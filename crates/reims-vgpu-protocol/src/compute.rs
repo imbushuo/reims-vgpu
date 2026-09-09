@@ -19,6 +19,44 @@
 
 use reims_vgpu_wire::ops::compute as wire;
 
+/// `MTLComputePipelineDescriptor.textureWriteRoundingMode` (also named
+/// `textureWriteFPRoundingMode`), a four-byte compact-TLV property.
+///
+/// Isolated setter perturbations of the macOS 15.6.1 serializer identify this
+/// tag, not `shaderValidation`. The default is omitted; native descriptor
+/// descriptions name the three ordinals as Default, RTZ and RTNE.
+pub const COMPUTE_PIPELINE_TAG_TEXTURE_WRITE_ROUNDING_MODE: u8 = 0x0a;
+
+/// Rounding requested by a compute pipeline for floating-point texture writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TextureWriteRoundingMode {
+    #[default]
+    Default,
+    TowardZero,
+    ToNearestEven,
+}
+
+impl TextureWriteRoundingMode {
+    #[must_use]
+    pub const fn parse(word: u32) -> Option<Self> {
+        match word {
+            0 => Some(Self::Default),
+            1 => Some(Self::TowardZero),
+            2 => Some(Self::ToNearestEven),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn word(self) -> u32 {
+        match self {
+            Self::Default => 0,
+            Self::TowardZero => 1,
+            Self::ToNearestEven => 2,
+        }
+    }
+}
+
 /// The compute-encoder record an opcode names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ComputeKind {
@@ -220,6 +258,23 @@ impl DispatchType {
 mod tests {
     use super::*;
     use crate::closure::{Rail, LEDGER};
+
+    #[test]
+    fn texture_write_rounding_mode_is_a_closed_ordinal() {
+        assert_eq!(COMPUTE_PIPELINE_TAG_TEXTURE_WRITE_ROUNDING_MODE, 0x0a);
+        assert_eq!(TextureWriteRoundingMode::default(), TextureWriteRoundingMode::Default);
+        for (word, mode) in [
+            (0, TextureWriteRoundingMode::Default),
+            (1, TextureWriteRoundingMode::TowardZero),
+            (2, TextureWriteRoundingMode::ToNearestEven),
+        ] {
+            assert_eq!(TextureWriteRoundingMode::parse(word), Some(mode));
+            assert_eq!(mode.word(), word);
+        }
+        for word in [3, 4, 255, u32::MAX] {
+            assert_eq!(TextureWriteRoundingMode::parse(word), None);
+        }
+    }
 
     #[test]
     fn no_two_kinds_share_an_opcode() {

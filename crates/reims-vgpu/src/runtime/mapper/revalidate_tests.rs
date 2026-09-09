@@ -180,7 +180,7 @@ fn surface_page_collision_invalidates_mapping_fail_closed() {
         m.mapped = true;
         m.map_generation = 7;
         m.page_entries = vec![entry(0x777), entry(0x778)];
-        m.page_table_kva = 0xABC0;
+        m.page_table_gpa = Some(0xABC0);
     }
     state.map_surface(OWNER);
     {
@@ -199,7 +199,7 @@ fn surface_page_collision_invalidates_mapping_fail_closed() {
         m.page_entries.is_empty(),
         "known-bad page plan must be cleared"
     );
-    assert_eq!(m.page_table_kva, 0);
+    assert_eq!(m.page_table_gpa, None);
     assert_eq!(
         m.map_generation, 8,
         "generation bump makes any deferred writeback fail closed"

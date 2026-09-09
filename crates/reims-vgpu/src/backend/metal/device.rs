@@ -58,6 +58,10 @@ impl MetalBackend {
 }
 
 impl Backend for MetalBackend {
+    fn begin_render_pass(&self) -> crate::backend::RenderPass {
+        crate::backend::RenderPass::Metal(super::render_pass::MetalRenderPass::default())
+    }
+
     fn name(&self) -> &'static str {
         Rail::Metal.name()
     }
@@ -107,17 +111,6 @@ impl Backend for MetalBackend {
 
     fn forget_host_icbs(&self) {
         crate::runtime::icb::metal::clear_host_icb_cache();
-    }
-
-    fn encode_draw_chain<M: HostMemory + HostOps>(
-        &self,
-        state: &mut DeviceState,
-        host: &mut M,
-        req: &mut DrawEncodeRequest,
-        writeback_guest: bool,
-        force_full_store: bool,
-    ) -> (EncodeStatus, Option<Vec<u8>>) {
-        draw::metal::encode_draw_chain(state, host, req, writeback_guest, force_full_store)
     }
 
     fn execute_dispatch<M: HostMemory + HostOps>(

@@ -1,15 +1,15 @@
 //! `MTLStorageMode`, and what this wire's use of it does and does not license.
 //!
-//! # The three values this wire has been seen to carry
+//! # The three guest-backed storage modes
 //!
 //! The mode arrives as `resource_options[7:4]` — the ordinal shifted left by
 //! four, which is `MTLResourceOptions`' documented storage-mode shift rather
 //! than a bare mode field. Three ordinals are pinned by fixtures that moved the
-//! nibble alone: shared, managed, private. The public API declares a fourth,
-//! memoryless, and this wire has never been observed carrying it, so it is a
-//! refusal here rather than a variant: a memoryless resource's backing
-//! contract on *this* interface is not established, and a route chosen for it
-//! would be chosen from the SDK's description of a different transport.
+//! nibble alone: shared, managed, private. Memoryless is a separate object-list
+//! contract, now recovered in [`crate::memoryless`]: type 9 carries only a
+//! serializer creation command and no guest allocation. This guest-backed
+//! placement vocabulary still refuses it rather than assigning guest pages to
+//! a pass-local attachment.
 //!
 //! # Private is an announcement, not an access contract
 //!
@@ -86,12 +86,10 @@ impl StorageMode {
     }
 }
 
-/// A storage-mode ordinal this wire has not been observed carrying.
+/// A storage-mode ordinal outside this guest-backed placement vocabulary.
 ///
-/// Named rather than folded into a nearby mode: the API declares a memoryless
-/// mode whose backing contract on this interface is not established, and
-/// choosing a route for it from the SDK's description of a different transport
-/// is the guess this refusal exists instead of.
+/// Named rather than folded into a nearby mode. In particular, memoryless
+/// belongs to [`crate::memoryless`], not this guest-backed placement vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnobservedStorageMode {
     pub ordinal: u8,
@@ -108,7 +106,7 @@ impl UnobservedStorageMode {
 ///
 /// # Errors
 ///
-/// If the ordinal is not one of the three this wire carries.
+/// If the ordinal is not one of the three guest-backed modes.
 pub const fn storage_mode(ordinal: u8) -> Result<StorageMode, UnobservedStorageMode> {
     match ordinal {
         0 => Ok(StorageMode::Shared),
@@ -151,9 +149,8 @@ mod tests {
         assert_eq!(from_resource_options(0x0120), Ok(StorageMode::Private));
     }
 
-    /// Memoryless is a real API mode whose contract on this wire is not
-    /// established. Folding it into a neighbour would pick a route from another
-    /// transport's description.
+    /// Memoryless belongs to the separate type-9 contract. It must not enter
+    /// guest-backed placement by being folded into a neighbouring mode.
     #[test]
     fn an_unobserved_ordinal_is_refused_by_number() {
         assert_eq!(

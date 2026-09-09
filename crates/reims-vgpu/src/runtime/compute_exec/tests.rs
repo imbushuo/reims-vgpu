@@ -64,6 +64,103 @@ impl RailStage for NeutralStage {
         Self
     }
 }
+
+#[cfg(feature = "backend-metal")]
+mod planar_staging {
+        use super::*;
+        use crate::backend::metal::planar::tests::{device_descriptor, texture_descriptor};
+        use crate::protocol::planar::{BackingFormat, SampleFormat};
+        use crate::runtime::compute_exec::metal::{try_stage_planar_sampled, MetalStage};
+
+        fn fixture(format: SampleFormat) -> (DeviceState, FakeHost) {
+            use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let mut host = FakeHost::new();
+            gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+            assert!(state.set_object_list(1, 0, 32));
+            let pfn = 0x20u32;
+            host.map_range(u64::from(pfn) << PAGE_SHIFT_ARM64E, 1 << PAGE_SHIFT_ARM64E, 0x5a);
+            assert!(state.map_surface(5));
+            {
+                let m = state.mappings.get_mut(&5).unwrap();
+                m.mapped = true;
+                m.mapping_internal = 1;
+                m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            }
+            assert!(state.set_mapping_device_desc(5, &device_descriptor(BackingFormat::VideoRange)));
+            assert!(state.set_mapping_geom(5, 8, 4, format.word()));
+            write_descriptor(&mut state, &mut host, &texture_descriptor(format));
+            (state, host)
+        }
+
+        fn write_descriptor(state: &mut DeviceState, host: &mut FakeHost, descriptor: &[u8]) {
+            const GVA: u64 = 0x300;
+            write_task_gva_arm64e(host, &state.tasks[1], GVA, descriptor);
+            let mut entry = [0; OBJECT_LIST_ENTRY_LEN];
+            st32(&mut entry, u32::from(OBJECT_TYPE_MAPPER_REF_TEXTURE) | ((descriptor.len() as u32) << 8));
+            st64(&mut entry[4..], GVA);
+            write_task_gva_arm64e(
+                host, &state.tasks[1], list_object_entry_offset(11, 32).unwrap(), &entry,
+            );
+        }
+
+        #[test]
+        fn planar_fragment_and_compute_staging_keep_whole_planes_and_private_ordinals() {
+            for format in [SampleFormat::Ycbcr10_420TwoPlane, SampleFormat::Rgb10_420TwoPlane] {
+                let (mut state, mut host) = fixture(format);
+                let image = try_stage_planar_sampled(&mut state, &mut host, 1, 11).unwrap().unwrap();
+                assert_eq!(image.description.format, format);
+                assert_eq!(image.layout.planes[0].offset, 128);
+                assert_eq!(image.layout.planes[1].offset, 2176);
+                for p in 0..2 {
+                    assert_eq!(image.plane_bytes(p), &[0x5a; 1024], "includes leading/row/extended padding");
+                }
+                let staged = stage_texture_raw::<MetalStage, _>(&mut state, &mut host, 1, 11, 33, false)
+                    .ok().expect("compute stages the same composite image");
+                assert!(staged.storage_selector.is_none());
+                assert!(staged.bytes.is_empty(), "no fabricated packed image");
+                assert_eq!(staged.rail.planar.unwrap().description.format, format);
+            }
+        }
+
+        #[test]
+        fn planar_staging_refuses_other_rails_storage_and_unknown_texture_tail() {
+            let (mut state, mut host) = fixture(SampleFormat::Ycbcr10_420TwoPlane);
+            assert!(matches!(
+                stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 11, 33, false),
+                Err(ComputeStatus::Unsupported("planar_sampling_metal_only"))
+            ));
+            #[cfg(feature = "backend-vulkan")]
+            assert!(matches!(
+                stage_texture_raw::<super::super::vulkan::VulkanStage, _>(&mut state, &mut host, 1, 11, 33, false),
+                Err(ComputeStatus::Unsupported("planar_sampling_metal_only"))
+            ));
+            assert!(matches!(
+                stage_texture_raw::<MetalStage, _>(&mut state, &mut host, 1, 11, 33, true),
+                Err(ComputeStatus::Unsupported("planar_storage_binding"))
+            ));
+            let (mut state, mut host) = fixture(SampleFormat::Ycbcr10_420TwoPlane);
+            let mut descriptor = texture_descriptor(SampleFormat::Ycbcr10_420TwoPlane);
+            descriptor[44] = 1;
+            write_descriptor(&mut state, &mut host, &descriptor);
+            assert!(matches!(
+                try_stage_planar_sampled(&mut state, &mut host, 1, 11),
+                Err(ComputeStatus::Unsupported("planar_texture_protection_options"))
+            ));
+        }
+
+        #[test]
+        fn planar_staging_bounds_backing_before_allocation() {
+            let (mut state, mut host) = fixture(SampleFormat::Ycbcr10_420TwoPlane);
+            let mut backing = device_descriptor(BackingFormat::VideoRange);
+            st32(&mut backing[16..], 1 << 20);
+            assert!(state.set_mapping_device_desc(5, &backing));
+            assert!(matches!(
+                try_stage_planar_sampled(&mut state, &mut host, 1, 11),
+                Err(ComputeStatus::GuestIo("planar_mapping_span"))
+            ));
+        }
+    }
 // Both rails' tests live here alongside the shared staging ones. Neither rail is
 // re-exported into `super`, so each is named where its arm compiles.
 #[cfg(feature = "backend-vulkan")]
@@ -89,6 +186,94 @@ use crate::runtime::gva_mem;
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
 use reims_vgpu_wire::device_desc::RefTextureBuilder;
+
+fn compute_rounding_pipeline(mode: u32) -> (DeviceState, FakeHost) {
+    use crate::protocol::compute::COMPUTE_PIPELINE_TAG_TEXTURE_WRITE_ROUNDING_MODE;
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+    let mut desc = [0u8; 32];
+    st32(&mut desc[0..], SERIALIZER_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut desc[4..], 32);
+    st32(&mut desc[8..], 6);
+    st32(&mut desc[12..], 13);
+    desc[SERIALIZER_OBJECT_FIRST_TLVS] = 2;
+    let mut p = SERIALIZER_OBJECT_FIRST_TLVS + 1;
+    for (tag, word) in [
+        (PIPELINE_TAG_KERNEL_FUNC, 5),
+        (COMPUTE_PIPELINE_TAG_TEXTURE_WRITE_ROUNDING_MODE, mode),
+    ] {
+        desc[p] = tag;
+        desc[p + 1] = 4;
+        st32(&mut desc[p + 2..], word);
+        p += 6;
+    }
+    let desc_gva = 0x140u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(&mut entry, OBJECT_TYPE_SERIALIZER_OBJECT as u32 | (desc.len() as u32) << 8);
+    entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    let off = list_object_entry_offset(6, 32).unwrap();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &entry);
+    (state, host)
+}
+
+#[test]
+fn compute_rounding_survives_pipeline_load() {
+    for mode in [
+        TextureWriteRoundingMode::Default,
+        TextureWriteRoundingMode::TowardZero,
+        TextureWriteRoundingMode::ToNearestEven,
+    ] {
+        let (state, host) = compute_rounding_pipeline(mode.word());
+        let pipeline = load_compute_pipeline(&state, &host, 1, 6).unwrap();
+        assert_eq!(pipeline.kernel_func_ref, 5);
+        assert_eq!(pipeline.texture_write_rounding_mode, mode);
+        assert!(pipeline.stage_input.is_none());
+    }
+}
+
+#[test]
+fn compute_rounding_decode_failure_keeps_precise_slug_on_every_load() {
+    let (state, host) = compute_rounding_pipeline(3);
+    let cap = crate::observe::FailCapture::start();
+    for _ in 0..2 {
+        assert!(load_compute_pipeline(&state, &host, 1, 6).is_none());
+    }
+    let lines = cap.lines();
+    let errors: Vec<_> = lines.iter().filter(|line| {
+        line.starts_with("compute_load_pipeline reason=res_compute_rounding_ordinal")
+    }).collect();
+    assert_eq!(errors.len(), 2, "{lines:?}");
+    for error in errors {
+        assert!(error.contains("class=unsupported task=1 pipe_ref=6 desc_len=32"), "{error}");
+    }
+    assert!(!lines.iter().any(|line| line.contains("reason=desc_decode")));
+}
+
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn compute_rounding_vulkan_refuses_nondefault_before_shader_loading() {
+    assert_eq!(validate_texture_write_rounding(TextureWriteRoundingMode::Default), Ok(()));
+    for mode in [TextureWriteRoundingMode::TowardZero, TextureWriteRoundingMode::ToNearestEven] {
+        let (mut state, mut host) = compute_rounding_pipeline(mode.word());
+        let mut acc = ComputeAccum::default();
+        acc.set_pipeline(6);
+        let cap = crate::observe::FailCapture::start();
+        // No shader object was installed. A missing-MTLB result would mean the
+        // descriptor requirement was silently passed over.
+        let status = execute_dispatch_linux(
+            &mut state, &mut host, 1, &acc, &threadgroups([1, 1, 1], [1, 1, 1]),
+        );
+        assert_eq!(status, ComputeStatus::Unsupported("compute_vk_texture_write_rounding_unsupported"));
+        let lines = cap.lines();
+        assert!(lines.iter().any(|line| {
+            line.contains("reason=compute_vk_texture_write_rounding_unsupported")
+                && line.contains(&format!("mode={} task=1 pipe=6", mode.word()))
+        }), "{lines:?}");
+    }
+}
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -946,7 +1131,7 @@ fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
         bytes: vec![0; 64],
         is_storage: true,
         writeback: TextureWriteback::None,
-        rail: MetalStage { texture_ref: 44 },
+        rail: MetalStage { texture_ref: 44, planar: None },
     };
 
     assert_eq!(
@@ -2995,9 +3180,29 @@ fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
+    #[cfg(feature = "backend-vulkan")]
+    for reference in [21, 7] {
+        assert_eq!(
+            state.pending_writebacks.arm(
+                reference,
+                crate::runtime::writeback_debt::test_resident_identity(reference, 4, 3, 1),
+                4,
+                3,
+                1,
+            ),
+            None,
+        );
+    }
     let staged = stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 21, 0, false)
         .expect("a buffer-backed texture is a wire form this device decodes");
 
+    #[cfg(feature = "backend-vulkan")]
+    for reference in [21, 7] {
+        assert!(
+            state.pending_writebacks.get(reference).is_none(),
+            "raw staging must pay both the texture and its backing buffer"
+        );
+    }
     assert_eq!(staged.width, W_TEXELS as u32);
     assert_eq!(staged.height, H_ROWS as u32);
     assert_eq!(

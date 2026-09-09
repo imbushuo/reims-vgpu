@@ -907,7 +907,30 @@ fn bind_sampled_images(
     if images.is_empty() {
         return Status::OK;
     }
-    for image in images {
+    for source in images {
+        let image = match source {
+            ReimsVgpuSampledImage::Packed(image) => image,
+            ReimsVgpuSampledImage::Planar { binding, image } => {
+                let Some(index) = texture_index(*binding) else {
+                    return Status::args("metal_render_sampled_binding_invalid")
+                        .field("binding", *binding);
+                };
+                let texture = match super::planar::upload(device, image) {
+                    Ok(texture) => texture,
+                    Err(status) => {
+                        set_err(err, format!("planar render texture: {status:?}"));
+                        return status;
+                    }
+                };
+                if fragment_stage {
+                    encoder.set_fragment_texture(index as u64, Some(&texture));
+                } else {
+                    encoder.set_vertex_texture(index as u64, Some(&texture));
+                }
+                retained.push(texture);
+                continue;
+            }
+        };
         let Some(texture_index) = texture_index(image.binding) else {
             set_err(
                 err,
@@ -1554,6 +1577,12 @@ pub struct RetainedColorTarget {
     pub texture: RetainedColorTexture,
 }
 
+/// The owner of an MRT attachment's native storage.
+pub enum ColorTarget<'a> {
+    Guest(Option<RetainedColorTarget>),
+    Memoryless(&'a super::render_pass::PassLocalColorTarget),
+}
+
 /// One color render target for MRT encode (host RGBA8 seed/readback by default).
 pub struct ColorRt<'a> {
     /// Metal color attachment index (`[[color(n)]]`).
@@ -1566,24 +1595,38 @@ pub struct ColorRt<'a> {
     pub clear_g: f64,
     pub clear_b: f64,
     pub clear_a: f64,
-    /// Guest MTL loadAction (0=DontCare, 1=Load, 2=Clear). Every color target
-    /// is an ephemeral host RT, so Load requires a CPU seed (archive
-    /// `reims_vgpu_backend_metal`: NULL seed → Clear invent).
+    /// Guest MTL loadAction (0=DontCare, 1=Load, 2=Clear). Load requires either
+    /// a CPU seed or initialized storage from the attachment's owner.
     pub load_action: u32,
     /// Per-slot blend from pipeline color-attachment section (overrides global for this RT).
     pub blend: Option<ReimsVgpuBlendState>,
     /// Per-slot `MTLColorWriteMask` from the same section. `0xf` (all) is the
     /// value for an attachment whose entry omits the tag.
     pub write_mask: u32,
-    /// This rail's retention of the attachment's texture, when the attachment
-    /// has a stable identity to retain it under.
-    ///
-    /// `None` is an attachment with none — no mapping, so no surface to key on —
-    /// which gets a fresh texture per draw as every colour target used to.
-    pub retained: Option<RetainedColorTarget>,
+    /// Memoryless contents are borrowed from the owning guest pass, never from
+    /// the cross-pass surface registry.
+    pub target: ColorTarget<'a>,
 }
 
 impl ColorRt<'_> {
+    pub(super) fn attach(&self, pass: &RenderPassDescriptorRef, target: &TextureRef) {
+        if let Some(attachment) = pass.color_attachments().object_at(u64::from(self.slot)) {
+            attachment.set_texture(Some(target));
+            let load = match color_rt_load_action(self.load_action, self.prior_content_present()) {
+                REIMS_VGPU_MTL_LOAD_ACTION_LOAD => MTLLoadAction::Load,
+                REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE => MTLLoadAction::DontCare,
+                _ => MTLLoadAction::Clear,
+            };
+            attachment.set_load_action(load);
+            attachment.set_clear_color(MTLClearColor::new(
+                self.clear_r, self.clear_g, self.clear_b, self.clear_a,
+            ));
+            // Memoryless's private allocation survives only inside the guest
+            // pass; Store here preserves exact texels for its next split draw.
+            attachment.set_store_action(MTLStoreAction::Store);
+        }
+    }
+
     /// Whether this pass's prior content will be in the target when the pass
     /// begins, from either of the two ways it can get there.
     ///
@@ -1593,15 +1636,34 @@ impl ColorRt<'_> {
     /// action, and asking only about the seed made a retained target's Load
     /// silently degrade to a clear.
     fn prior_content_present(&self) -> bool {
-        self.seed_rgba8.is_some()
-            || matches!(
-                self.retained,
+        match &self.target {
+            ColorTarget::Memoryless(target) => target.initialized(),
+            ColorTarget::Guest(retained) => self.seed_rgba8.is_some()
+            || matches!(retained,
                 Some(RetainedColorTarget {
                     texture: RetainedColorTexture::Prior(_),
                     ..
                 })
-            )
+            ),
+        }
     }
+}
+
+pub(super) fn new_color_target(
+    device: &DeviceRef,
+    format: MTLPixelFormat,
+    width: u32,
+    height: u32,
+    storage: MTLStorageMode,
+) -> Option<Texture> {
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(format);
+    descriptor.set_width(u64::from(width));
+    descriptor.set_height(u64::from(height));
+    descriptor.set_storage_mode(storage);
+    descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+    crate::backend::metal::raw_metal::new_texture(device, &descriptor)
 }
 
 /// The occlusion query a draw is armed with, and the answer the pass recorded.
@@ -1645,6 +1707,71 @@ pub(crate) fn color_rt_load_action(guest_load: u32, has_seed: bool) -> u32 {
         x if x == REIMS_VGPU_MTL_LOAD_ACTION_LOAD && has_seed => REIMS_VGPU_MTL_LOAD_ACTION_LOAD,
         _ if has_seed => REIMS_VGPU_MTL_LOAD_ACTION_LOAD,
         _ => REIMS_VGPU_MTL_LOAD_ACTION_CLEAR,
+    }
+}
+
+#[cfg(test)]
+mod memoryless_tests {
+    use super::*;
+
+    #[test]
+    fn memoryless_half_float_attachment_can_feed_a_stored_colour() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("memoryless native test requires a Metal device");
+            return;
+        };
+        if !device.supports_family(MTLGPUFamily::Apple1) {
+            eprintln!("memoryless native test requires Apple GPU memoryless support");
+            return;
+        }
+        let memoryless = new_color_target(&device, MTLPixelFormat::RGBA16Float,
+            4, 4, MTLStorageMode::Memoryless).expect("memoryless target");
+        assert_eq!(memoryless.storage_mode(), MTLStorageMode::Memoryless);
+        assert_eq!(memoryless.pixel_format(), MTLPixelFormat::RGBA16Float);
+        let output = new_color_target(&device, MTLPixelFormat::RGBA8Unorm,
+            4, 4, MTLStorageMode::Shared).expect("readback target");
+        let library = crate::backend::metal::raw_metal::new_library_with_source(&device, r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            vertex float4 memoryless_vertex(uint i [[vertex_id]]) {
+                const float2 points[] = {float2(-1,-1), float2(3,-1), float2(-1,3)};
+                return float4(points[i], 0, 1);
+            }
+            fragment half4 memoryless_fragment(half4 prior [[color(1)]]) {
+                return prior;
+            }
+        "#).expect("original synthetic framebuffer-fetch shader");
+        let pipeline = RenderPipelineDescriptor::new();
+        pipeline.set_vertex_function(Some(&library.get_function("memoryless_vertex", None).unwrap()));
+        pipeline.set_fragment_function(Some(&library.get_function("memoryless_fragment", None).unwrap()));
+        pipeline.color_attachments().object_at(0).unwrap().set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+        pipeline.color_attachments().object_at(1).unwrap().set_pixel_format(MTLPixelFormat::RGBA16Float);
+        let pipeline = device.new_render_pipeline_state(&pipeline).expect("framebuffer-fetch pipeline");
+        let pass = RenderPassDescriptor::new();
+        let color = pass.color_attachments().object_at(0).unwrap();
+        color.set_texture(Some(&output));
+        color.set_load_action(MTLLoadAction::DontCare);
+        color.set_store_action(MTLStoreAction::Store);
+        let tile = pass.color_attachments().object_at(1).unwrap();
+        tile.set_texture(Some(&memoryless));
+        tile.set_load_action(MTLLoadAction::Clear);
+        tile.set_clear_color(MTLClearColor::new(0.25, 0.5, 0.75, 1.0));
+        tile.set_store_action(MTLStoreAction::DontCare);
+        let queue = device.new_command_queue();
+        let command = queue.new_command_buffer();
+        let encoder = command.new_render_command_encoder(&pass);
+        encoder.set_render_pipeline_state(&pipeline);
+        encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+        let mut pixels = [0u8; 64];
+        output.get_bytes(pixels.as_mut_ptr().cast(), 16,
+            MTLRegion::new_2d(0, 0, 4, 4), 0);
+        for pixel in pixels.chunks_exact(4) {
+            assert_eq!(pixel, &[64, 128, 191, 255]);
+        }
     }
 }
 
@@ -1874,6 +2001,13 @@ pub fn render_core_mrt(
     let mut color_meta: Vec<(u32, u32, usize, MTLPixelFormat)> = Vec::with_capacity(colors.len());
     // (slot, fmt_u32, bpp, mtl_fmt)
     for c in colors.iter() {
+        if matches!(c.target, ColorTarget::Memoryless(_))
+            && (c.seed_rgba8.is_some() || c.out_rgba8.is_some()
+                || (c.load_action == REIMS_VGPU_MTL_LOAD_ACTION_LOAD && !c.prior_content_present()))
+        {
+            set_err(err, "memoryless attachment cannot carry external contents");
+            return Status::args("metal_render_memoryless_external_contents").field("slot", c.slot);
+        }
         if c.slot as usize >= REIMS_VGPU_METAL_MAX_COLOR_RTS {
             set_err(
                 err,
@@ -2072,18 +2206,10 @@ pub fn render_core_mrt(
         // 8 MB upload per draw per attachment; see
         // [`crate::backend::metal::resident`] for the one claim that makes
         // loading from a retained one safe.
-        let (target, holds_prior) = match &c.retained {
-            None => {
-                let target_descriptor = TextureDescriptor::new();
-                target_descriptor.set_texture_type(MTLTextureType::D2);
-                target_descriptor.set_pixel_format(mtl_fmt);
-                target_descriptor.set_width(width as u64);
-                target_descriptor.set_height(height as u64);
-                target_descriptor.set_storage_mode(MTLStorageMode::Shared);
-                target_descriptor
-                    .set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-                let Some(target) =
-                    crate::backend::metal::raw_metal::new_texture(device, &target_descriptor)
+        let (target, holds_prior) = match &c.target {
+            ColorTarget::Memoryless(target) => (target.texture().clone(), target.initialized()),
+            ColorTarget::Guest(None) => {
+                let Some(target) = new_color_target(device, mtl_fmt, width, height, MTLStorageMode::Shared)
                 else {
                     return Status::execute("metal_render_color_target_alloc_failed")
                         .field("slot", slot)
@@ -2092,7 +2218,7 @@ pub fn render_core_mrt(
                 };
                 (target, false)
             }
-            Some(retained) => match &retained.texture {
+            ColorTarget::Guest(Some(retained)) => match &retained.texture {
                 RetainedColorTexture::Prior(texture) => (texture.clone(), true),
                 RetainedColorTexture::Allocation(texture) => (texture.clone(), false),
                 RetainedColorTexture::Absent => {
@@ -2147,26 +2273,7 @@ pub fn render_core_mrt(
     let span_pass = crate::runtime::chain_phase::CostSpan::new("metal_pass_us");
     let pass = RenderPassDescriptor::new();
     for (i, c) in colors.iter().enumerate() {
-        let (slot, target, _) = &color_textures[i];
-        if let Some(ca) = pass.color_attachments().object_at(*slot as u64) {
-            ca.set_texture(Some(target));
-            // Ephemeral host RT: archive Load+seed / Clear invent.
-            let resolved = color_rt_load_action(c.load_action, c.prior_content_present());
-            let mtl_load = match resolved {
-                x if x == crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_LOAD => {
-                    MTLLoadAction::Load
-                }
-                x if x == crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE => {
-                    MTLLoadAction::DontCare
-                }
-                _ => MTLLoadAction::Clear,
-            };
-            ca.set_load_action(mtl_load);
-            ca.set_clear_color(MTLClearColor::new(
-                c.clear_r, c.clear_g, c.clear_b, c.clear_a,
-            ));
-            ca.set_store_action(MTLStoreAction::Store);
-        }
+        c.attach(pass, &color_textures[i].1);
     }
 
     // Both builders now separate "no attachment" from "an attachment this

@@ -45,7 +45,7 @@ impl Drop for MetalSession {
     fn drop(&mut self) {
         if !self.ended {
             // Abandoned session (test early-return / panic): close encoder cleanly.
-            self.encoder.end_encoding();
+            objc::rc::autoreleasepool(|| self.encoder.end_encoding());
             self.ended = true;
         }
     }
@@ -53,6 +53,12 @@ impl Drop for MetalSession {
 
 impl MetalSession {
     pub(crate) fn open(dispatch_type: DispatchType) -> Result<Self, ComputeStatus> {
+        // A session owns retained command-buffer/encoder handles; the borrowed
+        // autoreleased results must not keep every segment alive on the worker.
+        objc::rc::autoreleasepool(|| Self::open_pooled(dispatch_type))
+    }
+
+    fn open_pooled(dispatch_type: DispatchType) -> Result<Self, ComputeStatus> {
         use crate::backend::metal::abi::REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT;
         use crate::backend::metal::runtime::{system_device, thread_queue};
         use metal::MTLDispatchType;
@@ -108,6 +114,16 @@ impl MetalSession {
     }
 
     pub(crate) fn encode_control<M: HostMemory + HostOps>(
+        &mut self,
+        state: &DeviceState,
+        host: &M,
+        task_id: u32,
+        cmd: &ComputeCommand,
+    ) -> ComputeStatus {
+        objc::rc::autoreleasepool(|| self.encode_control_pooled(state, host, task_id, cmd))
+    }
+
+    fn encode_control_pooled<M: HostMemory + HostOps>(
         &mut self,
         state: &DeviceState,
         host: &M,
@@ -242,6 +258,17 @@ impl MetalSession {
         cmd: &ComputeCommand,
         acc: &ComputeAccum,
     ) -> ComputeStatus {
+        objc::rc::autoreleasepool(|| self.encode_icb_pooled(state, host, task_id, cmd, acc))
+    }
+
+    fn encode_icb_pooled<M: HostMemory + HostOps>(
+        &mut self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        cmd: &ComputeCommand,
+        acc: &ComputeAccum,
+    ) -> ComputeStatus {
         use crate::backend::metal::raw_metal::{
             execute_commands_in_buffer, execute_commands_in_buffer_indirect,
         };
@@ -354,6 +381,17 @@ impl MetalSession {
     }
 
     pub(crate) fn finish<M: HostMemory + HostOps>(
+        self,
+        host: &mut M,
+        state: &mut DeviceState,
+        task_id: u32,
+    ) -> ComputeStatus {
+        // Consume self inside the pool: completion, writeback and destruction
+        // of retained resources all precede its drain, including error returns.
+        objc::rc::autoreleasepool(|| self.finish_pooled(host, state, task_id))
+    }
+
+    fn finish_pooled<M: HostMemory + HostOps>(
         mut self,
         host: &mut M,
         state: &mut DeviceState,
@@ -455,7 +493,8 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
             AirLoadRail::Compute,
         )
         .ok_or(ComputeStatus::MissingMtlb("compute_icb_inherit_mtlb_load"))?;
-        let pso = new_icb_compute_pso(&session.device, &mtlb).map_err(ComputeStatus::from)?;
+        let pso =
+            new_icb_compute_pso(&session.device, &mtlb, &pipeline).map_err(ComputeStatus::from)?;
         session.encoder.set_compute_pipeline_state(&pso);
         session.retained_psos.push(pso);
     }
@@ -867,4 +906,59 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
         storage_tex,
         mtl_storage,
     )))
+}
+
+#[cfg(test)]
+mod autorelease_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+    use crate::runtime::host::FakeHost;
+    use foreign_types::ForeignType;
+    use objc::rc::{autoreleasepool, WeakPtr};
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    #[test]
+    fn autorelease_session_open_retains_handles_but_abandonment_releases_them() {
+        // A surrounding pool models the long-lived worker: the operation must
+        // release its autoreleased ownership before that outer pool drains.
+        autoreleasepool(|| {
+            for _ in 0..4 {
+                let session = MetalSession::open(DispatchType::Serial).expect("Metal session");
+                let command = unsafe { WeakPtr::new(session.command_buffer.as_ptr().cast()) };
+                let encoder = unsafe { WeakPtr::new(session.encoder.as_ptr().cast()) };
+                assert!(!command.load().is_null());
+                assert!(!encoder.load().is_null());
+                drop(session);
+                assert!(encoder.load().is_null(), "abandoned encoder leaked into worker pool");
+                assert!(command.load().is_null(), "abandoned command buffer leaked into worker pool");
+            }
+        });
+    }
+
+    #[test]
+    fn autorelease_session_keeps_resources_until_native_completion_and_releases_after_finish() {
+        autoreleasepool(|| {
+            let mut host = FakeHost::new();
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let mut session = MetalSession::open(DispatchType::Serial).expect("Metal session");
+            let buffer = session.device.new_buffer(16, metal::MTLResourceOptions::StorageModeShared);
+            let resource = unsafe { WeakPtr::new(buffer.as_ptr().cast()) };
+            let command = unsafe { WeakPtr::new(session.command_buffer.as_ptr().cast()) };
+            session.retained.push(buffer);
+            let alive_at_completion = Arc::new(AtomicBool::new(false));
+            let observed = alive_at_completion.clone();
+            let completion_resource = resource.clone();
+            let completed = block::ConcreteBlock::new(move |_: &metal::CommandBufferRef| {
+                observed.store(!completion_resource.load().is_null(), Ordering::SeqCst);
+            }).copy();
+            session.command_buffer.add_completed_handler(&completed);
+            drop(completed);
+
+            assert!(!resource.load().is_null(), "opening pool must not release retained inputs");
+            assert_eq!(session.finish(&mut host, &mut state, 1), ComputeStatus::Ok);
+            assert!(alive_at_completion.load(Ordering::SeqCst));
+            assert!(resource.load().is_null(), "finished session retained its input buffer");
+            assert!(command.load().is_null(), "finished command buffer leaked into worker pool");
+        });
+    }
 }

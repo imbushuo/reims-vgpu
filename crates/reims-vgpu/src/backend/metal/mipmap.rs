@@ -53,6 +53,18 @@ pub fn generate_mipmaps_filtered(
     levels: u32,
     level0: &[u8],
 ) -> Result<Vec<MetalMipLevel>, MetalMipmapError> {
+    objc::rc::autoreleasepool(|| {
+        generate_mipmaps_filtered_pooled(format, width, height, levels, level0)
+    })
+}
+
+fn generate_mipmaps_filtered_pooled(
+    format: u16,
+    width: u32,
+    height: u32,
+    levels: u32,
+    level0: &[u8],
+) -> Result<Vec<MetalMipLevel>, MetalMipmapError> {
     // The whole argument ladder, in one call, so that its order stays a fact
     // some host can execute rather than one only an Apple machine can.
     let plan = plan_level0(format, width, height, levels, level0.len())?;

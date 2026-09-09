@@ -30,11 +30,15 @@ mod function;
 #[cfg(target_os = "macos")]
 pub(crate) mod mipmap;
 #[cfg(target_os = "macos")]
+pub(crate) mod planar;
+#[cfg(target_os = "macos")]
 pub(crate) mod mtl_enum;
 #[cfg(target_os = "macos")]
 pub(crate) mod raw_metal;
 #[cfg(target_os = "macos")]
 pub(crate) mod render;
+#[cfg(target_os = "macos")]
+pub(crate) mod render_pass;
 /// Colour render targets this rail keeps alive across draws, and the one claim
 /// that makes loading from one safe. See the module doc.
 #[cfg(target_os = "macos")]

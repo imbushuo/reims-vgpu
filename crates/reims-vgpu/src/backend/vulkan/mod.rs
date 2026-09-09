@@ -151,23 +151,16 @@ pub(crate) fn gva_window(identity: &engine::TargetIdentity) -> Option<GvaWindow>
 }
 
 impl Backend for VulkanBackend {
+    fn begin_render_pass(&self) -> crate::backend::RenderPass {
+        crate::backend::RenderPass::Vulkan
+    }
+
     fn name(&self) -> &'static str {
         Rail::Vulkan.name()
     }
 
     fn reset(&self) {
         engine::reset_guest_state();
-    }
-
-    fn encode_draw_chain<M: HostMemory + HostOps>(
-        &self,
-        state: &mut DeviceState,
-        host: &mut M,
-        req: &mut DrawEncodeRequest,
-        writeback_guest: bool,
-        force_full_store: bool,
-    ) -> (EncodeStatus, Option<Vec<u8>>) {
-        draw::vulkan::encode_draw_chain(state, host, req, writeback_guest, force_full_store)
     }
 
     fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(

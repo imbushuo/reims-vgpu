@@ -33,7 +33,7 @@ impl PushDescriptorCaps {
                 .is_some_and(|total| total <= self.max_descriptors)
     }
 
-    pub fn required_extensions(self) -> Vec<*const i8> {
+    pub fn required_extensions(self) -> Vec<*const std::ffi::c_char> {
         self.is_available()
             .then_some(ash::khr::push_descriptor::NAME.as_ptr())
             .into_iter()

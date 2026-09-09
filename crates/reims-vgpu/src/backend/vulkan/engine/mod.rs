@@ -2570,7 +2570,13 @@ pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
             d24_stencil8: ctx.features.d24_unorm_s8_attachment,
             max_threads_per_threadgroup: ctx.features.max_compute_workgroup_size,
             max_threadgroup_memory_bytes: ctx.features.max_compute_shared_memory_bytes,
-            native_fp16: ctx.features.float16,
+            // llvmpipe advertises shaderFloat16 but LLVM 20 aborts the entire
+            // process while selecting the guest's `fs_variant_partial`
+            // shader (a v4f32 -> v4i16 bitcast).  A CPU Vulkan device is the
+            // software fallback, so report the conservative capability and
+            // let the Apple plugin choose its non-native-FP16 path.
+            native_fp16: ctx.features.float16
+                && ctx.caps.device_type != ash::vk::PhysicalDeviceType::CPU,
         })
         .unwrap_or(crate::model::DeviceInfoLimits {
             max_sample_count: 1,

@@ -757,11 +757,29 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     range_location: u64,
     range_length: u64,
 ) -> EncodeStatus {
+    objc::rc::autoreleasepool(|| {
+        encode_icb_execute_and_writeback_pooled(
+            state, host, req, icb_ref, range_location, range_length,
+        )
+    })
+}
+
+fn encode_icb_execute_and_writeback_pooled<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    req: &DrawEncodeRequest,
+    icb_ref: u32,
+    range_location: u64,
+    range_length: u64,
+) -> EncodeStatus {
     use crate::backend::metal::runtime::{system_device, thread_queue};
     use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::icb::metal::{fill_icb_from_command_memory, resolve_metal_icb};
     use ::metal::*;
 
+    if req.colors.iter().any(|c| c.storage == ColorStorage::Memoryless) {
+        return EncodeStatus::BadArgs("icb_exec_memoryless_unsupported");
+    }
     if icb_ref == 0 {
         return EncodeStatus::BadArgs("icb_exec_ref_zero");
     }

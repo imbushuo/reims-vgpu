@@ -1,7 +1,6 @@
 //! Compute encode path: PSO cache, binds, dispatch core, reflection.
 
 use crate::backend::blob::BlobKey;
-use crate::backend::hash::hash_bytes;
 use crate::backend::metal::abi::*;
 use crate::backend::metal::cache::{
     compute_pso_insert, compute_pso_lookup, reflect_insert, reflect_lookup, ComputePsoKey,
@@ -26,40 +25,93 @@ use crate::backend::metal::util::{
     valid_threadgroup_memory_index, ErrOut, Status,
 };
 use metal::*;
+use objc::runtime::{BOOL, NO};
+use objc::{msg_send, sel, sel_impl};
+use reims_vgpu_protocol::compute::TextureWriteRoundingMode;
 use reims_vgpu_protocol::extent::{tight_image_bytes, Extent3};
+use std::hash::{Hash, Hasher};
 use std::ptr;
 
 pub fn hash_compute_stage_input(stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>) -> u64 {
     match stage_input {
         None => 0,
-        Some(s) => hash_bytes(bytes_of(s)),
+        Some(s) => {
+            // Hash fields, not repr(C) padding: the cache's equality compares
+            // those same fields and padding does not survive a Rust copy.
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            s.hash(&mut hasher);
+            hasher.finish()
+        }
     }
+}
+
+pub(crate) fn make_compute_pipeline_descriptor(
+    function: &Function,
+    stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
+    texture_write_rounding_mode: TextureWriteRoundingMode,
+    err: ErrOut<'_>,
+) -> Result<ComputePipelineDescriptor, Status> {
+    let descriptor = ComputePipelineDescriptor::new();
+    descriptor.set_compute_function(Some(function));
+    if let Some(si) = stage_input {
+        let stage_descriptor = make_compute_stage_input_descriptor(si, err)?;
+        descriptor.set_stage_input_descriptor(Some(&stage_descriptor));
+    }
+    set_texture_write_rounding_mode(&descriptor, texture_write_rounding_mode, err)?;
+    Ok(descriptor)
+}
+
+fn set_texture_write_rounding_mode(
+    descriptor: &ComputePipelineDescriptorRef,
+    mode: TextureWriteRoundingMode,
+    err: ErrOut<'_>,
+) -> Result<(), Status> {
+    if mode == TextureWriteRoundingMode::Default {
+        return Ok(());
+    }
+    // This private property is not present on every host. The descriptor
+    // itself, not the OS version or GPU name, grants access to its setter.
+    unsafe {
+        let available: BOOL =
+            msg_send![descriptor, respondsToSelector: sel!(setTextureWriteRoundingMode:)];
+        validate_rounding_setter(mode, available != NO, err)?;
+        let _: () = msg_send![descriptor, setTextureWriteRoundingMode: mode.word() as NSUInteger];
+    }
+    Ok(())
+}
+
+fn validate_rounding_setter(
+    mode: TextureWriteRoundingMode,
+    available: bool,
+    err: ErrOut<'_>,
+) -> Result<(), Status> {
+    if mode != TextureWriteRoundingMode::Default && !available {
+        set_err(err, "compute texture-write rounding setter unavailable");
+        return Err(Status::execute("metal_compute_rounding_setter_unavailable")
+            .field("mode", mode.word()));
+    }
+    Ok(())
 }
 
 fn new_compute_pipeline_state_uncached(
     device: &Device,
     function: &Function,
     stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
+    texture_write_rounding_mode: TextureWriteRoundingMode,
     err: ErrOut<'_>,
 ) -> Result<ComputePipelineState, Status> {
-    match stage_input {
-        None => device
-            .new_compute_pipeline_state_with_function(function)
-            .map_err(|e| {
-                set_err(err, format!("compute PSO failed: {e}"));
-                Status::execute("metal_compute_pso_create_failed")
-            }),
-        Some(si) => {
-            let stage_descriptor = make_compute_stage_input_descriptor(si, err)?;
-            let descriptor = ComputePipelineDescriptor::new();
-            descriptor.set_compute_function(Some(function));
-            descriptor.set_stage_input_descriptor(Some(&stage_descriptor));
-            device.new_compute_pipeline_state(&descriptor).map_err(|e| {
-                set_err(err, format!("compute PSO failed: {e}"));
-                Status::execute("metal_compute_stage_input_pso_create_failed")
-            })
-        }
+    if stage_input.is_none() && texture_write_rounding_mode == TextureWriteRoundingMode::Default {
+        return device.new_compute_pipeline_state_with_function(function).map_err(|e| {
+            set_err(err, format!("compute PSO failed: {e}"));
+            Status::execute("metal_compute_pso_create_failed")
+        });
     }
+    let descriptor =
+        make_compute_pipeline_descriptor(function, stage_input, texture_write_rounding_mode, err)?;
+    device.new_compute_pipeline_state(&descriptor).map_err(|e| {
+        set_err(err, format!("compute PSO failed: {e}"));
+        Status::execute("metal_compute_descriptor_pso_create_failed")
+    })
 }
 
 pub fn new_compute_pipeline_state(
@@ -67,17 +119,21 @@ pub fn new_compute_pipeline_state(
     function: &Function,
     mtlb: &[u8],
     stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
+    texture_write_rounding_mode: TextureWriteRoundingMode,
     err: ErrOut<'_>,
 ) -> Result<ComputePipelineState, Status> {
     let key = ComputePsoKey {
         mtlb: BlobKey::new(mtlb),
         stage_hash: hash_compute_stage_input(stage_input),
         stage_input,
+        texture_write_rounding_mode,
     };
     if let Some(hit) = compute_pso_lookup(&key) {
         return Ok(hit);
     }
-    let pso = new_compute_pipeline_state_uncached(device, function, stage_input, err)?;
+    let pso = new_compute_pipeline_state_uncached(
+        device, function, stage_input, texture_write_rounding_mode, err,
+    )?;
     Ok(compute_pso_insert(&key, pso))
 }
 
@@ -379,7 +435,31 @@ pub(crate) fn bind_compute_sampled_images(
         return Status::OK;
     }
     let mut seen = [false; REIMS_VGPU_METAL_MAX_TEXTURES];
-    for image in sampled {
+    for source in sampled {
+        let image = match source {
+            ReimsVgpuComputeSampledImage::Packed(image) => image,
+            ReimsVgpuComputeSampledImage::Planar { binding, image } => {
+                let Some(index) = texture_index(*binding) else {
+                    return Status::args("metal_compute_sampled_binding_invalid")
+                        .field("binding", *binding);
+                };
+                if seen[index] {
+                    return Status::args("metal_compute_sampled_binding_duplicate")
+                        .field("binding", *binding);
+                }
+                seen[index] = true;
+                let texture = match super::planar::upload(device, image) {
+                    Ok(texture) => texture,
+                    Err(status) => {
+                        set_err(err, format!("planar compute texture: {status:?}"));
+                        return status;
+                    }
+                };
+                encoder.set_texture(index as u64, Some(&texture));
+                mtl_sampled.push(texture);
+                continue;
+            }
+        };
         let Some(texture_index) = texture_index(image.binding) else {
             set_err(
                 err,
@@ -663,6 +743,7 @@ pub fn compute_encode_on_encoder(
     stage_in_region_indirect: Option<&ReimsVgpuComputeStageInRegionIndirectArguments>,
     imageblock_dimensions: Option<&ReimsVgpuComputeImageblockDimensions>,
     stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
+    texture_write_rounding_mode: TextureWriteRoundingMode,
     // `dispatchThreads:` when true, `dispatchThreadgroups:` when false.
     //
     // A `bool` rather than the `REIMS_VGPU_COMPUTE_DISPATCH_KIND_*` ordinal the
@@ -728,7 +809,9 @@ pub fn compute_encode_on_encoder(
     }
 
     let function = load_only_function(device, mtlb, "compute", err)?;
-    let pso = new_compute_pipeline_state(device, &function, mtlb, stage_input, err)?;
+    let pso = new_compute_pipeline_state(
+        device, &function, mtlb, stage_input, texture_write_rounding_mode, err,
+    )?;
 
     let threadgroup_total = (tg_x as u64) * (tg_y as u64) * (tg_z as u64);
     let max_tg = pso.max_total_threads_per_threadgroup();
@@ -882,6 +965,7 @@ pub fn compute_core(
     stage_in_region_indirect: Option<&ReimsVgpuComputeStageInRegionIndirectArguments>,
     imageblock_dimensions: Option<&ReimsVgpuComputeImageblockDimensions>,
     stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
+    texture_write_rounding_mode: TextureWriteRoundingMode,
     // A `bool`, and forwarded as one — see `compute_encode_on_encoder`, which
     // consumes it. It sits beside `dispatch_type` here, which is why.
     dispatch_threads: bool,
@@ -931,6 +1015,7 @@ pub fn compute_core(
         stage_in_region_indirect,
         imageblock_dimensions,
         stage_input,
+        texture_write_rounding_mode,
         dispatch_threads,
         grid,
         threadgroup,
@@ -1097,6 +1182,71 @@ unsafe fn msg_send_release(obj: *mut objc::runtime::Object) {
 mod tests {
     use super::*;
     use crate::observe::Emit;
+
+    #[test]
+    fn compute_rounding_requires_a_setter_only_for_nondefault_modes() {
+        let err = (std::ptr::null_mut(), 0);
+        for available in [false, true] {
+            assert!(validate_rounding_setter(TextureWriteRoundingMode::Default, available, err).is_ok());
+        }
+        for mode in [TextureWriteRoundingMode::TowardZero, TextureWriteRoundingMode::ToNearestEven] {
+            assert!(validate_rounding_setter(mode, true, err).is_ok());
+            let status = validate_rounding_setter(mode, false, err).unwrap_err();
+            let line = Emit::refusal("compute_rounding_test", &status).unwrap().render();
+            assert!(line.contains("reason=metal_compute_rounding_setter_unavailable"));
+            assert!(line.contains(&format!("mode={}", mode.word())));
+        }
+    }
+
+    #[test]
+    fn compute_rounding_reaches_native_descriptor_and_pso_with_stage_input_intact() {
+        let device = Device::system_default().expect("Metal device");
+        let library = device.new_library_with_source(
+            "#include <metal_stdlib>\nusing namespace metal;\n\
+             kernel void rounding_test(device uint *out [[buffer(0)]], \
+             uint i [[thread_position_in_grid]]) { out[i] = i; }",
+            &CompileOptions::new(),
+        ).expect("synthetic compute source");
+        let function = library.get_function("rounding_test", None).unwrap();
+        let err = (std::ptr::null_mut(), 0);
+        let probe = ComputePipelineDescriptor::new();
+        let available: BOOL = unsafe {
+            msg_send![&*probe, respondsToSelector: sel!(setTextureWriteRoundingMode:)]
+        };
+        eprintln!("compute texture-write rounding setter available={}", available != NO);
+        for mode in [
+            TextureWriteRoundingMode::Default,
+            TextureWriteRoundingMode::TowardZero,
+            TextureWriteRoundingMode::ToNearestEven,
+        ] {
+            let result = make_compute_pipeline_descriptor(&function, None, mode, err);
+            if mode != TextureWriteRoundingMode::Default && available == NO {
+                let status = result.err().expect("missing setter must refuse");
+                assert!(Emit::refusal("compute_rounding_test", &status).unwrap().render()
+                    .contains("reason=metal_compute_rounding_setter_unavailable"));
+                continue;
+            }
+            let descriptor = result.unwrap();
+            if available != NO {
+                let actual: NSUInteger = unsafe { msg_send![&*descriptor, textureWriteRoundingMode] };
+                assert_eq!(actual, mode.word() as NSUInteger);
+            }
+            new_compute_pipeline_state_uncached(&device, &function, None, mode, err)
+                .expect("native compute PSO with requested rounding");
+            let stage = ReimsVgpuComputeStageInputDescriptor::default();
+            let descriptor = make_compute_pipeline_descriptor(&function, Some(&stage), mode, err)
+                .expect("rounding and stage-input coexist");
+            let actual_stage: *mut objc::runtime::Object =
+                unsafe { msg_send![&*descriptor, stageInputDescriptor] };
+            assert!(!actual_stage.is_null());
+            if available != NO {
+                let actual: NSUInteger = unsafe { msg_send![&*descriptor, textureWriteRoundingMode] };
+                assert_eq!(actual, mode.word() as NSUInteger);
+            }
+            new_compute_pipeline_state_uncached(&device, &function, Some(&stage), mode, err)
+                .expect("native stage-input PSO with requested rounding");
+        }
+    }
 
     fn buffer(backing: &mut [u8]) -> ReimsVgpuBuffer {
         ReimsVgpuBuffer {

@@ -6,6 +6,9 @@ use crate::protocol::endian::{st16, st32};
 use crate::runtime::heap_query; // ICB layout fixture encoder only
 
 use core::mem::{offset_of, size_of};
+use reims_vgpu_protocol::compute::{
+    TextureWriteRoundingMode, COMPUTE_PIPELINE_TAG_TEXTURE_WRITE_ROUNDING_MODE,
+};
 use reims_vgpu_wire::ops::{
     backed_texture as w_backed, depth_stencil as w_ds, heap_texture as w_heap, icb as w_icb,
     sampler as w_smp, texture_view as w_view,
@@ -93,6 +96,7 @@ impl crate::observe::Decline for DecodeStatus {
 /// | 6 | `createFunction` | `createObject<id<MTLFunction>>` | both |
 /// | 7 | `createObjectInternal` | `createObject<T>`, `T` by subtype | both |
 /// | 8 | `addChildResource` | `createSerializerTexture` | both |
+/// | 9 | `createMemorylessTexture` | serialized texture without guest backing | arm |
 /// | 11 | `allocateMapperRefTextureHandle` | `createMapperRefTexture` | arm |
 /// | 12 | `allocateTextureHandle` | `createNormalTexture`, dual-plane | arm |
 /// | 13, 14, 15 | heap, heap buffer, mapper-ref buffer | `createHeap*`, `createMapperRefBuffer` | arm |
@@ -115,6 +119,7 @@ pub const OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS: u8 = 3;
 pub const OBJECT_TYPE_FUNCTION: u8 = 6;
 pub const OBJECT_TYPE_SERIALIZER_OBJECT: u8 = 7;
 pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
+pub use reims_vgpu_protocol::memoryless::OBJECT_TYPE_MEMORYLESS_TEXTURE;
 pub const OBJECT_TYPE_MAPPER_REF_TEXTURE: u8 = 11;
 
 /// A texture whose storage the guest describes as **two planes**.
@@ -937,11 +942,12 @@ pub struct ComputeStageInputDescriptor {
     pub dropped_layouts: u32,
 }
 
-/// Decoded serializer-object compute pipeline (kernel function + optional stage-input).
+/// Decoded compute pipeline: kernel, optional stage-input and texture-write rounding.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ComputePipelineDescriptor {
     pub kernel_func_ref: u32,
     pub stage_input: Option<ComputeStageInputDescriptor>,
+    pub texture_write_rounding_mode: TextureWriteRoundingMode,
 }
 
 /// Both counts are 5-bit fields of `header0`
@@ -2994,13 +3000,14 @@ const MESH_PIPELINE_TAGS_CONSUMED: [u8; 5] = [
 /// Tags [`decode_compute_pipeline_descriptor`] reads out of a compute
 /// pipeline's own compact-TLV block.
 ///
-/// Two. Listed apart from its render sibling rather than merged into a union,
+/// Three. Listed apart from its render sibling rather than merged into a union,
 /// because a union would report a render tag as *consumed* on a compute
 /// pipeline that has no reader for it — an instrument built to find unread
 /// fields must not hide one behind a tag its other caller reads.
-const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 2] = [
+const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 3] = [
     PIPELINE_TAG_KERNEL_FUNC,
     PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET,
+    COMPUTE_PIPELINE_TAG_TEXTURE_WRITE_ROUNDING_MODE,
 ];
 
 /// `MTLRenderPipelineDescriptor.label`, a four-byte reference into the record's
@@ -5018,7 +5025,7 @@ pub fn parse_compute_stage_input_block(
     Ok(Some(out))
 }
 
-/// Decode serializer-object compute pipeline (`objType=0x0b`): kernel TLV + optional stage-input.
+/// Decode a compute pipeline's kernel, stage-input and texture-write rounding.
 pub fn decode_compute_pipeline_descriptor(
     bytes: &[u8],
 ) -> Result<ComputePipelineDescriptor, DecodeStatus> {
@@ -5044,6 +5051,22 @@ pub fn decode_compute_pipeline_descriptor(
         &COMPUTE_PIPELINE_TAGS_BENIGN,
         &fields,
     )?;
+    let mut rounding_fields = fields
+        .iter()
+        .filter(|f| f.tag == COMPUTE_PIPELINE_TAG_TEXTURE_WRITE_ROUNDING_MODE);
+    let texture_write_rounding_mode = match rounding_fields.next() {
+        None => TextureWriteRoundingMode::Default,
+        Some(field) => {
+            if rounding_fields.next().is_some() {
+                return Err(DecodeStatus::ErrUnsupported("res_compute_rounding_duplicate"));
+            }
+            if field.length != 4 {
+                return Err(DecodeStatus::ErrUnsupported("res_compute_rounding_width"));
+            }
+            TextureWriteRoundingMode::parse(field.value_u32)
+                .ok_or(DecodeStatus::ErrUnsupported("res_compute_rounding_ordinal"))?
+        }
+    };
     // A descriptor that says where its stage-input descriptor is is read there,
     // and one that says nothing has none — see
     // `PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET`. The inferring path below stays
@@ -5056,6 +5079,7 @@ pub fn decode_compute_pipeline_descriptor(
     Ok(ComputePipelineDescriptor {
         kernel_func_ref: compact_tlv_u32(&fields, PIPELINE_TAG_KERNEL_FUNC).unwrap_or(0),
         stage_input,
+        texture_write_rounding_mode,
     })
 }
 

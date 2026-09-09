@@ -2015,7 +2015,9 @@ pub struct MappingEntry {
     pub condemned_entries: Option<Vec<u32>>,
     /// Guest KVA of MappingInternal (from capture or recover).
     pub mapping_internal: u64,
-    pub page_table_kva: u64,
+    /// Root table GPA decoded from the published device descriptor; GPA zero
+    /// is distinct from an absent plan.
+    pub page_table_gpa: Option<u64>,
     /// Cached `sIOSurfaceDeviceDescriptor` (0x200) from MappingInternal+0x38.
     /// Used for biplanar plane selection by texture geometry; empty when unknown.
     pub device_desc: Vec<u8>,
@@ -5340,7 +5342,7 @@ impl DeviceState {
         };
         let had = !e.page_entries.is_empty() || e.contig_ptr != 0;
         e.page_entries.clear();
-        e.page_table_kva = 0;
+        e.page_table_gpa = None;
         e.condemned_entries = None;
         Self::bump_map_generation(e);
         let (retired, retired_import) = Self::take_mapping_view(e);
@@ -5376,7 +5378,7 @@ impl DeviceState {
             return false;
         }
         e.condemned_entries = Some(std::mem::take(&mut e.page_entries));
-        e.page_table_kva = 0;
+        e.page_table_gpa = None;
         let (retired, retired_import) = Self::take_mapping_view(e);
         let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
@@ -5423,7 +5425,7 @@ impl DeviceState {
         } else {
             e.page_entries.clear();
         }
-        e.page_table_kva = 0;
+        e.page_table_gpa = None;
         e.device_desc.clear();
         e.content_generation = 0;
         e.surface_content_epoch = 0;
@@ -5464,7 +5466,7 @@ impl DeviceState {
         if let Some(e) = self.mappings.get_mut(&mapping_id) {
             e.mapped = false;
             e.page_entries.clear();
-            e.page_table_kva = 0;
+            e.page_table_gpa = None;
             e.condemned_entries = None;
             e.mapping_internal = 0;
             e.device_desc.clear();
@@ -5515,7 +5517,7 @@ impl DeviceState {
         e.mapped = true;
         e.mapping_internal = mapping_internal;
         e.page_entries.clear();
-        e.page_table_kva = 0;
+        e.page_table_gpa = None;
         e.condemned_entries = None;
         e.device_desc.clear();
         e.content_generation = 0;

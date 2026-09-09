@@ -122,6 +122,8 @@ pub mod dispatch;
 pub mod draw;
 pub mod endian;
 pub mod extent;
+pub mod memoryless;
+pub mod planar;
 pub mod fifo;
 pub mod fnv;
 pub mod gva;

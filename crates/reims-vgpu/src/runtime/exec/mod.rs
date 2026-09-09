@@ -5211,6 +5211,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             out.metal_draws_fail = out.metal_draws_fail.saturating_add(1);
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
+        let mut render_pass = crate::backend::selected().begin_render_pass();
         for (di, pd) in draw_list.iter().enumerate() {
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let mut req = if di == 0 {
@@ -5280,7 +5281,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
                 let draw_started = std::time::Instant::now();
                 fin.enter(crate::runtime::drain::FinishPhase::Encode);
-                let encode = crate::backend::selected().encode_draw_chain(
+                let encode = render_pass.encode_draw(
                     state,
                     host,
                     &mut req,
@@ -5605,6 +5606,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
         .colors
         .iter()
         .map(|c| draw::ColorRtRequest {
+            storage: c.storage,
             slot: c.slot,
             texture_ref: c.texture_ref,
             mapping_id: c.mapping_id,

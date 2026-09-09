@@ -23,9 +23,23 @@ pub(crate) struct MetalStage {
     /// Read by this rail's format refusal; the Vulkan rail reaches its images by
     /// another route and never asks.
     pub(crate) texture_ref: u32,
+    pub(crate) planar: Option<std::sync::Arc<crate::backend::metal::planar::SampledImage>>,
 }
 
 impl RailStage for MetalStage {
+    fn supports_planar_samples() -> bool { true }
+
+    fn stage_planar(
+        texture_ref: u32,
+        description: crate::protocol::planar::TextureDescription,
+        layout: crate::protocol::planar::Layout,
+        planes: [Vec<u8>; 2],
+    ) -> Result<Self, ComputeStatus> {
+        let image = crate::backend::metal::planar::SampledImage::new(description, layout, planes)
+            .map_err(|reason| ComputeStatus::Unsupported(reason.slug()))?;
+        Ok(Self { texture_ref, planar: Some(std::sync::Arc::new(image)) })
+    }
+
     /// This rail keeps no residency mirror, so neither residency fact survives
     /// staging — see `super::vulkan::resident_serve` for the rail that does.
     fn stage(
@@ -33,7 +47,7 @@ impl RailStage for MetalStage {
         _residency: Option<ComputeStorageResidencyCandidate>,
         _serve: Option<ResidentServe>,
     ) -> Self {
-        Self { texture_ref }
+        Self { texture_ref, planar: None }
     }
 }
 
@@ -102,6 +116,16 @@ pub(crate) fn split_staged_textures(
     let mut storage: Vec<ReimsVgpuStorageImage> = Vec::new();
     let mut sampled: Vec<ReimsVgpuComputeSampledImage> = Vec::new();
     for t in staged {
+        if let Some(image) = &t.rail.planar {
+            if t.is_storage {
+                return Err(ComputeStatus::Unsupported("planar_storage_binding"));
+            }
+            sampled.push(ReimsVgpuComputeSampledImage::Planar {
+                binding: t.binding,
+                image: image.clone(),
+            });
+            continue;
+        }
         let selector = t.storage_selector_or_refuse(task_id, pipeline_ref)?;
         if t.is_storage {
             storage.push(ReimsVgpuStorageImage {
@@ -135,6 +159,31 @@ pub(crate) fn split_staged_textures(
         }
     }
     Ok((storage, sampled))
+}
+
+/// A fragment binding can reuse precisely the compute rail's checked whole-
+/// surface staging. `None` means this is not a direct composite type11 texture.
+pub(crate) fn try_stage_planar_sampled<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+) -> Result<Option<std::sync::Arc<crate::backend::metal::planar::SampledImage>>, ComputeStatus> {
+    let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
+        return Ok(None);
+    };
+    if entry.object_type != crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE {
+        return Ok(None);
+    }
+    let Some(descriptor) = objects::read_descriptor(state, host, task_id, &entry) else {
+        return Ok(None);
+    };
+    if crate::protocol::planar::type11_sample_format(&descriptor).is_none() {
+        return Ok(None);
+    }
+    let staged = stage_texture_raw::<MetalStage, _>(state, host, task_id, texture_ref, 0, false)?;
+    staged.rail.planar.map(Some)
+        .ok_or(ComputeStatus::Unsupported("planar_staging_missing"))
 }
 
 /// One nested dispatch's deferred writeback (GPU → host staging → GVA after session commit).
@@ -243,7 +292,7 @@ pub(crate) fn flush_nested_jobs<M: HostMemory + HostOps>(
     ComputeStatus::Ok
 }
 
-fn stage_input_to_apv(
+pub(crate) fn stage_input_to_apv(
     si: &ComputeStageInputDescriptor,
 ) -> crate::backend::metal::abi::ReimsVgpuComputeStageInputDescriptor {
     use crate::backend::metal::abi::{
@@ -308,6 +357,21 @@ fn stage_input_to_apv(
 }
 
 pub(crate) fn execute_dispatch_metal<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    acc: &ComputeAccum,
+    dispatch: &DispatchRecord,
+    session: Option<&mut crate::runtime::compute_session::metal::MetalSession>,
+) -> ComputeStatus {
+    // Drain reflection and encoder temporaries per dispatch, not per segment.
+    // Nested jobs move owned Metal handles and their backing into the session.
+    objc::rc::autoreleasepool(|| {
+        execute_dispatch_pooled(state, host, task_id, acc, dispatch, session)
+    })
+}
+
+fn execute_dispatch_pooled<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -507,6 +571,7 @@ pub(crate) fn execute_dispatch_metal<M: HostMemory + HostOps>(
             indirect_region_args.as_ref(),
             imageblock.as_ref(),
             reims_vgpu_stage_input.as_ref(),
+            pipeline.texture_write_rounding_mode,
             dispatch_threads,
             grid,
             tg,
@@ -543,6 +608,7 @@ pub(crate) fn execute_dispatch_metal<M: HostMemory + HostOps>(
         indirect_region_args.as_ref(),
         imageblock.as_ref(),
         reims_vgpu_stage_input.as_ref(),
+        pipeline.texture_write_rounding_mode,
         dispatch_threads,
         dispatch_type,
         grid,

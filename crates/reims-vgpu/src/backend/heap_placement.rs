@@ -24,6 +24,11 @@ use crate::runtime::heap_query::{QueryError, SizeAndAlign, TextureDescriptor};
 
 #[cfg(target_os = "macos")]
 pub fn heap_texture_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
+    objc::rc::autoreleasepool(|| heap_texture_size_and_align_pooled(desc))
+}
+
+#[cfg(target_os = "macos")]
+fn heap_texture_size_and_align_pooled(desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
     use crate::protocol::texture_shape::TextureKind;
     use metal::{
         MTLResourceOptions, MTLTextureType, MTLTextureUsage, TextureDescriptor as MtlDescriptor,

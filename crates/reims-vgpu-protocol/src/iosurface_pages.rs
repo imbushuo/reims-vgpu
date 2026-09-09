@@ -90,6 +90,7 @@ pub fn dims_extent(dims: u64) -> (u32, u32) {
 }
 
 pub const DEVICE_DESC_LEN: usize = 0x200;
+pub const DEVICE_DESC_PAGE_TABLE: usize = 0x00;
 pub const DEVICE_DESC_PIXEL_FORMAT: usize = 0x04;
 pub const DEVICE_DESC_BASE_OFFSET: usize = 0x08;
 pub const DEVICE_DESC_ALLOC_SIZE: usize = 0x10;
@@ -105,6 +106,7 @@ pub fn page_size_of(page_shift: u32) -> u64 {
 }
 
 pub const PAGE_ENTRY_VALID: u32 = 0x1;
+pub const PAGE_ENTRY_CHILD_TABLE: u32 = 0x2;
 pub const PAGE_ENTRY_PFN_SHIFT: u32 = 2;
 
 pub const MAPPING_INTERNAL_BACKPTR: u64 = 0x18;
@@ -112,11 +114,6 @@ pub const MAPPING_INTERNAL_ID: u64 = 0x30;
 pub const MAPPING_INTERNAL_DESC_PTR: u64 = 0x38;
 pub const MAPPING_INTERNAL_SIZE: u64 = 0x40;
 pub const MAPPING_INTERNAL_EXPECTED_SIZE: u32 = 0x200;
-pub const MAPPING_INTERNAL_PAGE_FIELD_48: u64 = 0x48;
-pub const MAPPING_INTERNAL_PAGE_FIELD_50: u64 = 0x50;
-pub const MAPPING_INTERNAL_PAGE_COUNT: u64 = 0x70;
-pub const MAPPING_PAGE_TABLE_FROM_F48: u64 = 0xb8;
-pub const MAPPING_PAGE_TABLE_FROM_F50: u64 = 0x28;
 
 pub const ARM_KERNEL_VA_MASK: u64 = 0xffffff00_00000000;
 pub const ARM_KERNEL_VA_BASE: u64 = 0xfffffe00_00000000;
@@ -141,10 +138,10 @@ pub enum Status {
     ErrInternalMappingId(&'static str),
     ErrInternalSize(&'static str),
     ErrInternalFields(&'static str),
+    ErrPageGeometry(&'static str),
     ErrPageCount(&'static str),
     ErrPageTableRead(&'static str),
     ErrPageEntry(&'static str),
-    ErrNoPageTable(&'static str),
 }
 
 impl reims_vgpu_observe::Refusal for Status {
@@ -158,10 +155,10 @@ impl reims_vgpu_observe::Refusal for Status {
             | Self::ErrInternalMappingId(reason)
             | Self::ErrInternalSize(reason)
             | Self::ErrInternalFields(reason)
+            | Self::ErrPageGeometry(reason)
             | Self::ErrPageCount(reason)
             | Self::ErrPageTableRead(reason)
-            | Self::ErrPageEntry(reason)
-            | Self::ErrNoPageTable(reason) => Some(reason),
+            | Self::ErrPageEntry(reason) => Some(reason),
         }
     }
 
@@ -175,10 +172,10 @@ impl reims_vgpu_observe::Refusal for Status {
             Self::ErrInternalMappingId(_) => "internal_mapping_id",
             Self::ErrInternalSize(_) => "internal_size",
             Self::ErrInternalFields(_) => "internal_fields",
+            Self::ErrPageGeometry(_) => "page_geometry",
             Self::ErrPageCount(_) => "page_count",
             Self::ErrPageTableRead(_) => "page_table_read",
             Self::ErrPageEntry(_) => "page_entry",
-            Self::ErrNoPageTable(_) => "no_page_table",
         };
         vec![("class", class.to_string())]
     }
@@ -220,42 +217,14 @@ pub struct MapperInternalFields {
     pub owner_kva: u64,
     pub mapping_id: u32,
     pub internal_size: u32,
-    pub page_field_48: u64,
-    pub page_field_50: u64,
-    pub raw_page_count: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageTablePlan {
     pub entries: Vec<u32>,
-    pub page_table_kva: u64,
+    pub page_table_gpa: u64,
     pub min_size: u64,
     pub required_pages: u64,
-    /// Whether the `MappingInternal` field this plan did *not* come through was
-    /// populated as well.
-    ///
-    /// [`build_table_plan`] used to chase `+0x48` then `+0xb8`, and `+0x50`
-    /// then `+0x28`, returning the entries of whichever parsed first — the
-    /// classic "try both, keep the one that works" ladder. Two driven arm64
-    /// boots retired it; see that function. This is what is left of the
-    /// measurement, and it stays because it is free: `contract` stays clear of
-    /// the observability dependency, so the fact travels in the plan rather
-    /// than being emitted here.
-    pub candidates: CandidateOutcome,
-}
-
-/// What the unused `MappingInternal` page field held on one successful plan.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CandidateOutcome {
-    /// `+0x50` held a kernel VA as well as `+0x48`, which the plan came
-    /// through.
-    ///
-    /// Measured `true` on every one of 223 successful resolves across two
-    /// driven arm64 workloads, which is *why* the second chase could go: the
-    /// field is populated essentially always, so it never discriminated
-    /// anything. A run where this turned mostly `false` would mean the two
-    /// fields really are two layouts and the deletion was wrong.
-    pub other_field_populated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -588,20 +557,22 @@ pub fn mapper_request_published_entry_offset(producer: u32) -> Option<u64> {
     }
 }
 
-pub fn required_entry_count(
-    fields: &MapperInternalFields,
-    min_size: u64,
-    page_shift: u32,
-) -> Result<u32, Status> {
-    let pages64 = fields.raw_page_count;
-    let required_pages = span_page_count_shift(min_size, page_shift);
-    // Guest page count is authoritative — no product 4096-page ceiling.
-    // Fail only on zero, span coverage, or host-unaddressable entry vectors
-    // (process addressability for `Vec<u32>` of entries — not a MiB budget).
-    if pages64 == 0 || pages64 < required_pages || pages64 > u32::MAX as u64 {
-        return Err(Status::ErrPageCount("iosurface_page_count_invalid"));
+fn required_entry_count(alloc_size: u32, min_size: u64, page_shift: u32) -> Result<u32, Status> {
+    if alloc_size == 0 {
+        return Err(Status::ErrPageCount("iosurface_allocation_size_zero"));
     }
-    let entry_bytes = pages64.saturating_mul(4);
+    // The runtime floors its physical span at one page. A subpage allocation
+    // owns that page too, but no larger byte reach may exceed the allocation.
+    let page_size = page_size_of(page_shift);
+    if min_size > (alloc_size as u64).max(page_size) {
+        return Err(Status::ErrPageCount("iosurface_span_exceeds_allocation"));
+    }
+    let pages64 = span_page_count_shift(alloc_size as u64, page_shift);
+    let table_entries = page_size / U32_SIZE as u64;
+    if pages64 > table_entries * table_entries {
+        return Err(Status::ErrPageCount("iosurface_page_table_capacity_exceeded"));
+    }
+    let entry_bytes = pages64 * U32_SIZE as u64;
     if usize::try_from(entry_bytes)
         .ok()
         .filter(|&n| n <= isize::MAX as usize)
@@ -705,28 +676,7 @@ pub fn read_mapper_identity(
         owner_kva,
         mapping_id,
         internal_size,
-        page_field_48: 0,
-        page_field_50: 0,
-        raw_page_count: 0,
     })
-}
-
-pub fn read_mapper_internal(
-    mem: &dyn PagesMemory,
-    internal_kva: u64,
-    has_mapper_device: bool,
-    mapper_device_kva: u64,
-) -> Result<MapperInternalFields, Status> {
-    let mut fields = read_mapper_identity(mem, internal_kva, has_mapper_device, mapper_device_kva)?;
-    fields.page_field_48 = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_FIELD_48).ok_or(
-        Status::ErrInternalRead("iosurface_mapper_page_field_48_read"),
-    )?;
-    fields.page_field_50 = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_FIELD_50).ok_or(
-        Status::ErrInternalRead("iosurface_mapper_page_field_50_read"),
-    )?;
-    fields.raw_page_count = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_COUNT)
-        .ok_or(Status::ErrInternalRead("iosurface_mapper_page_count_read"))?;
-    Ok(fields)
 }
 
 pub fn read_internal_desc_ptr(mem: &dyn PagesMemory, internal_kva: u64) -> Result<u64, Status> {
@@ -773,28 +723,67 @@ pub fn validate_mapper_internal(
 
 fn read_table_entries(
     mem: &dyn PagesMemory,
-    table_kva: u64,
+    table_gpa: u64,
     pages: u32,
     page_shift: u32,
 ) -> Result<Vec<u32>, Status> {
     let mut entries = Vec::with_capacity(pages as usize);
-    for i in 0..pages {
-        let entry = read_u32_at(mem, table_kva, (i as u64) * U32_SIZE as u64)
+    let table_entries = page_size_of(page_shift) / U32_SIZE as u64;
+    for i in 0..table_entries {
+        if entries.len() == pages as usize {
+            return Ok(entries);
+        }
+        let entry = read_u32_at(mem, table_gpa, i * U32_SIZE as u64)
             .ok_or(Status::ErrPageTableRead("iosurface_page_table_entry_read"))?;
         let gpa = entry_gpa_shift(entry, page_shift)
             .ok_or(Status::ErrPageEntry("iosurface_page_table_entry_invalid"))?;
         if !mem.is_ram_gpa(gpa) {
             return Err(Status::ErrPageEntry("iosurface_page_table_gpa_not_ram"));
         }
-        entries.push(entry);
+        if entry & PAGE_ENTRY_CHILD_TABLE == 0 {
+            entries.push(entry);
+            continue;
+        }
+        if gpa == table_gpa {
+            return Err(Status::ErrPageEntry("iosurface_page_table_cycle"));
+        }
+        let child_pages = (pages as usize - entries.len()).min(table_entries as usize);
+        for j in 0..child_pages {
+            let child = read_u32_at(mem, gpa, j as u64 * U32_SIZE as u64)
+                .ok_or(Status::ErrPageTableRead("iosurface_child_table_entry_read"))?;
+            let child_gpa = entry_gpa_shift(child, page_shift)
+                .ok_or(Status::ErrPageEntry("iosurface_child_table_entry_invalid"))?;
+            if child & PAGE_ENTRY_CHILD_TABLE != 0 {
+                return Err(Status::ErrPageEntry(
+                    if child_gpa == table_gpa || child_gpa == gpa {
+                        "iosurface_page_table_cycle"
+                    } else {
+                        "iosurface_page_table_depth_exceeded"
+                    },
+                ));
+            }
+            if !mem.is_ram_gpa(child_gpa) {
+                return Err(Status::ErrPageEntry("iosurface_child_table_gpa_not_ram"));
+            }
+            entries.push(child);
+        }
+    }
+    if entries.len() != pages as usize {
+        return Err(Status::ErrPageCount("iosurface_page_table_span_uncovered"));
     }
     Ok(entries)
 }
 
+/// Flatten the published descriptor's physical page table, not private backing
+/// objects. The descriptor word always names the root table; bit 1 on entries
+/// *inside* that table selects a child table. Tables contain page_size / 4
+/// entries and may be at most two levels deep. Allocation bytes size the data
+/// page list independently of geometry or MappingInternal's private layout.
 pub fn build_table_plan(
     mem: &dyn PagesMemory,
     expected_mapping_id: u32,
     fields: &MapperInternalFields,
+    device_desc: &[u8],
     min_size: u64,
     page_shift: u32,
 ) -> Result<PageTablePlan, Status> {
@@ -802,64 +791,34 @@ pub fn build_table_plan(
     if st != Status::Ok {
         return Err(st);
     }
-    let field_48_populated = mem.is_kernel_va(fields.page_field_48);
-    let field_50_populated = mem.is_kernel_va(fields.page_field_50);
-    if !field_48_populated && !field_50_populated {
-        return Err(Status::ErrInternalFields(
-            "iosurface_page_table_fields_invalid",
+    if !matches!(
+        page_shift,
+        crate::gva::PAGE_SHIFT_X86 | crate::gva::PAGE_SHIFT_ARM64E
+    ) {
+        return Err(Status::ErrPageGeometry("iosurface_page_shift_unsupported"));
+    }
+    if device_desc.len() < DEVICE_DESC_LEN {
+        return Err(Status::ErrShortDescriptor(
+            "iosurface_page_table_descriptor_short",
         ));
     }
     let required_pages = span_page_count_shift(min_size, page_shift);
-    let pages = required_entry_count(fields, min_size, page_shift)?;
-
-    // One chase, `+0x48` then `+0xb8`.
-    //
-    // There used to be a second, `+0x50` then `+0x28`, with the entries of
-    // whichever parsed first being returned — a "try both, keep the one that
-    // works" ladder, which this project refuses on principle but could not
-    // refuse here without evidence, because the alternative reading was that
-    // the two fields are two layouts handled side by side.
-    //
-    // Two driven arm64 boots settled it, over **223 successful resolves** on
-    // deliberately different workloads (Safari plus window drags; Finder view
-    // switching, System Settings panes, Mission Control and window resizes).
-    // Both fields held a kernel VA on every one of them, so the branch really
-    // did choose rather than dispatch — and `+0x48` won every one, with the
-    // second chase never once carrying a resolve that the first had failed.
-    // A branch that chooses, and always chooses the same way, is a fallback.
-    //
-    // What replaces the fallback is loudness. Every way the `+0x48` chase can
-    // fail now reaches `mapper_resolve_fail` under its own slug instead of
-    // being silently rescued by a rail nothing has confirmed, and
-    // [`CandidateOutcome::other_field_populated`] keeps measuring the premise.
-    // The field test above stays: a mapping with only `+0x50` set is still
-    // *detected*, and refused by name rather than resolved through the
-    // unconfirmed path.
-    if !field_48_populated {
-        return Err(Status::ErrNoPageTable("iosurface_page_table_only_field_50"));
+    let pages = required_entry_count(
+        ld32(&device_desc[DEVICE_DESC_ALLOC_SIZE..]),
+        min_size,
+        page_shift,
+    )?;
+    let table_gpa = entry_gpa_shift(ld32(&device_desc[DEVICE_DESC_PAGE_TABLE..]), page_shift)
+        .ok_or(Status::ErrPageEntry("iosurface_page_table_root_invalid"))?;
+    if !mem.is_ram_gpa(table_gpa) {
+        return Err(Status::ErrPageEntry("iosurface_page_table_root_not_ram"));
     }
-    let table_kva = match read_u64_at(mem, fields.page_field_48, MAPPING_PAGE_TABLE_FROM_F48) {
-        Some(v) if mem.is_kernel_va(v) => v,
-        Some(_) => {
-            return Err(Status::ErrNoPageTable(
-                "iosurface_page_table_pointer_48_invalid",
-            ))
-        }
-        None => {
-            return Err(Status::ErrPageTableRead(
-                "iosurface_page_table_pointer_48_read",
-            ))
-        }
-    };
-    let entries = read_table_entries(mem, table_kva, pages, page_shift)?;
+    let entries = read_table_entries(mem, table_gpa, pages, page_shift)?;
     Ok(PageTablePlan {
         entries,
-        page_table_kva: table_kva,
+        page_table_gpa: table_gpa,
         min_size,
         required_pages,
-        candidates: CandidateOutcome {
-            other_field_populated: field_50_populated,
-        },
     })
 }
 
@@ -882,11 +841,13 @@ mod tests {
 
     struct MapMem {
         map: HashMap<u64, u8>,
+        non_ram: Vec<u64>,
     }
     impl MapMem {
         fn new() -> Self {
             Self {
                 map: HashMap::new(),
+                non_ram: Vec::new(),
             }
         }
         fn put_u32(&mut self, a: u64, v: u32) {
@@ -911,7 +872,10 @@ mod tests {
             true
         }
         fn is_kernel_va(&self, address: u64) -> bool {
-            arm_kernel_va(address)
+            guest_kernel_va(address)
+        }
+        fn is_ram_gpa(&self, address: u64) -> bool {
+            !self.non_ram.contains(&address)
         }
     }
 
@@ -945,146 +909,210 @@ mod tests {
         );
     }
 
-    /// An unreadable `+0x48` pointer is refused by its own name, however good
-    /// the other field looks.
-    ///
-    /// This case used to be the interesting one for a different reason: with
-    /// two candidates the question was which failure to *attribute* the refusal
-    /// to, and the answer was "the candidate actually walked". With one
-    /// candidate there is nothing to outrank, and the case becomes the alarm
-    /// instead. A well-formed table sits behind `+0x50` here and this device
-    /// deliberately does not go and get it, so if a driven arm64 boot ever
-    /// shows this slug the deletion of that chase is what to reconsider.
-    #[test]
-    fn an_unreadable_chased_pointer_is_refused_by_its_own_name() {
-        let internal = ARM_KERNEL_VA_BASE + 0x10_000;
-        let field_48 = ARM_KERNEL_VA_BASE + 0x20_000;
-        let field_50 = ARM_KERNEL_VA_BASE + 0x30_000;
-        let table = ARM_KERNEL_VA_BASE + 0x40_000;
-        let mut mem = MapMem::new();
+    fn page_entry(pfn: u32) -> u32 {
+        (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+    }
 
-        mem.put_u64(field_50 + MAPPING_PAGE_TABLE_FROM_F50, table);
-        mem.put_u32(table, 0);
-        let fields = MapperInternalFields {
-            internal_kva: internal,
+    fn table_descriptor(root: u32, alloc_size: u32) -> [u8; DEVICE_DESC_LEN] {
+        let mut desc = [0; DEVICE_DESC_LEN];
+        crate::endian::st32(&mut desc[DEVICE_DESC_PAGE_TABLE..], root);
+        crate::endian::st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], alloc_size);
+        desc
+    }
+
+    fn mapper_fields(page_shift: u32) -> MapperInternalFields {
+        MapperInternalFields {
+            internal_kva: if page_shift == crate::gva::PAGE_SHIFT_X86 {
+                X86_KERNEL_VA_MIN + 0x10_000
+            } else {
+                ARM_KERNEL_VA_BASE + 0x10_000
+            },
             mapping_id: 3,
             internal_size: MAPPING_INTERNAL_EXPECTED_SIZE,
-            page_field_48: field_48,
-            page_field_50: field_50,
-            raw_page_count: 1,
             ..MapperInternalFields::default()
-        };
+        }
+    }
 
-        let error =
-            build_table_plan(&mem, 3, &fields, PAGE_SIZE_ARM64E, PAGE_SHIFT_ARM64E).unwrap_err();
+    #[test]
+    fn descriptor_root_and_rounded_allocation_own_the_page_list() {
+        for shift in [crate::gva::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+            let page_size = page_size_of(shift);
+            let fields = mapper_fields(shift);
+            let mut mem = MapMem::new();
+            // Only identity bytes exist: no private backing fields can be read.
+            mem.put_u64(fields.internal_kva + MAPPING_INTERNAL_BACKPTR, 0);
+            mem.put_u32(fields.internal_kva + MAPPING_INTERNAL_ID, 3);
+            mem.put_u32(
+                fields.internal_kva + MAPPING_INTERNAL_SIZE,
+                MAPPING_INTERNAL_EXPECTED_SIZE,
+            );
+            let fields = read_mapper_identity(&mem, fields.internal_kva, false, 0).unwrap();
+            let table = 2 * page_size;
+            mem.put_u32(table, page_entry(8));
+            mem.put_u32(table + 4, page_entry(10));
+            let desc = table_descriptor(page_entry(2), page_size as u32 + 1);
+            let plan = build_table_plan(&mem, 3, &fields, &desc, page_size, shift).unwrap();
+            assert_eq!(plan.entries, vec![page_entry(8), page_entry(10)]);
+            assert_eq!(plan.page_table_gpa, table);
+            assert_eq!(plan.required_pages, 1);
+        }
+    }
+
+    #[test]
+    fn published_framebuffer_shape_resolves_without_private_fields() {
+        let mut mem = MapMem::new();
+        let root = 0x0009_6d09;
+        let table = 0x96d0_8000;
+        for i in 0..1013 {
+            mem.put_u32(table + i * 4, page_entry(0x10000 + i as u32));
+        }
+        let desc = table_descriptor(root, 0x00fd_2000);
+        let plan = build_table_plan(
+            &mem,
+            3,
+            &mapper_fields(PAGE_SHIFT_ARM64E),
+            &desc,
+            0x00fd_2000,
+            PAGE_SHIFT_ARM64E,
+        )
+        .unwrap();
+        assert_eq!(plan.page_table_gpa, table);
+        assert_eq!(plan.entries.len(), 1013);
+        assert_eq!(plan.required_pages, 1013);
+    }
+
+    #[test]
+    fn allocation_bounds_allow_one_physical_page_but_not_extra_byte_reach() {
+        for shift in [crate::gva::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+            let page_size = page_size_of(shift);
+            let mut mem = MapMem::new();
+            mem.put_u32(2 * page_size, page_entry(8));
+            mem.put_u32(2 * page_size + 4, page_entry(9));
+            let fields = mapper_fields(shift);
+            for alloc in [1, 512, page_size as u32, page_size as u32 + 1] {
+                let desc = table_descriptor(page_entry(2), alloc);
+                let plan = build_table_plan(&mem, 3, &fields, &desc, page_size, shift).unwrap();
+                assert_eq!(
+                    plan.entries.len() as u64,
+                    span_page_count_shift(alloc as u64, shift),
+                );
+                let err = build_table_plan(
+                    &mem,
+                    3,
+                    &fields,
+                    &desc,
+                    (alloc as u64).max(page_size) + 1,
+                    shift,
+                )
+                .unwrap_err();
+                assert_eq!(err.refusal(), Some("iosurface_span_exceeds_allocation"));
+            }
+            let desc = table_descriptor(page_entry(2), 0);
+            assert_eq!(
+                build_table_plan(&mem, 3, &fields, &desc, page_size, shift)
+                    .unwrap_err()
+                    .refusal(),
+                Some("iosurface_allocation_size_zero")
+            );
+        }
+    }
+
+    #[test]
+    fn child_flags_in_root_entries_select_two_levels_and_stop_at_allocation() {
+        for shift in [crate::gva::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+            let size = page_size_of(shift);
+            let count = size / 4;
+            for root_flag in [0, PAGE_ENTRY_CHILD_TABLE] {
+                let mut mem = MapMem::new();
+                mem.put_u32(2 * size, page_entry(3) | PAGE_ENTRY_CHILD_TABLE);
+                mem.put_u32(2 * size + 4, page_entry(4) | PAGE_ENTRY_CHILD_TABLE);
+                let mut expected = Vec::new();
+                for i in 0..count {
+                    let entry = page_entry(8 + i as u32);
+                    mem.put_u32(3 * size + i * 4, entry);
+                    expected.push(entry);
+                }
+                mem.put_u32(4 * size, page_entry(7));
+                expected.push(page_entry(7));
+                let desc = table_descriptor(page_entry(2) | root_flag, ((count + 1) * size) as u32);
+                let plan = build_table_plan(&mem, 3, &mapper_fields(shift), &desc, size, shift).unwrap();
+                assert_eq!(plan.entries, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_published_tables_have_typed_refusals() {
+        let shift = PAGE_SHIFT_ARM64E;
+        let size = page_size_of(shift);
+        let fields = mapper_fields(shift);
+        let desc = table_descriptor(page_entry(2), size as u32);
+        let refused = |mem: &MapMem, desc: &[u8], reason| {
+            assert_eq!(
+                build_table_plan(mem, 3, &fields, desc, size, shift)
+                    .unwrap_err()
+                    .refusal(),
+                Some(reason)
+            );
+        };
+        let mut mem = MapMem::new();
+        refused(&mem, &desc[..0x20], "iosurface_page_table_descriptor_short");
+        refused(
+            &mem,
+            &table_descriptor(0, size as u32),
+            "iosurface_page_table_root_invalid",
+        );
+        mem.non_ram.push(2 * size);
+        refused(&mem, &desc, "iosurface_page_table_root_not_ram");
+        mem.non_ram.clear();
+        refused(&mem, &desc, "iosurface_page_table_entry_read");
+        mem.put_u32(2 * size, 0);
+        refused(&mem, &desc, "iosurface_page_table_entry_invalid");
+        mem.put_u32(2 * size, page_entry(3));
+        mem.non_ram.push(3 * size);
+        refused(&mem, &desc, "iosurface_page_table_gpa_not_ram");
+        mem.put_u32(2 * size, page_entry(3) | PAGE_ENTRY_CHILD_TABLE);
+        refused(&mem, &desc, "iosurface_page_table_gpa_not_ram");
+        mem.non_ram.clear();
+        refused(&mem, &desc, "iosurface_child_table_entry_read");
+        mem.put_u32(3 * size, 0);
+        refused(&mem, &desc, "iosurface_child_table_entry_invalid");
+        mem.put_u32(3 * size, page_entry(4));
+        mem.non_ram.push(4 * size);
+        refused(&mem, &desc, "iosurface_child_table_gpa_not_ram");
+        mem.non_ram.clear();
+        mem.put_u32(3 * size, page_entry(4) | PAGE_ENTRY_CHILD_TABLE);
+        refused(&mem, &desc, "iosurface_page_table_depth_exceeded");
+        for ancestor in [2, 3] {
+            mem.put_u32(3 * size, page_entry(ancestor) | PAGE_ENTRY_CHILD_TABLE);
+            refused(&mem, &desc, "iosurface_page_table_cycle");
+        }
+        mem.put_u32(2 * size, page_entry(2) | PAGE_ENTRY_CHILD_TABLE);
+        refused(&mem, &desc, "iosurface_page_table_cycle");
         assert_eq!(
-            error.refusal(),
-            Some("iosurface_page_table_pointer_48_read")
+            build_table_plan(&mem, 3, &fields, &desc, size, 64)
+                .unwrap_err()
+                .refusal(),
+            Some("iosurface_page_shift_unsupported")
         );
     }
 
-    /// The page table comes through `+0x48` or it does not come at all.
-    ///
-    /// The `+0x50` chase that used to stand behind it was retired on 223
-    /// successful resolves across two driven arm64 workloads, on which both
-    /// fields were always populated and `+0x48` always won. The two cases that
-    /// used to be rescued by it are now refusals **by name**, which is the
-    /// whole trade: a rail nothing has confirmed no longer answers silently,
-    /// and if either refusal ever appears in a driven boot's log it says the
-    /// deletion was wrong and names which reading was right.
     #[test]
-    fn the_page_table_comes_through_field_48_or_is_refused_by_name() {
-        let internal = ARM_KERNEL_VA_BASE + 0x10_000;
-        let field_48 = ARM_KERNEL_VA_BASE + 0x20_000;
-        let field_50 = ARM_KERNEL_VA_BASE + 0x30_000;
-        let table_a = ARM_KERNEL_VA_BASE + 0x40_000;
-        let table_b = ARM_KERNEL_VA_BASE + 0x50_000;
-        let good_entry = 1u32; // frame 1, which `entry_gpa_shift` accepts
-        let base = |page_field_48, page_field_50| MapperInternalFields {
-            internal_kva: internal,
-            mapping_id: 3,
-            internal_size: MAPPING_INTERNAL_EXPECTED_SIZE,
-            page_field_48,
-            page_field_50,
-            raw_page_count: 1,
-            ..MapperInternalFields::default()
-        };
-
-        // Only `+0x48` populated: a plan, and the census says the other field
-        // was empty. On the two measured workloads this never happened.
-        let mut mem = MapMem::new();
-        mem.put_u64(field_48 + MAPPING_PAGE_TABLE_FROM_F48, table_a);
-        mem.put_u32(table_a, good_entry);
-        let plan = build_table_plan(
-            &mem,
-            3,
-            &base(field_48, 0),
-            PAGE_SIZE_ARM64E,
-            PAGE_SHIFT_ARM64E,
-        )
-        .expect("the chased field alone is a plan");
-        assert_eq!(plan.page_table_kva, table_a);
-        assert!(!plan.candidates.other_field_populated);
-
-        // Both populated and both parseable: the plan comes through `+0x48`,
-        // and `table_b` is never read. This is the shape all 223 measured
-        // resolves had.
-        let mut mem = MapMem::new();
-        mem.put_u64(field_48 + MAPPING_PAGE_TABLE_FROM_F48, table_a);
-        mem.put_u64(field_50 + MAPPING_PAGE_TABLE_FROM_F50, table_b);
-        mem.put_u32(table_a, good_entry);
-        mem.put_u32(table_b, good_entry);
-        let plan = build_table_plan(
-            &mem,
-            3,
-            &base(field_48, field_50),
-            PAGE_SIZE_ARM64E,
-            PAGE_SHIFT_ARM64E,
-        )
-        .expect("both good is a plan");
-        assert_eq!(plan.page_table_kva, table_a, "the chase is `+0x48`");
-        assert!(plan.candidates.other_field_populated);
-
-        // Only `+0x50` populated. The field test still sees it — this is not
-        // `iosurface_page_table_fields_invalid` — but the chase that used to
-        // answer it is gone, so it is refused under a name that says exactly
-        // which reading of the two fields it would take to make that wrong.
-        let mut mem = MapMem::new();
-        mem.put_u64(field_50 + MAPPING_PAGE_TABLE_FROM_F50, table_b);
-        mem.put_u32(table_b, good_entry);
-        let error = build_table_plan(
-            &mem,
-            3,
-            &base(0, field_50),
-            PAGE_SIZE_ARM64E,
-            PAGE_SHIFT_ARM64E,
-        )
-        .expect_err("the deleted chase does not answer this");
-        assert_eq!(error.refusal(), Some("iosurface_page_table_only_field_50"));
-
-        // Both populated, `+0x48`'s table unparseable. This is the one shape
-        // the fallback was ever load-bearing for, and `earlier_failed` read
-        // zero over both driven boots — so it is now a refusal carrying the
-        // reason the table failed, rather than a silent rescue.
-        let mut mem = MapMem::new();
-        mem.put_u64(field_48 + MAPPING_PAGE_TABLE_FROM_F48, table_a);
-        mem.put_u64(field_50 + MAPPING_PAGE_TABLE_FROM_F50, table_b);
-        mem.put_u32(table_a, 0); // a zero entry is refused
-        mem.put_u32(table_b, good_entry);
-        let error = build_table_plan(
-            &mem,
-            3,
-            &base(field_48, field_50),
-            PAGE_SIZE_ARM64E,
-            PAGE_SHIFT_ARM64E,
-        )
-        .expect_err("no second candidate rescues this any more");
-        assert_eq!(
-            error.refusal(),
-            Some("iosurface_page_table_entry_invalid"),
-            "the refusal names why the chased table failed, not that a \
-             fallback was missing"
-        );
+    fn a_flat_table_must_not_read_past_its_guest_page() {
+        for shift in [crate::gva::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+            let size = page_size_of(shift);
+            let mut mem = MapMem::new();
+            for i in 0..size / 4 {
+                mem.put_u32(2 * size + i * 4, page_entry(8 + i as u32));
+            }
+            let desc = table_descriptor(page_entry(2), ((size / 4 + 1) * size) as u32);
+            assert_eq!(
+                build_table_plan(&mem, 3, &mapper_fields(shift), &desc, size, shift)
+                    .unwrap_err()
+                    .refusal(),
+                Some("iosurface_page_table_span_uncovered")
+            );
+        }
     }
 
     #[test]
@@ -1095,6 +1123,79 @@ mod tests {
             packed_span_estimate(MTL_FORMAT_BGRA8_UNORM, 200, 100),
             Some(896 * 100)
         );
+    }
+
+    #[test]
+    fn mixed_root_entries_preserve_leaf_order_without_reading_unused_slots() {
+        for shift in [crate::gva::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+            let size = page_size_of(shift);
+            let mut mem = MapMem::new();
+            mem.put_u32(2 * size, page_entry(8));
+            mem.put_u32(2 * size + 4, page_entry(3) | PAGE_ENTRY_CHILD_TABLE);
+            mem.put_u32(3 * size, page_entry(10));
+            mem.put_u32(3 * size + 4, page_entry(9));
+            let desc = table_descriptor(page_entry(2), (2 * size + 1) as u32);
+            let plan =
+                build_table_plan(&mem, 3, &mapper_fields(shift), &desc, 2 * size + 1, shift)
+                    .unwrap();
+            assert_eq!(plan.entries, vec![page_entry(8), page_entry(10), page_entry(9)]);
+            assert_eq!(plan.required_pages, 3);
+        }
+    }
+
+    #[test]
+    fn allocation_count_has_no_private_or_arbitrary_page_ceiling() {
+        for shift in [crate::gva::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+            let size = page_size_of(shift);
+            for alloc in [1, (4097 * size) as u32, u32::MAX] {
+                assert_eq!(
+                    required_entry_count(alloc, u64::from(alloc).max(size), shift),
+                    Ok(span_page_count_shift(u64::from(alloc), shift) as u32)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_walk_retains_mapping_identity_validation() {
+        let shift = PAGE_SHIFT_ARM64E;
+        let mem = MapMem::new();
+        let fields = mapper_fields(shift);
+        let desc = table_descriptor(page_entry(2), PAGE_SIZE_ARM64E as u32);
+        for (invalid, reason) in [
+            (
+                MapperInternalFields { internal_kva: 0, ..fields },
+                "iosurface_validate_internal_kva_invalid",
+            ),
+            (
+                MapperInternalFields { mapping_id: 4, ..fields },
+                "iosurface_validate_mapping_id_mismatch",
+            ),
+            (
+                MapperInternalFields { internal_size: 0, ..fields },
+                "iosurface_validate_internal_size_mismatch",
+            ),
+            (
+                MapperInternalFields { has_mapper_device: true, ..fields },
+                "iosurface_validate_mapper_device_kva_invalid",
+            ),
+            (
+                MapperInternalFields {
+                    has_mapper_device: true,
+                    mapper_device_kva: ARM_KERNEL_VA_BASE,
+                    owner_kva: ARM_KERNEL_VA_BASE + 1,
+                    ..fields
+                },
+                "iosurface_validate_internal_owner_mismatch",
+            ),
+        ] {
+            assert_eq!(
+                build_table_plan(&mem, 3, &invalid, &desc, PAGE_SIZE_ARM64E, shift)
+                    .unwrap_err()
+                    .refusal(),
+                Some(reason)
+            );
+        }
     }
 
     #[test]

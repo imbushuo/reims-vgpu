@@ -13,6 +13,32 @@
 use super::*;
 use crate::runtime::draw::vulkan::gva_span_identity;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ComputeRoundingUnsupported {
+    mode: TextureWriteRoundingMode,
+}
+
+impl crate::observe::Decline for ComputeRoundingUnsupported {
+    fn slug(&self) -> &'static str {
+        "compute_vk_texture_write_rounding_unsupported"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("mode", self.mode.word().to_string())]
+    }
+}
+
+pub(crate) fn validate_texture_write_rounding(
+    mode: TextureWriteRoundingMode,
+) -> Result<(), ComputeRoundingUnsupported> {
+    match mode {
+        TextureWriteRoundingMode::Default => Ok(()),
+        TextureWriteRoundingMode::TowardZero | TextureWriteRoundingMode::ToNearestEven => {
+            Err(ComputeRoundingUnsupported { mode })
+        }
+    }
+}
+
 /// The sampled-image bindings that need a neutral texture: those the module
 /// statically uses and `bound` does not cover.
 ///
@@ -499,6 +525,15 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let Some(pipeline) = load_compute_pipeline(state, host, task_id, acc.pipeline_ref) else {
         return ComputeStatus::MissingPipeline("compute_vk_pipeline_load");
     };
+    // Neither Vulkan image writes nor metal2vulkan currently implement this
+    // descriptor specialization. Compiling the default would run another program.
+    if let Err(reason) = validate_texture_write_rounding(pipeline.texture_write_rounding_mode) {
+        crate::observe::Emit::decline("compute_linux_pipeline", &reason)
+            .field("task", task_id)
+            .field("pipe", acc.pipeline_ref)
+            .fail();
+        return ComputeStatus::Unsupported(crate::observe::Decline::slug(&reason));
+    }
     if let Some(stage_input) = pipeline.stage_input.as_ref() {
         if crate::observe::first_sight("compute_stage_input_contract", u64::from(acc.pipeline_ref))
         {

@@ -91,6 +91,7 @@ pub(crate) use texture_view::*;
 // items have callers outside it.
 mod render_target;
 use render_target::{lookup_render_target, ResolvedRenderTarget};
+pub use reims_vgpu_protocol::memoryless::ColorStorage;
 
 /// Bind **index** cap for the buffer argument table.
 ///
@@ -494,9 +495,11 @@ pub struct IndexedDrawInfo {
 ///
 /// Archive `ApplePVGPURenderTarget`: either mapper-ref-texture IOSurface (`mapping_id`) or
 /// normal-texture guest-VA linear (`target_gva` + `row_stride`). Wallpaper/background
-/// layers are the GVA form.
+/// layers are the GVA form. Memoryless attachments have neither address; their
+/// `storage` declaration confines their contents to one render pass.
 #[derive(Clone, Debug, Default)]
 pub struct ColorRtRequest {
+    pub storage: ColorStorage,
     pub slot: u32,
     pub texture_ref: u32,
     pub mapping_id: u32,
@@ -2110,6 +2113,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         return lost("unbound_texture_ref");
     }
     let Some(ResolvedRenderTarget {
+        storage,
         mapping_id,
         target_gva: gva,
         width: w,
@@ -2121,6 +2125,9 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     else {
         return lost("render_target_unresolved");
     };
+    if storage == ColorStorage::Memoryless {
+        return true;
+    }
     let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
     if rgba.len() < need {
         return lost("readback_short");
@@ -2336,6 +2343,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         .pipeline_raster_sample_count(state, host, task_id, pipeline_ref)
         .unwrap_or(rt.sample_count);
     let c0 = ColorRtRequest {
+        storage: rt.storage,
         slot: 0,
         texture_ref: color_texture_ref,
         mapping_id: rt.mapping_id,
@@ -2345,9 +2353,13 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         height: rt.height,
         format: rt.format,
         sample_count: attachment_sample_count,
-        load_action: 0,
-        store_action: MTL_STORE_ACTION_STORE,
-        clear_color: [0.0; 4],
+        load_action: if rt.storage == ColorStorage::Memoryless { color.load_action } else { 0 },
+        store_action: if rt.storage == ColorStorage::Memoryless {
+            color.store_action
+        } else {
+            MTL_STORE_ACTION_STORE
+        },
+        clear_color: if rt.storage == ColorStorage::Memoryless { color.clear_color } else { [0.0; 4] },
         target_seed_rgba: None,
         multisample_source_ref: 0,
     };
@@ -2480,6 +2492,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             (att.texture_ref, 0, source_target)
         };
         let ResolvedRenderTarget {
+            storage,
             mapping_id,
             target_gva: gva,
             width: mw,
@@ -2504,6 +2517,19 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             base_w = mw;
             base_h = mh;
         } else if mw != base_w || mh != base_h {
+            if storage == ColorStorage::Memoryless
+                || colors.iter().any(|c: &ColorRtRequest| c.storage == ColorStorage::Memoryless)
+            {
+                if let Some(event) = crate::observe::Emit::refusal(
+                    "mrt_request", &EncodeStatus::BadArgs("mrt_memoryless_geometry"),
+                ) {
+                    event.field("task", task_id).field("slot", slot)
+                        .field("dims", format!("{mw}x{mh}"))
+                        .field("pass_dims", format!("{base_w}x{base_h}"))
+                        .fail_once((u64::from(task_id) << 32) | u64::from(att.texture_ref));
+                }
+                return None;
+            }
             // An attachment whose geometry differs from the first one is
             // dropped, and the draw goes on with the rest. **This is a loss the
             // guest is not told about**: the shader still writes that
@@ -2541,11 +2567,11 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             // Clear-only stream record for this attachment: real Metal Clear.
             load_action = MTL_LOAD_ACTION_CLEAR;
             clear_color = cl.clear_color;
-            if mapping_id == 0 {
+            if mapping_id == 0 && storage == ColorStorage::GuestBacked {
                 seed = Some(solid_rgba8(mw, mh, &cl.clear_color));
             }
         } else if att.load_action == MTL_LOAD_ACTION_CLEAR {
-            if mapping_id == 0 {
+            if mapping_id == 0 && storage == ColorStorage::GuestBacked {
                 seed = Some(solid_rgba8(mw, mh, &att.clear_color));
             }
         } else if att.load_action == MTL_LOAD_ACTION_LOAD && mapping_id == 0 {
@@ -2725,6 +2751,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             }
         }
         colors.push(ColorRtRequest {
+            storage,
             slot,
             texture_ref: target_ref,
             mapping_id,

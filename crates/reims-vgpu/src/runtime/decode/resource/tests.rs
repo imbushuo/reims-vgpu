@@ -1119,10 +1119,20 @@ fn compute_pipeline_stage_input_fixture() {
 /// the assertion. It reproduces the record a live macOS 12.7.6 guest sends: 56
 /// bytes, section at 32, both counts zero.
 fn macos12_shaped_compute_pipeline(kernel_ref: u32, attrs: u32, layouts: u32) -> Vec<u8> {
-    // Two fields of `[tag][len][u32]` behind a one-byte count, then padding to
+    compute_pipeline_with_stage_input_and_rounding(kernel_ref, attrs, layouts, None)
+}
+
+fn compute_pipeline_with_stage_input_and_rounding(
+    kernel_ref: u32,
+    attrs: u32,
+    layouts: u32,
+    rounding: Option<u32>,
+) -> Vec<u8> {
+    // Kernel and stage-input offset, plus optional rounding, then padding to
     // the section's four-byte alignment.
     const TLV_TWO_FIELDS: usize = 1 + 2 * (1 + 1 + 4);
-    let section = (SERIALIZER_OBJECT_FIRST_TLVS + TLV_TWO_FIELDS).next_multiple_of(4);
+    let first_fields = 2 + usize::from(rounding.is_some());
+    let section = (SERIALIZER_OBJECT_FIRST_TLVS + 1 + first_fields * 6).next_multiple_of(4);
     // The section's own two fields, then its two offset arrays and compact-TLV
     // entries. Both entry kinds carry four u32 properties.
     const ENTRY_LEN: usize = 1 + 4 * (1 + 1 + 4);
@@ -1138,7 +1148,7 @@ fn macos12_shaped_compute_pipeline(kernel_ref: u32, attrs: u32, layouts: u32) ->
     st32(&mut b[8..], kernel_ref + 1);
     st32(&mut b[12..], (total - SERIALIZER_OBJECT_FIRST_TLVS) as u32);
 
-    b[SERIALIZER_OBJECT_FIRST_TLVS] = 2;
+    b[SERIALIZER_OBJECT_FIRST_TLVS] = first_fields as u8;
     let mut p = SERIALIZER_OBJECT_FIRST_TLVS + 1;
     for (tag, value) in [
         (
@@ -1151,6 +1161,11 @@ fn macos12_shaped_compute_pipeline(kernel_ref: u32, attrs: u32, layouts: u32) ->
         b[p + 1] = 4;
         st32(&mut b[p + 2..], value);
         p += 6;
+    }
+    if let Some(rounding) = rounding {
+        b[p] = COMPUTE_PIPELINE_TAG_TEXTURE_WRITE_ROUNDING_MODE;
+        b[p + 1] = 4;
+        st32(&mut b[p + 2..], rounding);
     }
 
     b[section] = 2;
@@ -1203,6 +1218,125 @@ fn macos12_shaped_compute_pipeline(kernel_ref: u32, attrs: u32, layouts: u32) ->
         ],
     );
     b
+}
+
+fn compute_pipeline_rounding_fields(values: &[&[u8]]) -> Vec<u8> {
+    let payload_len = 1 + 6 + values.iter().map(|v| 2 + v.len()).sum::<usize>();
+    let len = SERIALIZER_OBJECT_FIRST_TLVS + payload_len.next_multiple_of(4);
+    let mut b = vec![0u8; len];
+    st32(&mut b[0..], SERIALIZER_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut b[4..], len as u32);
+    st32(&mut b[12..], payload_len as u32);
+    b[SERIALIZER_OBJECT_FIRST_TLVS] = 1 + values.len() as u8;
+    let mut p = SERIALIZER_OBJECT_FIRST_TLVS + 1;
+    b[p] = PIPELINE_TAG_KERNEL_FUNC;
+    b[p + 1] = 4;
+    st32(&mut b[p + 2..], 9);
+    p += 6;
+    for value in values {
+        b[p] = COMPUTE_PIPELINE_TAG_TEXTURE_WRITE_ROUNDING_MODE;
+        b[p + 1] = value.len() as u8;
+        b[p + 2..p + 2 + value.len()].copy_from_slice(value);
+        p += 2 + value.len();
+    }
+    b
+}
+
+#[test]
+fn compute_rounding_decodes_default_and_each_native_ordinal() {
+    let cap = crate::observe::FailCapture::start();
+    let absent = decode_compute_pipeline_descriptor(&compute_pipeline_rounding_fields(&[])).unwrap();
+    assert_eq!(absent.texture_write_rounding_mode, TextureWriteRoundingMode::Default);
+    assert!(absent.stage_input.is_none());
+    for mode in [
+        TextureWriteRoundingMode::Default,
+        TextureWriteRoundingMode::TowardZero,
+        TextureWriteRoundingMode::ToNearestEven,
+    ] {
+        let bytes = compute_pipeline_rounding_fields(&[&mode.word().to_le_bytes()]);
+        let decoded = decode_compute_pipeline_descriptor(&bytes).unwrap();
+        assert_eq!(decoded.kernel_func_ref, 9);
+        assert_eq!(decoded.texture_write_rounding_mode, mode);
+        assert!(decoded.stage_input.is_none());
+    }
+    assert!(!cap.lines().iter().any(|line| line.contains("pipeline_descriptor_field_dropped")));
+}
+
+#[test]
+fn compute_rounding_labelled_56_and_60_byte_descriptors_have_no_stage_input() {
+    for len in [56usize, 60] {
+        let mut bytes = vec![0u8; len];
+        st32(&mut bytes, SERIALIZER_OBJECT_COMPUTE_PIPELINE);
+        st32(&mut bytes[4..], len as u32);
+        st32(&mut bytes[12..], (len - SERIALIZER_OBJECT_FIRST_TLVS) as u32);
+        bytes[SERIALIZER_OBJECT_FIRST_TLVS] = 3;
+        let label_offset = 1 + 3 * 6;
+        let mut p = SERIALIZER_OBJECT_FIRST_TLVS + 1;
+        for (tag, word) in [
+            (COMPUTE_PIPELINE_TAG_LABEL, label_offset as u32),
+            (COMPUTE_PIPELINE_TAG_TEXTURE_WRITE_ROUNDING_MODE, 2),
+            (PIPELINE_TAG_KERNEL_FUNC, 9),
+        ] {
+            bytes[p] = tag;
+            bytes[p + 1] = 4;
+            st32(&mut bytes[p + 2..], word);
+            p += 6;
+        }
+        bytes[p..len - 1].fill(b'x');
+        let decoded = decode_compute_pipeline_descriptor(&bytes).unwrap();
+        assert_eq!(decoded.kernel_func_ref, 9);
+        assert_eq!(decoded.texture_write_rounding_mode, TextureWriteRoundingMode::ToNearestEven);
+        assert!(decoded.stage_input.is_none());
+    }
+}
+
+#[test]
+fn compute_rounding_refuses_unknown_ordinal_width_duplicates_and_truncation() {
+    for word in [3u32, 255, u32::MAX] {
+        let bytes = compute_pipeline_rounding_fields(&[&word.to_le_bytes()]);
+        assert_eq!(
+            decode_compute_pipeline_descriptor(&bytes).unwrap_err(),
+            DecodeStatus::ErrUnsupported("res_compute_rounding_ordinal")
+        );
+    }
+    for value in [&[][..], &[2][..], &[2, 0, 0][..], &[2, 0, 0, 0, 0][..]] {
+        let bytes = compute_pipeline_rounding_fields(&[value]);
+        assert_eq!(
+            decode_compute_pipeline_descriptor(&bytes).unwrap_err(),
+            DecodeStatus::ErrUnsupported("res_compute_rounding_width")
+        );
+    }
+    let bytes = compute_pipeline_rounding_fields(&[&0u32.to_le_bytes(), &2u32.to_le_bytes()]);
+    assert_eq!(
+        decode_compute_pipeline_descriptor(&bytes).unwrap_err(),
+        DecodeStatus::ErrUnsupported("res_compute_rounding_duplicate")
+    );
+    let mut truncated = compute_pipeline_rounding_fields(&[&2u32.to_le_bytes()]);
+    truncated.truncate(SERIALIZER_OBJECT_FIRST_TLVS + 1 + 6 + 2 + 3);
+    let len = truncated.len() as u32;
+    st32(&mut truncated[4..], len);
+    assert_eq!(
+        decode_compute_pipeline_descriptor(&truncated).unwrap_err(),
+        DecodeStatus::ErrShort("res_tlv_value_short")
+    );
+    let mut unknown_tag = compute_pipeline_rounding_fields(&[&2u32.to_le_bytes()]);
+    unknown_tag[SERIALIZER_OBJECT_FIRST_TLVS + 1 + 6] = 0xfe;
+    assert_eq!(
+        decode_compute_pipeline_descriptor(&unknown_tag).unwrap_err(),
+        DecodeStatus::ErrUnsupported("res_pipeline_field_unread")
+    );
+}
+
+#[test]
+fn compute_rounding_preserves_populated_stage_input() {
+    let plain = decode_compute_pipeline_descriptor(&macos12_shaped_compute_pipeline(9, 2, 3)).unwrap();
+    let rounded = decode_compute_pipeline_descriptor(
+        &compute_pipeline_with_stage_input_and_rounding(9, 2, 3, Some(2)),
+    ).unwrap();
+    assert_eq!(rounded.texture_write_rounding_mode, TextureWriteRoundingMode::ToNearestEven);
+    assert_eq!(rounded.kernel_func_ref, plain.kernel_func_ref);
+    assert!(rounded.stage_input.is_some());
+    assert_eq!(rounded.stage_input, plain.stage_input);
 }
 
 /// macOS 12 states where its stage-input descriptor is, and this device reads it

@@ -102,7 +102,7 @@ pub const REIMS_VGPU_BACKEND_MAX_VIEWPORTS: usize = 16;
 pub const REIMS_VGPU_BACKEND_MAX_SCISSORS: usize = REIMS_VGPU_BACKEND_MAX_VIEWPORTS;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ReimsVgpuComputeStageInputAttribute {
     pub raw_bits: u32,
     pub location: u32,
@@ -116,7 +116,7 @@ const _: () = assert!(size_of::<ReimsVgpuComputeStageInputAttribute>() == 6 * si
 const _: () = assert!(align_of::<ReimsVgpuComputeStageInputAttribute>() == align_of::<u32>());
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ReimsVgpuComputeStageInputLayout {
     pub raw_bits: u32,
     pub buffer_index: u32,
@@ -132,7 +132,7 @@ const _: () = assert!(size_of::<ReimsVgpuComputeStageInputLayout>() == 24);
 const _: () = assert!(offset_of!(ReimsVgpuComputeStageInputLayout, stride) == 16);
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ReimsVgpuComputeStageInputDescriptor {
     pub word0: u32,
     pub header0: u32,
@@ -197,7 +197,7 @@ const _: () = assert!(offset_of!(ReimsVgpuStorageImage, data) == 16);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct ReimsVgpuComputeSampledImage {
+pub struct ReimsVgpuPackedComputeSampledImage {
     pub binding: u32,
     /// The contract's selector, for [`ReimsVgpuStorageImage::format`]'s reason.
     pub format: crate::protocol::pixel_format::StorageImageSelector,
@@ -207,12 +207,18 @@ pub struct ReimsVgpuComputeSampledImage {
     pub len: usize,
     pub has_swizzle: u32,
     /// Read by [`super::compute`] only when `has_swizzle != 0`; inert otherwise.
-    /// Build through [`Self::unswizzled`] rather than filling it in by hand.
+    /// Build through [`ReimsVgpuComputeSampledImage::unswizzled`] rather than filling it in by hand.
     pub swizzle: [u8; 4],
 }
 
-const _: () = assert!(size_of::<ReimsVgpuComputeSampledImage>() == 40);
-const _: () = assert!(offset_of!(ReimsVgpuComputeSampledImage, swizzle) == 36);
+const _: () = assert!(size_of::<ReimsVgpuPackedComputeSampledImage>() == 40);
+const _: () = assert!(offset_of!(ReimsVgpuPackedComputeSampledImage, swizzle) == 36);
+
+#[derive(Clone, Debug)]
+pub(crate) enum ReimsVgpuComputeSampledImage {
+    Packed(ReimsVgpuPackedComputeSampledImage),
+    Planar { binding: u32, image: std::sync::Arc<super::planar::SampledImage> },
+}
 
 impl ReimsVgpuComputeSampledImage {
     /// A binding whose texels are consumed in their declared channel order.
@@ -232,7 +238,7 @@ impl ReimsVgpuComputeSampledImage {
         data: *const u8,
         len: usize,
     ) -> Self {
-        Self {
+        Self::Packed(ReimsVgpuPackedComputeSampledImage {
             binding,
             format,
             width,
@@ -241,7 +247,7 @@ impl ReimsVgpuComputeSampledImage {
             len,
             has_swizzle: 0,
             swizzle: [0; 4],
-        }
+        })
     }
 }
 
@@ -278,7 +284,7 @@ pub fn texture_binds_as_storage(usages: &[ReimsVgpuComputeTextureUsage], binding
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct ReimsVgpuSampledImage {
+pub struct ReimsVgpuPackedSampledImage {
     pub binding: u32,
     pub width: u32,
     pub height: u32,
@@ -288,6 +294,12 @@ pub struct ReimsVgpuSampledImage {
     pub bytes_per_row: u32,
     pub data: *const u8,
     pub data_len: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ReimsVgpuSampledImage {
+    Packed(ReimsVgpuPackedSampledImage),
+    Planar { binding: u32, image: std::sync::Arc<super::planar::SampledImage> },
 }
 
 #[repr(C)]

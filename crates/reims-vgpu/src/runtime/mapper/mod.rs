@@ -3,7 +3,8 @@
 //! Capture runs on the iosfc producer MMIO path (guest x19/x21/x22 still hold
 //! the directed handoff from `do_host_mapping_gated`). Resolve builds
 //! `MappingEntry.page_entries` and geometry from MappingInternal + device
-//! descriptor via guest KVA reads ([`HostOps::read_kva`]).
+//! descriptor via guest KVA reads ([`HostOps::read_kva`]), then walks its
+//! published physical page table through [`HostMemory::read_gpa`].
 
 // The backend the process executes on, reached only through the trait.
 use crate::backend::Backend as _;
@@ -11,7 +12,7 @@ use crate::model::{DeviceState, MapperCapture};
 use crate::protocol::iosurface_pages::{
     self, build_table_plan, decode_device_surface, decode_mapper_request_entry, guest_kernel_va,
     mapper_request_published_entry_offset, mapping_span_bound, read_internal_desc_ptr,
-    read_mapper_identity, read_mapper_internal, validate_mapper_internal, PagesMemory,
+    read_mapper_identity, validate_mapper_internal, PagesMemory,
     DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE, MAPPER_CAPTURE_REG_MAPPING_INTERNAL,
     MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
     MAPPER_REQUEST_UNMAP,
@@ -364,11 +365,11 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     let internal = m.mapping_internal;
     let mapper = state.mapper_device_kva;
     let cached_pages = m.page_entries.len();
-    let cached_table = m.page_table_kva;
+    let cached_table = m.page_table_gpa.unwrap_or(0);
     let had_cached_pages = cached_pages != 0;
     let mem = MapperMem::new(host);
 
-    let fields = match read_mapper_internal(&mem, internal, mapper != 0, mapper) {
+    let fields = match read_mapper_identity(&mem, internal, mapper != 0, mapper) {
         Ok(f) => f,
         Err(status) => {
             let reason = refusal_reason(&status);
@@ -438,69 +439,64 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         return false;
     }
 
-    // Geometry from device descriptor when present; cache full 0x200 for
-    // biplanar plane selection (mapping_span_bound).
+    // The published descriptor owns both the root GPA and allocation size.
+    // Losing its KVA alias does not revoke an already validated physical plan;
+    // a readable but malformed descriptor does.
+    let desc_kva = match read_internal_desc_ptr(&mem, internal) {
+        Ok(kva) => kva,
+        Err(status) => {
+            if had_cached_pages
+                && matches!(mem.last_error(), Some(MemError::NoCpu | MemError::Unmapped))
+            {
+                return true;
+            }
+            note_resolve_fail(
+                mapping_id,
+                refusal_reason(&status),
+                crate::observe::Emit::refusal("mapper_resolve_fail", &status)
+                    .expect("the error arm cannot carry Status::Ok")
+                    .field("mapping", mapping_id)
+                    .field("internal", format!("{internal:#x}"))
+                    .render(),
+            );
+            return false;
+        }
+    };
+    let mut device_desc = [0u8; DEVICE_DESC_LEN];
+    if !mem.read(desc_kva, &mut device_desc) {
+        let error = mem.last_error().unwrap_or(MemError::Unmapped);
+        if had_cached_pages && matches!(error, MemError::NoCpu | MemError::Unmapped) {
+            return true;
+        }
+        let decline = MapperDecline::DeviceDescriptorRead(error);
+        note_resolve_fail(
+            mapping_id,
+            crate::observe::Decline::slug(&decline),
+            crate::observe::Emit::decline("mapper_resolve_fail", &decline)
+                .field("mapping", mapping_id)
+                .field("internal", format!("{internal:#x}"))
+                .field("descriptor", format!("{desc_kva:#x}"))
+                .render(),
+        );
+        return false;
+    }
+
+    // Cache the full descriptor for biplanar plane selection.
     let mut width = 0u32;
     let mut height = 0u32;
     let mut format = 0u16;
     // Guest page size for *this* device — never a bare arm PAGE_SIZE constant.
     let guest_page = state.page_size();
     let mut min_size = guest_page;
-    let mut device_desc: Option<Vec<u8>> = None;
-    match read_internal_desc_ptr(&mem, internal) {
-        Ok(desc_kva) => {
-            let mut desc = [0u8; DEVICE_DESC_LEN];
-            if !mem.read(desc_kva, &mut desc) {
-                let decline = MapperDecline::DeviceDescriptorRead(
-                    mem.last_error().unwrap_or(MemError::Unmapped),
-                );
-                note_resolve_fail(
-                    mapping_id,
-                    crate::observe::Decline::slug(&decline),
-                    crate::observe::Emit::decline("mapper_device_descriptor_fallback", &decline)
-                        .field("mapping", mapping_id)
-                        .field("internal", format!("{internal:#x}"))
-                        .field("descriptor", format!("{desc_kva:#x}"))
-                        .render(),
-                );
-            } else {
-                device_desc = Some(desc.to_vec());
-                if let Some(surf) = decode_device_surface(&desc) {
-                    if surf.alloc_size as u64 > 0 {
-                        min_size = (surf.alloc_size as u64).max(guest_page);
-                    }
-                    if surf.width > 0 && surf.height > 0 {
-                        width = surf.width;
-                        height = surf.height;
-                        // Not `as u16`: this field carries an MTL ordinal or
-                        // an OSType FourCC depending on who wrote the
-                        // descriptor, and narrowing a FourCC produces a format
-                        // nothing in the device accepts. See
-                        // `objects::device_desc_format_to_mtl`.
-                        format =
-                            crate::runtime::objects::device_desc_format_to_mtl(surf.pixel_format);
-                        if let Some(end) = mapping_span_bound(Some(&desc), format, width, height) {
-                            min_size = min_size.max(end).max(guest_page);
-                        }
-                    }
-                }
-            }
-        }
-        Err(status) => {
-            let reason = refusal_reason(&status);
-            // A zero descriptor pointer is the documented "not present" state:
-            // geometry can come from the texture object. A failed read or a
-            // nonzero invalid pointer is a real fallback decision.
-            if reason != "iosurface_mapper_device_desc_pointer_zero" {
-                note_resolve_fail(
-                    mapping_id,
-                    reason,
-                    crate::observe::Emit::refusal("mapper_device_descriptor_fallback", &status)
-                        .expect("the error arm cannot carry Status::Ok")
-                        .field("mapping", mapping_id)
-                        .field("internal", format!("{internal:#x}"))
-                        .render(),
-                );
+    if let Some(surf) = decode_device_surface(&device_desc) {
+        min_size = (surf.alloc_size as u64).max(guest_page);
+        if surf.width > 0 && surf.height > 0 {
+            width = surf.width;
+            height = surf.height;
+            // The format field may be an MTL ordinal or an OSType FourCC.
+            format = crate::runtime::objects::device_desc_format_to_mtl(surf.pixel_format);
+            if let Some(end) = mapping_span_bound(Some(&device_desc), format, width, height) {
+                min_size = min_size.max(end);
             }
         }
     }
@@ -512,73 +508,48 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             width = m.width;
             height = m.height;
             format = if m.format != 0 { m.format } else { format };
-            let desc_slice = device_desc.as_deref().or(m.device_desc_complete());
-            if let Some(end) = mapping_span_bound(desc_slice, format, width, height) {
+            if let Some(end) = mapping_span_bound(Some(&device_desc), format, width, height) {
                 min_size = min_size.max(end).max(guest_page);
             }
         }
     }
 
-    let plan = match build_table_plan(&mem, mapping_id, &fields, min_size, state.page_shift) {
+    let plan = match build_table_plan(
+        &mem,
+        mapping_id,
+        &fields,
+        &device_desc,
+        min_size,
+        state.page_shift,
+    ) {
         Ok(p) => p,
         Err(status) => {
             // Still latch geom / device desc if we decoded them, even without pages yet.
-            if let Some(ref d) = device_desc {
-                let _ = state.set_mapping_device_desc(mapping_id, d);
-            }
+            let _ = state.set_mapping_device_desc(mapping_id, &device_desc);
             if width > 0 && height > 0 {
                 let _ = state.set_mapping_geom(mapping_id, width, height, format);
-                // Geometry IS known, yet no page table covers its
-                // `min_size` span — the short-page-table → black-tile class
-                // (fail-closed Store writeback / sample walk while the geom is
-                // set). Distinct from the dims-not-yet-landed poll (width==0),
-                // which stays silent as legitimate not-ready control flow.
-                let reason = refusal_reason(&status);
-                note_resolve_fail(
-                    mapping_id,
-                    reason,
-                    crate::observe::Emit::refusal("mapper_resolve_fail", &status)
-                        .expect("the error arm cannot carry Status::Ok")
-                        .field("mapping", mapping_id)
-                        .field("width", width)
-                        .field("height", height)
-                        .field("format", format!("{format:#x}"))
-                        .field("min_size", min_size)
-                        .render(),
-                );
             }
+            note_resolve_fail(
+                mapping_id,
+                refusal_reason(&status),
+                crate::observe::Emit::refusal("mapper_resolve_fail", &status)
+                    .expect("the error arm cannot carry Status::Ok")
+                    .field("mapping", mapping_id)
+                    .field("width", width)
+                    .field("height", height)
+                    .field("format", format!("{format:#x}"))
+                    .field("min_size", min_size)
+                    .field(
+                        "host_reason",
+                        mem.last_error()
+                            .map(|e| crate::observe::Decline::slug(&e))
+                            .unwrap_or("none"),
+                    )
+                    .render(),
+            );
             return false;
         }
     };
-
-    // The count that carried `build_table_plan`'s second candidate to its
-    // deletion, kept because it is what would falsify that deletion.
-    //
-    // That function used to chase `MappingInternal` `+0x48` then `+0xb8`, and
-    // `+0x50` then `+0x28`, taking whichever parsed first. The question was
-    // whether that is a "try both, keep the one that works" ladder or two
-    // layouts handled side by side, and it turns on how often both fields are
-    // populated at once: never, and it dispatches; always, and it chooses.
-    //
-    // Measured **223 successful resolves across two driven arm64 workloads**,
-    // and both fields held a kernel VA on every single one while `+0x48` won
-    // every single one. So it chose, always the same way, and the second chase
-    // never carried a resolve — which is a fallback, and it is gone.
-    //
-    // `iosurface_pt_cand_both` therefore stays as the premise's alarm rather
-    // than as a tally: it should keep reading equal to
-    // `iosurface_pt_cand_only_48 + itself`, i.e. essentially 100%. A run where
-    // `only_48` grows means the two fields are *not* both always populated,
-    // which is the reading under which the deleted chase was load-bearing.
-    //
-    // This rail is arm64-only — it is entered from `capture_at_producer`, which
-    // needs `HostOps::read_xreg`, and the x86 PCI shim returns -1 for that
-    // unconditionally — so only an arm64 boot can move these.
-    crate::runtime::drain::note_store_route(if plan.candidates.other_field_populated {
-        "iosurface_pt_cand_both"
-    } else {
-        "iosurface_pt_cand_only_48"
-    });
 
     // Read before the `get_mut` below takes `state` mutably.
     let page_shift = state.page_shift;
@@ -678,12 +649,10 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             }
         }
         m.page_entries = plan.entries;
-        m.page_table_kva = plan.page_table_kva;
+        m.page_table_gpa = Some(plan.page_table_gpa);
         m.mapping_internal = internal;
         m.mapped = true;
-        if let Some(ref d) = device_desc {
-            m.device_desc = d.clone();
-        }
+        m.device_desc = device_desc.to_vec();
     }
     if let Some(v) = retired {
         state.retired_views.push(v);
@@ -1000,11 +969,11 @@ pub fn ensure_resolved_for_scanout<H: HostMemory + HostOps>(
 /// Fail-closed page-list revalidation before host writeback or import-present.
 ///
 /// When `mapping_internal` is set **and** we previously resolved a live
-/// `page_table_kva`, re-walk MappingInternal so we never write through PFNs the
-/// guest recycled (zone freelist `0xff000000ff000000` class). Resolve failure
+/// `page_table_gpa`, re-walk the published descriptor so we never write through
+/// PFNs the guest recycled (zone freelist `0xff000000ff000000` class). Resolve failure
 /// **invalidates** a live table rather than writing stale PFNs.
 ///
-/// Manual / unit-test page lists (`page_table_kva == 0`) keep their entries when
+/// Manual / unit-test page lists (`page_table_gpa == None`) keep their entries when
 /// resolve is not available — product MAP always re-resolves once KVA is known.
 pub fn revalidate_mapping_pages<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1062,7 +1031,7 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
         return Some("revalidate_unmapped");
     }
     let has_internal = m.mapping_internal != 0;
-    let had_live_table = m.page_table_kva != 0;
+    let had_live_table = m.page_table_gpa.is_some();
     let had_pages = !m.page_entries.is_empty();
     // Whether the resolve below ran at all, and whether it reported success —
     // the two facts that separate the empty-page-list outcomes from each other.
@@ -1098,7 +1067,7 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
             }
             return Some("revalidate_resolve_fail");
         }
-        // No prior live KVA (first resolve miss, or test fixture with manual
+        // No prior physical table (first resolve miss, or test fixture with manual
         // page_entries only) — fall through to accept non-empty manual list.
     }
     match state.mappings.get(&mapping_id) {

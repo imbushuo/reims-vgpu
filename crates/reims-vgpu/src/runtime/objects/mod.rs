@@ -3920,7 +3920,7 @@ fn apply_backing<M: HostMemory>(
         }
         m.page_entries = entries;
         m.mapped = true;
-        m.page_table_kva = 0;
+        m.page_table_gpa = None;
         m.device_desc = device_desc;
         // Latched with the list rather than near it: this records the walk that
         // produced the entries above, so a later reader can repeat that walk —

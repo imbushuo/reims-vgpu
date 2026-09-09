@@ -278,10 +278,12 @@ pub fn attached() -> bool {
 /// Silent without a presenter: the window resizes before it attaches and after
 /// it detaches, and neither is a lost frame.
 pub fn resize(width: u32, height: u32) {
-    PRESENTER.with(|cell| {
-        if let Some(presenter) = cell.borrow_mut().as_mut() {
-            presenter.set_drawable_size(width, height);
-        }
+    objc::rc::autoreleasepool(|| {
+        PRESENTER.with(|cell| {
+            if let Some(presenter) = cell.borrow_mut().as_mut() {
+                presenter.set_drawable_size(width, height);
+            }
+        });
     });
 }
 
@@ -302,15 +304,21 @@ pub fn present(
 /// there to be detached from, which is the ordering the window's `exiting`
 /// callback exists to guarantee.
 pub fn detach() {
-    PRESENTER.with(|cell| {
-        if cell.borrow_mut().take().is_some() {
-            ATTACHED.store(false, Ordering::Release);
-        }
+    objc::rc::autoreleasepool(|| {
+        PRESENTER.with(|cell| {
+            if cell.borrow_mut().take().is_some() {
+                ATTACHED.store(false, Ordering::Release);
+            }
+        });
     });
 }
 
 impl Presenter {
     fn create(surface: &WindowSurface) -> Result<Self, MetalWindowDecline> {
+        objc::rc::autoreleasepool(|| Self::create_pooled(surface))
+    }
+
+    fn create_pooled(surface: &WindowSurface) -> Result<Self, MetalWindowDecline> {
         let RawWindowHandle::AppKit(handle) = surface.window else {
             return Err(MetalWindowDecline::NotAppKitWindow);
         };

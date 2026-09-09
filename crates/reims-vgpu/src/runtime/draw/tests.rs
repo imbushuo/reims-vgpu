@@ -2300,7 +2300,8 @@ fn missing_pipeline_is_soft() {
     // for a pipeline it cannot resolve, and naming one would make a build
     // carrying both assert against whichever glob import won.
     let st = crate::backend::selected()
-        .encode_draw_chain(&mut state, &mut host, &mut req, true, false)
+        .begin_render_pass()
+        .encode_draw(&mut state, &mut host, &mut req, true, false)
         .0;
     assert!(matches!(
         st,
@@ -6294,6 +6295,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     let page = 1u64 << PAGE_SHIFT_ARM64E;
     // 64x64 BGRA8 with a tight stride is exactly one 16 KiB page.
     let c0 = ColorRtRequest {
+        storage: ColorStorage::GuestBacked,
         slot: 0,
         texture_ref: 7,
         mapping_id: 0,
@@ -6502,6 +6504,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
     const BPR: u32 = W * 4;
     let fmt = crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let target = ColorRtRequest {
+        storage: ColorStorage::GuestBacked,
         slot: 0,
         texture_ref: 7,
         mapping_id: 0,
@@ -6622,11 +6625,9 @@ fn mapper_ref_texture_sample_resolves_geometry_before_reading_it() {
     use crate::protocol::endian::{st32, st64};
     use crate::protocol::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
-        DEVICE_DESC_PIXEL_FORMAT, DEVICE_DESC_PLANE_COUNT, MAPPING_INTERNAL_BACKPTR,
-        MAPPING_INTERNAL_DESC_PTR, MAPPING_INTERNAL_EXPECTED_SIZE, MAPPING_INTERNAL_ID,
-        MAPPING_INTERNAL_PAGE_COUNT, MAPPING_INTERNAL_PAGE_FIELD_48,
-        MAPPING_INTERNAL_PAGE_FIELD_50, MAPPING_INTERNAL_SIZE, MAPPING_PAGE_TABLE_FROM_F48,
-        PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
+        DEVICE_DESC_PAGE_TABLE, DEVICE_DESC_PIXEL_FORMAT, DEVICE_DESC_PLANE_COUNT,
+        MAPPING_INTERNAL_BACKPTR, MAPPING_INTERNAL_DESC_PTR, MAPPING_INTERNAL_EXPECTED_SIZE,
+        MAPPING_INTERNAL_ID, MAPPING_INTERNAL_SIZE, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
     };
     use crate::runtime::host::HostMemory;
 
@@ -6652,8 +6653,7 @@ fn mapper_ref_texture_sample_resolves_geometry_before_reading_it() {
     let mut host = FakeHost::new();
     let internal = KVA;
     let mapper = KVA + 0x1000;
-    let page_obj = KVA + 0x2000;
-    let table = KVA + 0x3000;
+    let table = 0x8000_0000u64;
     let desc_kva = KVA + 0x4000;
 
     put_u64(&mut host, internal + MAPPING_INTERNAL_BACKPTR, mapper);
@@ -6663,15 +6663,7 @@ fn mapper_ref_texture_sample_resolves_geometry_before_reading_it() {
         internal + MAPPING_INTERNAL_SIZE,
         MAPPING_INTERNAL_EXPECTED_SIZE,
     );
-    put_u64(
-        &mut host,
-        internal + MAPPING_INTERNAL_PAGE_FIELD_48,
-        page_obj,
-    );
-    put_u64(&mut host, internal + MAPPING_INTERNAL_PAGE_FIELD_50, 0);
-    put_u64(&mut host, internal + MAPPING_INTERNAL_PAGE_COUNT, 1);
     put_u64(&mut host, internal + MAPPING_INTERNAL_DESC_PTR, desc_kva);
-    put_u64(&mut host, page_obj + MAPPING_PAGE_TABLE_FROM_F48, table);
 
     let pfn = 0x1e88c_u32;
     let page_gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -6687,6 +6679,10 @@ fn mapper_ref_texture_sample_resolves_geometry_before_reading_it() {
 
     // The device-surface descriptor is the only carrier of this surface's dims.
     let mut desc = vec![0u8; DEVICE_DESC_LEN];
+    st32(
+        &mut desc[DEVICE_DESC_PAGE_TABLE..],
+        ((table >> PAGE_SHIFT_ARM64E) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID,
+    );
     st32(
         &mut desc[DEVICE_DESC_PIXEL_FORMAT..],
         u32::from(MTL_FORMAT_BGRA8_UNORM),

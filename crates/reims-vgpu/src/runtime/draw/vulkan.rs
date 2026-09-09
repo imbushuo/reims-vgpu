@@ -117,6 +117,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // ever reaches the pipeline scissor rect, never the Store extent.
     _force_full_store: bool,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
+    if req.colors.iter().any(|c| c.storage == ColorStorage::Memoryless) {
+        return (EncodeStatus::BadArgs("draw_vk_memoryless_unsupported"), None);
+    }
     // Charges this chain to one phase at a time all the way down, including the
     // parts of it that live inside `try_metal2vulkan_draw`. Held here rather
     // than there because the Store routing below the engine is on the same

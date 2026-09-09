@@ -49,7 +49,7 @@ use crate::runtime::mapper;
 use crate::runtime::mapping_write;
 use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 use crate::runtime::objects;
-use reims_vgpu_protocol::compute::DispatchType;
+use reims_vgpu_protocol::compute::{DispatchType, TextureWriteRoundingMode};
 use reims_vgpu_protocol::decode::compute::{ComputeRecord, DispatchRecord, Extent as RecordExtent};
 
 /// Cap on Metal compute buffer slots (matches backend `REIMS_VGPU_METAL_MAX_BUFFERS`).
@@ -910,6 +910,7 @@ fn apply_record_inner<M: HostMemory + HostOps>(
 
 pub(crate) struct LoadedComputePipeline {
     pub kernel_func_ref: u32,
+    pub texture_write_rounding_mode: TextureWriteRoundingMode,
     /// Product-ready stage-input. `None` means the descriptor declared none —
     /// and only that. A descriptor whose entries exceeded the decoder's caps
     /// refuses the pipeline (`stage_input_over_cap`) rather than landing here as
@@ -978,11 +979,16 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
             return None;
         }
     };
-    let Ok(decoded) = decode_serializer_object_descriptor(&desc) else {
-        return miss(
-            crate::observe::ladder_slug!("", desc_decode),
-            format!("desc_len={}", desc.len()),
-        );
+    let decoded = match decode_serializer_object_descriptor(&desc) {
+        Ok(decoded) => decoded,
+        Err(reason) => {
+            crate::observe::Emit::decline("compute_load_pipeline", &reason)
+                .field("task", task_id)
+                .field("pipe_ref", pipeline_ref)
+                .field("desc_len", desc.len())
+                .fail();
+            return None;
+        }
     };
     match decoded {
         ResourceDescriptor::ComputePipeline(cp) if cp.kernel_func_ref != 0 => {
@@ -1026,6 +1032,7 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
             };
             Some(LoadedComputePipeline {
                 kernel_func_ref: cp.kernel_func_ref,
+                texture_write_rounding_mode: cp.texture_write_rounding_mode,
                 stage_input,
             })
         }
@@ -1377,6 +1384,17 @@ fn staged_span_pages<M: HostMemory>(
 /// answers — so this is the rail narrowing a neutral answer, not the neutral
 /// layer computing a rail's input.
 pub(crate) trait RailStage: Sized {
+    fn supports_planar_samples() -> bool { false }
+
+    fn stage_planar(
+        _texture_ref: u32,
+        _description: crate::protocol::planar::TextureDescription,
+        _layout: crate::protocol::planar::Layout,
+        _planes: [Vec<u8>; 2],
+    ) -> Result<Self, ComputeStatus> {
+        Err(ComputeStatus::Unsupported("planar_sampling_metal_only"))
+    }
+
     /// This rail's half of one staged binding, from the neutral facts of it.
     ///
     /// `texture_ref` is the guest object reference this binding was staged
@@ -1502,10 +1520,9 @@ impl ResidentServe {
 /// because one wire form with two disagreeing readers is the defect shape this
 /// repository keeps finding. This arm used to refuse the form outright.
 ///
-/// Unlike the draw twin this does **not** convert to RGBA8. [`StagedTexture`]
-/// carries `pixel_format` beside `bytes`, so the native texels survive; the
-/// draw arm narrows because its consumer takes RGBA8, and reports the loss as
-/// `buftex_narrowed`. Here there is no loss to report.
+/// Unlike the CPU RGBA8 draw loader this keeps native texels. [`StagedTexture`]
+/// carries `pixel_format` beside `bytes`; Metal's sampled draw uploads reuse
+/// this staging path rather than narrowing formats their upload can represent.
 ///
 /// De-pitching is the whole of the work: the guest's rows are `bytes_per_row`
 /// apart and only the leading tight row is texels. The rest is padding the
@@ -1589,6 +1606,7 @@ fn stage_buffer_texture<R: RailStage, M: HostMemory + HostOps>(
     // storage — and a debt may be armed under either. The draw twin pays for
     // both; so does this.
     crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, bt.buffer_ref);
     let raw = read_buffer_window(state, host, task_id, bt.buffer_ref, bt.offset, span)?;
 
     let tight = tight as usize;
@@ -1984,6 +2002,23 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     }
     if let Some(mapping_id) = mapping_id_opt {
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
+        if let Some(entry) = stage_entry.filter(|entry|
+            entry.object_type == crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE
+        ) {
+            if let Some(descriptor) = objects::read_descriptor(state, host, task_id, &entry) {
+                if crate::protocol::planar::type11_sample_format(&descriptor).is_some() {
+                    if is_storage {
+                        return Err(ComputeStatus::Unsupported("planar_storage_binding"));
+                    }
+                    if view_level != 0 || view_pixel_format.is_some() {
+                        return Err(ComputeStatus::Unsupported("planar_texture_view"));
+                    }
+                    return stage_planar_texture::<R, _>(
+                        state, host, task_id, texture_ref, stage_ref, mapping_id, binding, &descriptor,
+                    );
+                }
+            }
+        }
         // Geom/format: a ref-texture record is the exact Metal texture view over
         // the IOSurface bytes. It is authoritative even for a stageable
         // single-plane mapping: the live BGRA8 desktop target is exposed as a
@@ -2354,6 +2389,78 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 serve,
             ),
         });
+    }
+
+    fn stage_planar_texture<R: RailStage, M: HostMemory + HostOps>(
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        texture_ref: u32,
+        descriptor_ref: u32,
+        mapping_id: u32,
+        binding: u32,
+        descriptor: &[u8],
+    ) -> Result<StagedTexture<R>, ComputeStatus> {
+        use crate::protocol::planar::{Layout, TextureDescription};
+        if !R::supports_planar_samples() {
+            return Err(ComputeStatus::Unsupported("planar_sampling_metal_only"));
+        }
+        let refusal = |reason: crate::protocol::planar::Refusal| {
+            crate::observe::Emit::refusal("planar_stage", &reason)
+                .expect("planar decode is a refusal")
+                .field("task", task_id)
+                .field("ref", texture_ref)
+                .field("mapping", mapping_id)
+                .fail();
+            ComputeStatus::Unsupported(reason.slug())
+        };
+        let description = TextureDescription::decode(descriptor, descriptor_ref).map_err(refusal)?;
+        if description.mapping_id != mapping_id {
+            return Err(ComputeStatus::Unsupported("planar_mapping_identity"));
+        }
+        let mapping = state.mappings.get(&mapping_id)
+            .ok_or(ComputeStatus::MissingTexture("planar_mapping_missing"))?;
+        if !mapping.mapped || mapping.page_entries.is_empty() {
+            return Err(ComputeStatus::MissingTexture("planar_mapping_unmapped"));
+        }
+        let generation = mapping.map_generation;
+        let layout = Layout::decode(
+            &mapping.device_desc, description.width, description.height,
+        ).map_err(refusal)?;
+        let mapped_bytes = (mapping.page_entries.len() as u64).checked_shl(state.page_shift)
+            .ok_or(ComputeStatus::GuestIo("planar_mapping_span"))?;
+        if layout.allocation_size > mapped_bytes {
+            return Err(ComputeStatus::GuestIo("planar_mapping_span"));
+        }
+        if host_alloc_len(layout.allocation_size).is_none() {
+            return Err(ComputeStatus::Unsupported("planar_host_length"));
+        }
+        let mut planes = [Vec::new(), Vec::new()];
+        for (plane, bytes) in layout.planes.iter().zip(&mut planes) {
+            let len = host_alloc_len(plane.size)
+                .ok_or(ComputeStatus::Unsupported("planar_host_length"))?;
+            bytes.resize(len, 0);
+            // The byte-reader owns guest import bounds and settling outstanding
+            // GPU writeback. Read the whole declared plane, including extensions.
+            if !mapper::read_mapping_bytes(state, host, mapping_id, plane.base, bytes) {
+                return Err(ComputeStatus::GuestIo("planar_mapping_read"));
+            }
+        }
+        if state.mappings.get(&mapping_id).map(|m| m.map_generation) != Some(generation) {
+            return Err(ComputeStatus::GuestIo("planar_mapping_changed"));
+        }
+        Ok(StagedTexture {
+            binding,
+            pixel_format: description.format.word(),
+            storage_selector: None,
+            width: description.width,
+            height: description.height,
+            mip_levels: 1,
+            bytes: Vec::new(),
+            is_storage: false,
+            writeback: TextureWriteback::None,
+            rail: R::stage_planar(texture_ref, description, layout, planes)?,
+        })
     }
 
     // normal-texture linear. Fail-visible: name which gate rejected (live class:

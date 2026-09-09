@@ -1,8 +1,9 @@
 //! Which host or guest bytes a colour attachment's `texture_ref` names.
 //!
 //! Every render pass this device encodes begins by turning the guest's
-//! `texture_ref` into somewhere to render: a host mapping id, or a linear guest
-//! VA plus a row stride. [`lookup_render_target`] is the only implementation of
+//! `texture_ref` into somewhere to render: a host mapping id, a linear guest
+//! VA plus a row stride, or a pass-local memoryless attachment.
+//! [`lookup_render_target`] is the only implementation of
 //! that question, and its three callers — the single-target request builder, the
 //! MRT one, and the abandoned-chain writeback — all treat a refusal as the whole
 //! pass being lost, because Metal will not form an encoder with a null colour
@@ -20,7 +21,9 @@
 //! 3. **Backing surface / ref-texture `RefTextureHandle`.** The object-list index is
 //!    the surface id; ref-texture wraps backing and is what product colour targets
 //!    actually bind.
-//! 4. **normal-texture linear guest VA.** Wallpaper and background intermediates and
+//! 4. **Memoryless texture.** Its serializer record declares the attachment,
+//!    not guest pages. Load/Store and unsupported subresources are refused.
+//! 5. **normal-texture linear guest VA.** Wallpaper and background intermediates and
 //!    UI intermediate render targets live here, so a mapper-ref-texture-only resolve drops
 //!    those passes entirely.
 //!
@@ -58,6 +61,7 @@
 //! background noise.
 
 use super::*;
+use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 /// The colour render target's base format for a **backing** surface, or nothing.
 ///
 /// On this arm `m.format == 0` is not "unset", it is a decoded refusal:
@@ -339,8 +343,10 @@ fn differed_before(surface_id: u32) -> bool {
 /// unnoticed: all three orders type-check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ResolvedRenderTarget {
+    pub(super) storage: ColorStorage,
     /// Non-zero ⇒ a host mapping; `0` with `target_gva` non-zero ⇒ normal-texture
-    /// linear guest VA. The two are exclusive, the same way
+    /// linear guest VA. Both are zero for `ColorStorage::Memoryless`.
+    /// The guest-backed forms are exclusive, the same way
     /// [`ColorRtRequest::target_gva`] documents.
     pub(super) mapping_id: u32,
     pub(super) target_gva: u64,
@@ -406,6 +412,11 @@ pub(super) struct RenderTargetRefusal {
 /// contract. Grouped by rung in the order [`lookup_render_target`] tries them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RenderTargetCause {
+    MemorylessDescRead,
+    MemorylessDecode { decode: &'static str },
+    MemorylessReference { descriptor_ref: u32 },
+    MemorylessAttachment { level: u32, load: u16, store: u16, resolve_ref: u32 },
+    MemorylessFormat { fmt: u16 },
     /// A texture-view whose swizzle is not the identity. The archive's
     /// `resolve_texture` requires `!has_swizzle` for a linear resolve, so the
     /// channel order this view asks for cannot be honoured by rendering into
@@ -544,6 +555,11 @@ impl crate::observe::Decline for RenderTargetRefusal {
     fn slug(&self) -> &'static str {
         use RenderTargetCause as C;
         match self.cause {
+            C::MemorylessDescRead => "rt_memoryless_desc_read",
+            C::MemorylessDecode { .. } => "rt_memoryless_desc_decode",
+            C::MemorylessReference { .. } => "rt_memoryless_reference",
+            C::MemorylessAttachment { .. } => "rt_memoryless_attachment",
+            C::MemorylessFormat { .. } => "rt_memoryless_format",
             C::ViewSwizzled => "rt_view_swizzled",
             C::ViewBaseUnbound => "rt_view_base_unbound",
             C::LevelOverflow { .. } => "rt_level_overflow",
@@ -587,6 +603,18 @@ impl crate::observe::Decline for RenderTargetRefusal {
         use RenderTargetCause as C;
         let mut v = vec![("base", self.base_ref.to_string())];
         match self.cause {
+            C::MemorylessDecode { decode } => v.push(("decode", decode.to_string())),
+            C::MemorylessReference { descriptor_ref } => {
+                v.push(("descriptor_ref", descriptor_ref.to_string()));
+            }
+            C::MemorylessAttachment { level, load, store, resolve_ref } => {
+                v.push(("level", level.to_string()));
+                v.push(("load", load.to_string()));
+                v.push(("store", store.to_string()));
+                v.push(("resolve_ref", resolve_ref.to_string()));
+            }
+            C::MemorylessFormat { fmt } => v.push(("fmt", format!("{fmt:#x}"))),
+            C::MemorylessDescRead => {}
             C::MapperRefTextureMipView { level } | C::LinearLevelGva { level } => {
                 v.push(("level", level.to_string()))
             }
@@ -888,6 +916,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             return Err(C::MapperRefTextureFormat { mapping_id, fmt }.at(resolved_ref));
         }
         return Ok(ResolvedRenderTarget {
+            storage: ColorStorage::GuestBacked,
             mapping_id,
             target_gva: 0,
             width: m.width,
@@ -968,6 +997,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         }
         // mapping_id = surface_id; no linear GVA.
         return Ok(ResolvedRenderTarget {
+            storage: ColorStorage::GuestBacked,
             mapping_id: surface_id,
             target_gva: 0,
             width: m.width,
@@ -979,6 +1009,44 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     }
     // normal-texture linear GVA (wallpaper/background layers, UI intermediate RTs).
     let entry = live.ok_or(C::NoListEntry.at(resolved_ref))?;
+    if entry.object_type == crate::runtime::decode::resource::OBJECT_TYPE_MEMORYLESS_TEXTURE {
+        let bytes = objects::read_descriptor(state, host, task_id, &entry)
+            .ok_or(C::MemorylessDescRead.at(resolved_ref))?;
+        let texture = reims_vgpu_protocol::memoryless::decode(&bytes).map_err(|reason| {
+            C::MemorylessDecode { decode: reason.slug() }.at(resolved_ref)
+        })?;
+        if texture.object_ref != resolved_ref {
+            return Err(C::MemorylessReference {
+                descriptor_ref: texture.object_ref,
+            }.at(resolved_ref));
+        }
+        // There are no bytes to Load or Store outside the pass. Resolve and
+        // multisample lifetime support must not be inferred from the type tag.
+        if level != 0 || att.slice != 0 || att.depth_plane != 0
+            || att.resolve_texture_ref != 0
+            || !matches!(att.load_action, MTL_LOAD_ACTION_DONT_CARE | MTL_LOAD_ACTION_CLEAR)
+            || att.store_action != reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE
+            || view_fmt_override.is_some()
+        {
+            return Err(C::MemorylessAttachment {
+                level, load: att.load_action, store: att.store_action,
+                resolve_ref: att.resolve_texture_ref,
+            }.at(resolved_ref));
+        }
+        if pixel_format::render_target_bpp(texture.pixel_format).is_none() {
+            return Err(C::MemorylessFormat { fmt: texture.pixel_format }.at(resolved_ref));
+        }
+        return Ok(ResolvedRenderTarget {
+            storage: ColorStorage::Memoryless,
+            mapping_id: 0,
+            target_gva: 0,
+            width: texture.width,
+            height: texture.height,
+            row_stride: 0,
+            format: texture.pixel_format,
+            sample_count: 1,
+        });
+    }
     if entry.object_type != OBJECT_TYPE_TEXTURE
         && entry.object_type != OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
     {
@@ -1120,6 +1188,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         return Err(C::RowStride { bpr, tight }.at(resolved_ref));
     }
     Ok(ResolvedRenderTarget {
+        storage: ColorStorage::GuestBacked,
         mapping_id: 0,
         target_gva: gva,
         width: w,
@@ -1432,6 +1501,61 @@ mod tests {
             texture_ref,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn memoryless_render_target_uses_the_serializer_and_never_invents_pages() {
+        use crate::model::PAGE_SHIFT_ARM64E;
+        use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+        use crate::runtime::gva_mem::{define_task_pages_arm64e, write_task_gva_arm64e};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+        assert!(state.set_object_list(1, 0, 256));
+        let texture_ref = 203;
+        let descriptor: Vec<u8> = [1u32, 44, texture_ref,
+            (115 << 16) | (5 << 8) | 0x42, 23, 17, 1,
+            0x0001_0001, 0x0030_0001, 0, 0]
+            .into_iter().flat_map(u32::to_le_bytes).collect();
+        let descriptor_gva = 0x1800u64;
+        write_task_gva_arm64e(&mut host, &state.tasks[1], descriptor_gva, &descriptor);
+        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        entry[..4].copy_from_slice(&(9u32 | (44 << 8)).to_le_bytes());
+        entry[4..12].copy_from_slice(&descriptor_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1],
+            list_object_entry_offset(texture_ref, 256).unwrap(), &entry);
+        let target = resolve_render_target(&mut state, &host, 1, attach(texture_ref)).unwrap();
+        assert_eq!(target.storage, ColorStorage::Memoryless);
+        assert_eq!((target.mapping_id, target.target_gva, target.row_stride), (0, 0, 0));
+        assert_eq!((target.width, target.height, target.format, target.sample_count), (23, 17, 115, 1));
+        let clear = ColorAttachment {
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            clear_color: [0.25, 0.5, 0.75, 1.0],
+            ..attach(texture_ref)
+        };
+        let single = color_target_request(&mut state, &host, 1, clear, 0, 3, 1, 3, 0, 0).unwrap();
+        assert_eq!(single.colors[0].storage, ColorStorage::Memoryless);
+        assert_eq!(single.colors[0].clear_color, clear.clear_color);
+        assert_eq!(single.colors[0].store_action, 0);
+        let mrt = mrt_draw_request(&mut state, &mut host, 1, 0,
+            &[(1, clear)], &[], Default::default()).unwrap();
+        assert_eq!(mrt.colors[0].storage, ColorStorage::Memoryless);
+        assert!(mrt.colors[0].target_seed_rgba.is_none());
+        for attachment in [
+            ColorAttachment { load_action: MTL_LOAD_ACTION_LOAD, ..attach(texture_ref) },
+            ColorAttachment { store_action: MTL_STORE_ACTION_STORE, ..attach(texture_ref) },
+            ColorAttachment { level: 1, ..attach(texture_ref) },
+        ] {
+            assert!(matches!(
+                resolve_render_target(&mut state, &host, 1, attachment).unwrap_err().cause,
+                RenderTargetCause::MemorylessAttachment { .. }
+            ));
+        }
+        let mut wrong_ref = descriptor;
+        wrong_ref[8..12].copy_from_slice(&204u32.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], descriptor_gva, &wrong_ref);
+        assert_eq!(resolve_render_target(&mut state, &host, 1, attach(texture_ref)).unwrap_err().cause,
+            RenderTargetCause::MemorylessReference { descriptor_ref: 204 });
     }
 
     /// A refusal is reported once per attachment per check, not once per draw.

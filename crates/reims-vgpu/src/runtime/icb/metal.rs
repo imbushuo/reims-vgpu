@@ -26,6 +26,12 @@ use super::*;
 pub fn materialize_metal_icb(
     desc: &IndirectCommandBufferDescriptor,
 ) -> Result<::metal::IndirectCommandBuffer, IcbStatus> {
+    objc::rc::autoreleasepool(|| materialize_metal_icb_pooled(desc))
+}
+
+fn materialize_metal_icb_pooled(
+    desc: &IndirectCommandBufferDescriptor,
+) -> Result<::metal::IndirectCommandBuffer, IcbStatus> {
     use crate::backend::metal::runtime::system_device;
     use ::metal::{IndirectCommandBufferDescriptor, MTLResourceOptions};
 
@@ -129,7 +135,7 @@ fn icb_cache() -> &'static parking_lot::Mutex<HashMap<(u32, u32), HostIcbEntry>>
 /// outliving its host object would name a descriptor no
 /// `MTLIndirectCommandBuffer` was built from.
 pub(crate) fn clear_host_icb_cache() {
-    icb_cache().lock().clear();
+    objc::rc::autoreleasepool(|| icb_cache().lock().clear());
 }
 
 /// Resolve guest ICB ref → host Metal ICB, reusing the per-(task,ref) cache.
@@ -361,6 +367,16 @@ fn icb_primitive_type(
 /// When the serializer-object body carries a vertex-input block, attaches an
 /// `MTLVertexDescriptor` so `[[stage_in]]` attributes bind correctly.
 pub fn fill_render_command<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    icb_ref: u32,
+    fill: &IcbRenderFill,
+) -> Result<(), IcbStatus> {
+    objc::rc::autoreleasepool(|| fill_render_command_pooled(state, host, task_id, icb_ref, fill))
+}
+
+fn fill_render_command_pooled<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -1088,8 +1104,10 @@ pub(crate) fn export_icb_writeback_job(
 pub(crate) fn new_icb_compute_pso(
     device: &::metal::Device,
     mtlb: &[u8],
+    pipeline: &crate::runtime::compute_exec::LoadedComputePipeline,
 ) -> Result<::metal::ComputePipelineState, IcbStatus> {
-    use ::metal::ComputePipelineDescriptor;
+    use crate::backend::metal::compute::make_compute_pipeline_descriptor;
+    use crate::runtime::compute_exec::metal::stage_input_to_apv;
 
     // Load sole function from MTLB (same contract as product compute path).
     let library = device
@@ -1102,8 +1120,19 @@ pub(crate) fn new_icb_compute_pso(
     let function = library
         .get_function(&names[0], None)
         .map_err(|_| IcbStatus::MetalFailed("icb_pso_function_get"))?;
-    let desc = ComputePipelineDescriptor::new();
-    desc.set_compute_function(Some(&function));
+    let stage_input = pipeline.stage_input.as_ref().map(stage_input_to_apv);
+    let desc = make_compute_pipeline_descriptor(
+        &function,
+        stage_input.as_ref(),
+        pipeline.texture_write_rounding_mode,
+        (std::ptr::null_mut(), 0),
+    )
+    .map_err(|reason| {
+        if let Some(emit) = crate::observe::Emit::refusal("icb_compute_pipeline", &reason) {
+            emit.fail();
+        }
+        IcbStatus::Unsupported("icb_compute_descriptor_refused")
+    })?;
     desc.set_support_indirect_command_buffers(true);
     device
         .new_compute_pipeline_state(&desc)
@@ -1121,6 +1150,16 @@ pub(crate) fn new_icb_compute_pso(
 /// supplies them at `executeCommandsInBuffer` (see
 /// [`crate::backend::compute_session::ComputeSession::encode_icb`]).
 pub fn fill_compute_command<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    icb_ref: u32,
+    fill: &IcbComputeFill,
+) -> Result<(), IcbStatus> {
+    objc::rc::autoreleasepool(|| fill_compute_command_pooled(state, host, task_id, icb_ref, fill))
+}
+
+fn fill_compute_command_pooled<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -1161,7 +1200,7 @@ pub fn fill_compute_command<M: HostMemory + HostOps>(
             AirLoadRail::Compute,
         )
         .ok_or(IcbStatus::Missing("icb_fcc_mtlb_load"))?;
-        Some(new_icb_compute_pso(device, &mtlb)?)
+        Some(new_icb_compute_pso(device, &mtlb, &pipeline)?)
     } else {
         None
     };

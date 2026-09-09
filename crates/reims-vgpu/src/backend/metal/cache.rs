@@ -11,6 +11,7 @@ use crate::model::content_cache::{CacheEntry, ContentCache};
 use crate::protocol::fnv::FNV_OFFSET_BASIS;
 use metal::{ComputePipelineState, DepthStencilState, Function, RenderPipelineState, SamplerState};
 use parking_lot::Mutex;
+use reims_vgpu_protocol::compute::TextureWriteRoundingMode;
 
 pub struct FnEntry {
     pub blob: BlobIdentity,
@@ -34,9 +35,10 @@ pub struct RenderPsoEntry {
 }
 
 /// What decides `MTLComputePipelineState` identity: the kernel blob, plus the
-/// stage-input descriptor the PSO is specialized against.
+/// stage-input descriptor and texture-write rounding the PSO is specialized against.
 ///
-/// Both halves are compared by content. The descriptor used to travel as a
+/// The blob and stage-input descriptor are compared by content; rounding is a
+/// closed ordinal. The descriptor used to travel as a
 /// `stage_hash` beside a `has_stage_input` flag and nothing retained it, so two
 /// descriptors whose digests collided specialized one PSO — the same hole
 /// [`crate::backend::blob`] describes for the blob, over 1520 bytes of decoded
@@ -48,25 +50,26 @@ pub struct ComputePsoKey<'a> {
     /// Buckets with the blob's digest and decides nothing.
     pub stage_hash: u64,
     pub stage_input: Option<&'a ReimsVgpuComputeStageInputDescriptor>,
+    pub texture_write_rounding_mode: TextureWriteRoundingMode,
 }
 
 pub struct ComputePsoEntry {
     pub mtlb: BlobIdentity,
     pub stage_hash: u64,
     pub stage_input: Option<ReimsVgpuComputeStageInputDescriptor>,
+    pub texture_write_rounding_mode: TextureWriteRoundingMode,
     pub pso: ComputePipelineState,
 }
 
-impl ComputePsoEntry {
-    fn stage_input_is(&self, key: &ComputePsoKey<'_>) -> bool {
-        match (&self.stage_input, key.stage_input) {
-            (None, None) => true,
-            (Some(mine), Some(theirs)) => {
-                crate::backend::metal::util::bytes_of(mine)
-                    == crate::backend::metal::util::bytes_of(theirs)
-            }
-            _ => false,
+impl ComputePsoKey<'_> {
+    fn matches(&self, key: &ComputePsoKey<'_>) -> bool {
+        if self.texture_write_rounding_mode != key.texture_write_rounding_mode
+            || self.mtlb.hash != key.mtlb.hash
+            || self.mtlb.bytes != key.mtlb.bytes
+        {
+            return false;
         }
+        self.stage_input == key.stage_input
     }
 }
 
@@ -166,16 +169,20 @@ impl CacheEntry for ComputePsoEntry {
             mtlb: self.mtlb.as_key(),
             stage_hash: self.stage_hash,
             stage_input: self.stage_input.as_ref(),
+            texture_write_rounding_mode: self.texture_write_rounding_mode,
         }
     }
     fn matches(&self, key: &ComputePsoKey<'_>) -> bool {
-        self.mtlb.is(&key.mtlb) && self.stage_input_is(key)
+        self.lookup_key().matches(key)
     }
-    /// The kernel blob's hash folded with the stage-input hash, so two PSOs
+    /// The kernel blob's hash folded with stage-input and rounding, so two PSOs
     /// specialized from one blob against different stage inputs do not pile
-    /// into one bucket. Both are prefilters; `matches` compares both records.
+    /// into one bucket. These are prefilters; `matches` compares every property.
     fn bucket(key: &ComputePsoKey<'_>) -> u64 {
-        hash_u64(key.mtlb.hash, key.stage_hash)
+        hash_u64(
+            hash_u64(key.mtlb.hash, key.stage_hash),
+            u64::from(key.texture_write_rounding_mode.word()),
+        )
     }
 }
 
@@ -313,6 +320,7 @@ pub fn compute_pso_insert(
                 mtlb: BlobIdentity::of(&key.mtlb),
                 stage_hash: key.stage_hash,
                 stage_input: key.stage_input.copied(),
+                texture_write_rounding_mode: key.texture_write_rounding_mode,
                 pso,
             })
             .pso
@@ -395,6 +403,43 @@ pub fn reflect_insert(key: &BlobKey<'_>, usages: Vec<ReimsVgpuComputeTextureUsag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_pso_identity_includes_rounding_and_stage_input_content() {
+        let stage = ReimsVgpuComputeStageInputDescriptor::default();
+        let key = ComputePsoKey {
+            mtlb: BlobKey::new(b"synthetic kernel identity"),
+            stage_hash: 7,
+            stage_input: Some(&stage),
+            texture_write_rounding_mode: TextureWriteRoundingMode::Default,
+        };
+        assert!(key.matches(&key));
+        let same_stage = ReimsVgpuComputeStageInputDescriptor::default();
+        assert!(key.matches(&ComputePsoKey { stage_input: Some(&same_stage), ..key }));
+        assert_eq!(
+            crate::backend::metal::compute::hash_compute_stage_input(Some(&stage)),
+            crate::backend::metal::compute::hash_compute_stage_input(Some(&same_stage)),
+        );
+        for mode in [
+            TextureWriteRoundingMode::TowardZero,
+            TextureWriteRoundingMode::ToNearestEven,
+        ] {
+            let different = ComputePsoKey { texture_write_rounding_mode: mode, ..key };
+            assert!(!key.matches(&different));
+            assert_ne!(ComputePsoEntry::bucket(&key), ComputePsoEntry::bucket(&different));
+        }
+        let mut changed_stage = stage;
+        changed_stage.index_buffer_index = 1;
+        assert!(!key.matches(&ComputePsoKey {
+            stage_input: Some(&changed_stage),
+            ..key
+        }));
+        assert!(!key.matches(&ComputePsoKey { stage_input: None, ..key }));
+        assert!(!key.matches(&ComputePsoKey {
+            mtlb: BlobKey { hash: key.mtlb.hash, bytes: b"different kernel identity" },
+            ..key
+        }));
+    }
 
     #[test]
     fn depth_stencil_cache_key_covers_both_faces() {

@@ -117,6 +117,7 @@ pub mod vulkan;
 /// besides [`SelectedBackend`] whose shape is neutral and whose contents are a
 /// rail's.
 pub mod compute_session;
+pub mod render_pass;
 
 /// The host driver's answer to the guest's `heapTextureSizeAndAlign` contract.
 /// A host capability, deliberately neither a rail decision nor a rail's module.
@@ -136,6 +137,7 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::resident_target::ResidentTarget;
 use crate::runtime::writeback_debt::GvaWritebackDebt;
 pub(crate) use compute_session::ComputeSession;
+pub(crate) use render_pass::RenderPass;
 use reims_vgpu_protocol::compute::DispatchType;
 use reims_vgpu_protocol::decode::blit::TextureSlices as BlitSliceCopy;
 use reims_vgpu_protocol::decode::compute::DispatchRecord;
@@ -241,30 +243,9 @@ pub(crate) trait Backend: Copy {
     /// identities, resident images, and aliases of guest memory must not.
     fn reset(&self);
 
-    /// Execute one decoded draw chain, and land its colour target in guest
-    /// memory when `writeback_guest`.
-    ///
-    /// `req` is backend-neutral: every field is a decoded guest fact, and the
-    /// two rails read the same request. What differs is entirely below this
-    /// call — Metal encodes an `MTLRenderCommandEncoder`, Vulkan builds an
-    /// `engine::DrawRequest` — and the asymmetry that matters is *not* in the
-    /// arguments but in the Store: each rail owns when the frame reaches the
-    /// guest's pages, which is why the return carries the tight RGBA8 colour 0
-    /// rather than a promise that the write happened.
-    ///
-    /// `force_full_store` is a Metal term (its Store can be scissor-local); the
-    /// Vulkan rail ignores it. It is a parameter rather than a rail-specific
-    /// entry point because the *caller's* reason for setting it — an abandoned
-    /// chain whose partial target must not be published — is a device fact, not
-    /// a Metal one.
-    fn encode_draw_chain<M: HostMemory + HostOps>(
-        &self,
-        state: &mut DeviceState,
-        host: &mut M,
-        req: &mut DrawEncodeRequest,
-        writeback_guest: bool,
-        force_full_store: bool,
-    ) -> (EncodeStatus, Option<Vec<u8>>);
+    /// Own one guest render encoder's draw sequence and pass-local resources.
+    /// The executor must keep the returned value through the whole pass.
+    fn begin_render_pass(&self) -> RenderPass;
 
     /// Execute a range of an indirect command buffer the guest has filled.
     ///
@@ -1226,6 +1207,15 @@ impl SelectedBackend {
 }
 
 impl Backend for SelectedBackend {
+    fn begin_render_pass(&self) -> RenderPass {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(backend) => backend.begin_render_pass(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(backend) => backend.begin_render_pass(),
+        }
+    }
+
     fn name(&self) -> &'static str {
         match self {
             #[cfg(feature = "backend-metal")]
@@ -1241,26 +1231,6 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.reset(),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.reset(),
-        }
-    }
-
-    fn encode_draw_chain<M: HostMemory + HostOps>(
-        &self,
-        state: &mut DeviceState,
-        host: &mut M,
-        req: &mut DrawEncodeRequest,
-        writeback_guest: bool,
-        force_full_store: bool,
-    ) -> (EncodeStatus, Option<Vec<u8>>) {
-        match self {
-            #[cfg(feature = "backend-metal")]
-            Self::Metal(b) => {
-                b.encode_draw_chain(state, host, req, writeback_guest, force_full_store)
-            }
-            #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan(b) => {
-                b.encode_draw_chain(state, host, req, writeback_guest, force_full_store)
-            }
         }
     }
 

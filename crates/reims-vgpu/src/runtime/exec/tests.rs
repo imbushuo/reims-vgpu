@@ -2727,6 +2727,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
         instance_count: 1,
         primitive_type: 3,
         colors: vec![draw::ColorRtRequest {
+            storage: draw::ColorStorage::GuestBacked,
             slot: 0,
             texture_ref: 11,
             mapping_id: 3,
@@ -2781,6 +2782,35 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
         first.colors[0].target_seed_rgba.as_ref().map(Vec::len),
         Some(16)
     );
+}
+
+#[test]
+fn memoryless_render_pass_template_preserves_identity_without_guest_backing() {
+    let first = draw::DrawEncodeRequest {
+        task_id: 7,
+        colors: vec![draw::ColorRtRequest {
+            storage: draw::ColorStorage::Memoryless,
+            slot: 1,
+            texture_ref: 37,
+            width: 242,
+            height: 5,
+            format: 0x73,
+            sample_count: 1,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let template = render_pass_attachment_template(&first);
+    let req = retarget_render_pass_draw(&template, &PendingDraw::default());
+    let color = &req.colors[0];
+    assert_eq!(color.storage, draw::ColorStorage::Memoryless);
+    assert_eq!((color.slot, color.texture_ref, color.width, color.height, color.format),
+        (1, 37, 242, 5, 0x73));
+    assert_eq!(color.load_action, MTL_LOAD_ACTION_LOAD);
+    assert_eq!(color.store_action, reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE);
+    assert_eq!((color.mapping_id, color.target_gva, color.row_stride), (0, 0, 0));
+    assert!(color.target_seed_rgba.is_none());
 }
 
 #[test]

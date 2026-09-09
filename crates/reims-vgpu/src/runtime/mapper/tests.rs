@@ -637,6 +637,8 @@ use crate::runtime::host::FakeHost;
 
 /// arm64e kernel VA base used by the contract.
 const KVA: u64 = 0xfffffe00_10000000;
+const TABLE_GPA: u64 = 0x8000_0000;
+const DESC_KVA: u64 = KVA + 0x4000;
 
 fn put_u32(h: &mut FakeHost, gpa: u64, v: u32) {
     h.map_range(gpa, 4, 0);
@@ -743,8 +745,6 @@ fn span_fixture(pfn: u32) -> (DeviceState, FakeHost, u64) {
     let mut host = FakeHost::new();
     let internal = KVA;
     let mapper = KVA + 0x1000;
-    let page_obj = KVA + 0x2000;
-    let table = KVA + 0x3000;
     let page_gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
 
     put_u64(&mut host, internal + MAPPING_INTERNAL_BACKPTR, mapper);
@@ -754,29 +754,24 @@ fn span_fixture(pfn: u32) -> (DeviceState, FakeHost, u64) {
         internal + MAPPING_INTERNAL_SIZE,
         MAPPING_INTERNAL_EXPECTED_SIZE,
     );
-    // page fields: 0x48 points at page_obj which has table ptr at +0xb8
     put_u64(
         &mut host,
-        internal + iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_48,
-        page_obj,
+        internal + iosurface_pages::MAPPING_INTERNAL_DESC_PTR,
+        DESC_KVA,
     );
-    put_u64(
-        &mut host,
-        internal + iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_50,
-        0,
+    let mut desc = [0u8; DEVICE_DESC_LEN];
+    st32(
+        &mut desc[iosurface_pages::DEVICE_DESC_PAGE_TABLE..],
+        ((TABLE_GPA >> PAGE_SHIFT_ARM64E) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID,
     );
-    put_u64(
-        &mut host,
-        internal + iosurface_pages::MAPPING_INTERNAL_PAGE_COUNT,
-        1,
+    st32(
+        &mut desc[iosurface_pages::DEVICE_DESC_ALLOC_SIZE..],
+        PAGE_SIZE_ARM64E as u32,
     );
-    put_u64(
-        &mut host,
-        page_obj + iosurface_pages::MAPPING_PAGE_TABLE_FROM_F48,
-        table,
-    );
+    host.map_range(DESC_KVA, DEVICE_DESC_LEN, 0);
+    host.write_gpa(DESC_KVA, &desc).unwrap();
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    put_u32(&mut host, table, entry);
+    put_u32(&mut host, TABLE_GPA, entry);
     // one page of guest RAM for the surface
     host.map_range(page_gpa, PAGE_SIZE_ARM64E as usize, 0x55);
 
@@ -801,6 +796,7 @@ fn resolve_builds_page_entries() {
     let m = state.mappings.get(&3).unwrap();
     assert_eq!(m.page_entries.len(), 1);
     assert_eq!(m.page_entries[0], entry);
+    assert_eq!(m.page_table_gpa, Some(TABLE_GPA));
     let span = cap.one("OFF");
     assert!(
         span.contains("mapping_gpa_span mid=3") && span.contains("pages=1"),
@@ -863,10 +859,15 @@ fn the_backing_span_latch_does_not_suppress_the_mapper_span() {
 struct FailingKvaHost {
     inner: FakeHost,
     err: MemError,
+    fail_at: Option<u64>,
 }
 
 impl HostMemory for FailingKvaHost {
     fn read_gpa(&self, gpa: u64, buf: &mut [u8]) -> Result<(), MemError> {
+        assert!(!guest_kernel_va(gpa), "KVA reads must use the CPU-backed callback");
+        if self.fail_at == Some(gpa) {
+            return Err(self.err);
+        }
         self.inner.read_gpa(gpa, buf)
     }
 
@@ -884,8 +885,13 @@ impl HostOps for FailingKvaHost {
 
     fn schedule_bh(&mut self) {}
 
-    fn read_kva(&self, _kva: u64, _buf: &mut [u8]) -> Result<(), MemError> {
-        Err(self.err)
+    fn read_kva(&self, kva: u64, buf: &mut [u8]) -> Result<(), MemError> {
+        assert!(guest_kernel_va(kva), "physical tables must not use a CPU alias");
+        if self.fail_at.is_none() || self.fail_at == Some(kva) {
+            Err(self.err)
+        } else {
+            self.inner.read_kva(kva, buf)
+        }
     }
 
     fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
@@ -902,40 +908,28 @@ impl HostOps for FailingKvaHost {
 }
 
 fn assert_revalidate_error_preserves_cached_page_plan(err: MemError) {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let entry = (0x444u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    assert!(state.attach_mapping_internal(3, KVA));
-    assert!(state.set_mapping_geom(
-        3,
-        64,
-        64,
-        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
-    ));
-    {
-        let m = state.mappings.get_mut(&3).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![entry];
-        m.page_table_kva = KVA + 0x3000;
+    for fail_at in [
+        None,
+        Some(KVA + iosurface_pages::MAPPING_INTERNAL_DESC_PTR),
+        Some(DESC_KVA),
+    ] {
+        let (mut state, inner, _) = span_fixture(0x444);
+        assert!(resolve_mapping_backing(&mut state, &inner, 3));
+        let before = state.mappings.get(&3).unwrap();
+        let entries = before.page_entries.clone();
+        let desc = before.device_desc.clone();
+        let generation = before.map_generation;
+        let host = FailingKvaHost { inner, err, fail_at };
+        clear_resolve_fail(3);
+        let capture = crate::observe::sink::FailCapture::start();
+        assert_eq!(revalidate_mapping_reason(&mut state, &host, 3), None);
+        let m = state.mappings.get(&3).unwrap();
+        assert_eq!(m.page_entries, entries);
+        assert_eq!(m.page_table_gpa, Some(TABLE_GPA));
+        assert_eq!(m.device_desc, desc);
+        assert_eq!(m.map_generation, generation);
+        assert!(capture.lines().is_empty(), "expected KVA alias loss is quiet");
     }
-
-    let host = FailingKvaHost {
-        inner: FakeHost::new(),
-        err,
-    };
-    clear_resolve_fail(3);
-    let log_before = std::fs::read_to_string(crate::observe::fail_log_path())
-        .unwrap_or_default()
-        .len();
-    assert_eq!(revalidate_mapping_reason(&mut state, &host, 3), None);
-    let m = state.mappings.get(&3).unwrap();
-    assert_eq!(m.page_entries, vec![entry]);
-    assert_eq!(m.page_table_kva, KVA + 0x3000);
-    let log_after = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
-    assert!(
-        !log_after[log_before..].contains("mapper_revalidate_fallback"),
-        "an expected cached-plan alias fallback must stay silent: {}",
-        &log_after[log_before..]
-    );
 }
 
 #[test]
@@ -946,6 +940,170 @@ fn revalidate_no_cpu_preserves_cached_page_plan() {
 #[test]
 fn revalidate_unmapped_read_preserves_cached_page_plan() {
     assert_revalidate_error_preserves_cached_page_plan(MemError::Unmapped);
+}
+
+#[test]
+fn alias_loss_without_a_valid_plan_cannot_fabricate_pages() {
+    for err in [MemError::NoCpu, MemError::Unmapped] {
+        for fail_at in [
+            None,
+            Some(KVA + iosurface_pages::MAPPING_INTERNAL_DESC_PTR),
+            Some(DESC_KVA),
+        ] {
+            let (mut state, inner, _) = span_fixture(0x444);
+            let host = FailingKvaHost { inner, err, fail_at };
+            clear_resolve_fail(3);
+            let capture = crate::observe::sink::FailCapture::start();
+            assert!(!resolve_mapping_backing(&mut state, &host, 3));
+            let m = state.mappings.get(&3).unwrap();
+            assert!(m.page_entries.is_empty());
+            assert_eq!(m.page_table_gpa, None);
+            assert!(capture.one("mapper_resolve_fail").contains("reason="));
+        }
+    }
+}
+
+#[test]
+fn unreadable_physical_table_invalidates_instead_of_using_kva_fallback() {
+    let (mut state, inner, _) = span_fixture(0x444);
+    assert!(resolve_mapping_backing(&mut state, &inner, 3));
+    let generation = state.mappings.get(&3).unwrap().map_generation;
+    let host = FailingKvaHost {
+        inner,
+        err: MemError::Unmapped,
+        fail_at: Some(TABLE_GPA),
+    };
+    let capture = crate::observe::sink::FailCapture::start();
+    assert_eq!(
+        revalidate_mapping_reason(&mut state, &host, 3),
+        Some("revalidate_resolve_fail")
+    );
+    let m = state.mappings.get(&3).unwrap();
+    assert!(m.page_entries.is_empty());
+    assert_eq!(m.page_table_gpa, None);
+    assert_eq!(m.map_generation, generation + 1);
+    assert!(capture.one("mapper_resolve_fail").contains("iosurface_page_table_entry_read"));
+}
+
+#[test]
+fn physical_root_at_zero_is_a_live_plan_not_a_manual_page_list() {
+    let (mut state, mut host, _) = span_fixture(0x444);
+    put_u32(&mut host, DESC_KVA, PAGE_ENTRY_VALID);
+    put_u32(&mut host, 0, (0x444 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID);
+    assert!(resolve_mapping_backing(&mut state, &host, 3));
+    assert_eq!(state.mappings.get(&3).unwrap().page_table_gpa, Some(0));
+    put_u32(&mut host, 0, 0);
+    assert!(!revalidate_mapping_pages(&mut state, &host, 3));
+    let m = state.mappings.get(&3).unwrap();
+    assert_eq!(m.page_table_gpa, None);
+    assert!(m.page_entries.is_empty());
+}
+
+#[test]
+fn descriptor_subpage_allocation_resolves_the_runtime_page_floor() {
+    for alloc in [1, 512, PAGE_SIZE_ARM64E - 1, PAGE_SIZE_ARM64E + 1] {
+        let (mut state, mut inner, _) = span_fixture(0x444);
+        put_u32(
+            &mut inner,
+            DESC_KVA + iosurface_pages::DEVICE_DESC_ALLOC_SIZE as u64,
+            alloc as u32,
+        );
+        let second = (0x445 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        put_u32(&mut inner, TABLE_GPA + 4, second);
+        let host = FailingKvaHost {
+            inner,
+            err: MemError::NoCpu,
+            fail_at: Some(u64::MAX),
+        };
+        assert!(resolve_mapping_backing(&mut state, &host, 3));
+        assert_eq!(
+            state.mappings.get(&3).unwrap().page_entries.len(),
+            if alloc > PAGE_SIZE_ARM64E { 2 } else { 1 }
+        );
+    }
+}
+
+#[test]
+fn published_framebuffer_descriptor_resolves_geometry_and_allocation() {
+    use crate::protocol::endian::st64;
+    use iosurface_pages::{
+        DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS,
+        DEVICE_DESC_PAGE_TABLE, DEVICE_DESC_PIXEL_FORMAT,
+    };
+    let (mut state, mut host, _) = span_fixture(0x444);
+    let mut desc = [0u8; DEVICE_DESC_LEN];
+    st32(&mut desc[DEVICE_DESC_PAGE_TABLE..], 0x0009_6d09);
+    st32(&mut desc[DEVICE_DESC_PIXEL_FORMAT..], 0x5247_6841);
+    st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x00fd_2000);
+    st64(&mut desc[DEVICE_DESC_DIMS..], (1920u64 << 8) | (1080u64 << 40));
+    st32(&mut desc[DEVICE_DESC_BPR..], 0x3c00);
+    st32(&mut desc[DEVICE_DESC_BPE..], 8);
+    host.write_gpa(DESC_KVA, &desc).unwrap();
+    host.map_range(0x96d0_8000, PAGE_SIZE_ARM64E as usize, 0);
+    for i in 0..1013u32 {
+        host.put_u32(
+            0x96d0_8000 + u64::from(i) * 4,
+            ((0x10000 + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+        );
+    }
+    assert!(resolve_mapping_backing(&mut state, &host, 3));
+    let m = state.mappings.get(&3).unwrap();
+    assert_eq!(m.page_table_gpa, Some(0x96d0_8000));
+    assert_eq!(m.page_entries.len(), 1013);
+    assert_eq!((m.width, m.height), (1920, 1080));
+    assert_eq!(m.format, crate::protocol::pixel_format::MTL_FORMAT_RGBA16_FLOAT);
+    assert!(pages_cover_geom(&state, 3));
+}
+
+#[test]
+fn published_plan_revalidation_preserves_reprieve_and_detects_rewire() {
+    let (mut state, mut host, _) = span_fixture(0x444);
+    assert!(resolve_mapping_backing(&mut state, &host, 3));
+    let generation = state.mappings.get(&3).unwrap().map_generation;
+    assert!(state.condemn_surface_backing(3));
+    assert!(resolve_mapping_backing(&mut state, &host, 3));
+    assert_eq!(state.mappings.get(&3).unwrap().map_generation, generation);
+    assert!(!state.mapping_backing_condemned(3));
+    let new_entry = (0x445 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    put_u32(&mut host, TABLE_GPA, new_entry);
+    assert!(revalidate_mapping_pages(&mut state, &host, 3));
+    let m = state.mappings.get(&3).unwrap();
+    assert_eq!(m.map_generation, generation + 1);
+    assert_eq!(m.page_entries, vec![new_entry]);
+    assert_eq!(m.page_table_gpa, Some(TABLE_GPA));
+    assert!(state.unmap_surface(3));
+    assert!(state.mappings.get(&3).unwrap().page_entries.is_empty());
+    assert_eq!(state.mappings.get(&3).unwrap().page_table_gpa, None);
+}
+
+#[test]
+fn malformed_descriptor_or_identity_cannot_keep_a_cached_plan() {
+    for (address, value, reason) in [
+        (DESC_KVA, 0, "iosurface_page_table_root_invalid"),
+        (
+            DESC_KVA + iosurface_pages::DEVICE_DESC_ALLOC_SIZE as u64,
+            0,
+            "iosurface_allocation_size_zero",
+        ),
+        (KVA + MAPPING_INTERNAL_ID, 9, "iosurface_validate_mapping_id_mismatch"),
+        (
+            KVA + iosurface_pages::MAPPING_INTERNAL_DESC_PTR,
+            0,
+            "iosurface_mapper_device_desc_pointer_zero",
+        ),
+    ] {
+        let (mut state, mut host, _) = span_fixture(0x444);
+        assert!(resolve_mapping_backing(&mut state, &host, 3));
+        if address == KVA + iosurface_pages::MAPPING_INTERNAL_DESC_PTR {
+            put_u64(&mut host, address, u64::from(value));
+        } else {
+            put_u32(&mut host, address, value);
+        }
+        let capture = crate::observe::sink::FailCapture::start();
+        assert!(!revalidate_mapping_pages(&mut state, &host, 3));
+        assert!(state.mappings.get(&3).unwrap().page_entries.is_empty());
+        assert!(capture.one("mapper_resolve_fail").contains(reason));
+    }
 }
 
 /// qemu-shim: early page resolve + late geom must re-expand the table.

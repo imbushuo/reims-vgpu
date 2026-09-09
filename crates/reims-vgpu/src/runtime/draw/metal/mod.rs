@@ -27,6 +27,7 @@ pub use icb::*;
 // parts, so they are not re-exported.
 mod depth_stencil;
 use depth_stencil::{seed_host_depth_stencil, DepthStencilAspect, HostAttachment};
+mod sampled;
 
 /// This rail's retention decision for one colour attachment, made before the
 /// seed is built and spent by the encode and then by the Store.
@@ -166,6 +167,7 @@ fn null_apv_buffer() -> crate::backend::metal::abi::ReimsVgpuBuffer {
 ///
 /// Takes `&mut req` so multi-MiB Load seeds can be **moved** into the encoder
 /// (no extra full-frame clone on the multi-draw chain).
+#[cfg(test)]
 pub fn encode_draw_chain<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -173,24 +175,29 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     writeback_guest: bool,
     force_full_store: bool,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
-    encode_draw_chain_inner(state, host, req, writeback_guest, force_full_store)
+    if req.continues_render_pass || req.render_pass_continues {
+        return (EncodeStatus::BadArgs("draw_mtl_render_pass_owner_required"), None);
+    }
+    crate::backend::metal::render_pass::MetalRenderPass::default()
+        .encode_draw(state, host, req, writeback_guest, force_full_store)
 }
 
-fn encode_draw_chain_inner<M: HostMemory + HostOps>(
+pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     req: &mut DrawEncodeRequest,
     writeback_guest: bool,
     force_full_store: bool,
+    pass: &crate::backend::metal::render_pass::MetalRenderPass,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
     use crate::backend::metal::abi::{
         ReimsVgpuBlendState, ReimsVgpuBuffer, ReimsVgpuDepthAttachment, ReimsVgpuDepthBiasState,
         ReimsVgpuIndexedDraw, ReimsVgpuRasterState, ReimsVgpuSampledImage, ReimsVgpuSampler,
         ReimsVgpuScissor, ReimsVgpuStencilAttachment, ReimsVgpuStencilReferenceState,
-        ReimsVgpuViewport, REIMS_VGPU_BINDING_SAMPLER_BASE, REIMS_VGPU_BINDING_TEXTURE_BASE,
+        ReimsVgpuViewport, REIMS_VGPU_BINDING_SAMPLER_BASE,
         REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT, REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8,
     };
-    use crate::backend::metal::render::{render_core_mrt, ColorRt, VisibilityQuery};
+    use crate::backend::metal::render::{render_core_mrt, ColorRt, ColorTarget, VisibilityQuery};
     use crate::backend::metal::util::ErrOut;
 
     // Opened before the first refusal check, so a chain that declines is charged
@@ -250,7 +257,8 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // Metal pass requires matching RT dimensions.
     if color_list
         .iter()
-        .any(|c| c.width != width || c.height != height || (c.mapping_id == 0 && c.target_gva == 0))
+        .any(|c| c.width != width || c.height != height
+            || (c.storage == ColorStorage::GuestBacked && c.mapping_id == 0 && c.target_gva == 0))
     {
         return (EncodeStatus::BadArgs("draw_mtl_mrt_geom_mismatch"), None);
     }
@@ -287,6 +295,11 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             None,
         );
     };
+    if pipeline.raster_sample_count > 1
+        && req.colors.iter().any(|c| c.storage == ColorStorage::Memoryless)
+    {
+        return (EncodeStatus::BadArgs("draw_mtl_memoryless_multisample"), None);
+    }
     // `load_render_pipeline` declared it; this rail is about to turn the
     // guest's shader form into the host's. Unlike the Vulkan rail this one
     // retains no pipeline state, so it walks the same three steps on every
@@ -498,9 +511,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // Sampled textures: mapper-ref-texture mapping pages, then normal-texture linear GVA.
     struct TexItem {
         index: u32,
-        w: u32,
-        h: u32,
-        rgba: Vec<u8>,
+        upload: sampled::SampledUpload,
     }
     // Archive apple-pv-gpu-exec: a bound texture that does not resolve gates the
     // draw (never samples black/garbage). Same for vertex-stage textures.
@@ -517,7 +528,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         if t.texture_ref == 0 {
             continue;
         }
-        let Some((w, h, rgba)) = load_sampled_rgba(state, host, req.task_id, t.texture_ref) else {
+        let Some(upload) = sampled::load(state, host, req.task_id, t.texture_ref) else {
             crate::observe::fail(format!(
                 "metal_draw gate: vertex texture miss ref={} {}",
                 t.texture_ref,
@@ -529,19 +540,17 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             );
         };
         crate::runtime::drain::note_store_route("metal_sampled_binds");
-        crate::runtime::drain::note_store_route_n("metal_sampled_bytes", rgba.len() as u64);
+        crate::runtime::drain::note_store_route_n("metal_sampled_bytes", upload.byte_len());
         vtx_tex_items.push(TexItem {
             index: t.index,
-            w,
-            h,
-            rgba,
+            upload,
         });
     }
     for t in req.fragment_textures.iter() {
         if t.texture_ref == 0 {
             continue;
         }
-        let Some((w, h, rgba)) = load_sampled_rgba(state, host, req.task_id, t.texture_ref) else {
+        let Some(upload) = sampled::load(state, host, req.task_id, t.texture_ref) else {
             crate::observe::fail(format!(
                 "metal_draw gate: fragment texture miss ref={} {}",
                 t.texture_ref,
@@ -553,50 +562,20 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             );
         };
         crate::runtime::drain::note_store_route("metal_sampled_binds");
-        crate::runtime::drain::note_store_route_n("metal_sampled_bytes", rgba.len() as u64);
+        crate::runtime::drain::note_store_route_n("metal_sampled_bytes", upload.byte_len());
         frag_tex_items.push(TexItem {
             index: t.index,
-            w,
-            h,
-            rgba,
+            upload,
         });
     }
     drop(span_sampled);
     let vtx_imgs: Vec<ReimsVgpuSampledImage> = vtx_tex_items
         .iter()
-        .map(|it| {
-            let data = it.rgba.as_ptr();
-            let len = it.rgba.len();
-            ReimsVgpuSampledImage {
-                binding: REIMS_VGPU_BINDING_TEXTURE_BASE + it.index,
-                width: it.w,
-                height: it.h,
-                rgba8: data,
-                len,
-                pixel_format: 0,
-                bytes_per_row: it.w.saturating_mul(RGBA8_BPP),
-                data,
-                data_len: len,
-            }
-        })
+        .map(|it| it.upload.image(it.index))
         .collect();
     let frag_imgs: Vec<ReimsVgpuSampledImage> = frag_tex_items
         .iter()
-        .map(|it| {
-            let data = it.rgba.as_ptr();
-            let len = it.rgba.len();
-            ReimsVgpuSampledImage {
-                binding: REIMS_VGPU_BINDING_TEXTURE_BASE + it.index,
-                width: it.w,
-                height: it.h,
-                rgba8: data,
-                len,
-                pixel_format: 0,
-                bytes_per_row: it.w.saturating_mul(RGBA8_BPP),
-                data,
-                data_len: len,
-            }
-        })
+        .map(|it| it.upload.image(it.index))
         .collect();
 
     // Samplers: serializer-object subtype 0x03 when present. A nonzero ref is an explicit
@@ -884,7 +863,10 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // boots; see [`chain_phase::CostSpan`].
     let mut color_outs: Vec<Vec<u8>> = {
         let _outs = chain_phase::CostSpan::new("metal_seed_outs_us");
-        (0..color_list.len()).map(|_| vec![0u8; need]).collect()
+        color_list.iter().map(|c| match c.storage {
+            ColorStorage::GuestBacked => vec![0u8; need],
+            ColorStorage::Memoryless => Vec::new(),
+        }).collect()
     };
 
     // For indexed draws, pass index_count as vertex_count for the early gate.
@@ -1011,15 +993,23 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         // target whatever the destination declared, and until this call there
         // was nothing on the always-on channel to say when that quantised a
         // wider one. See `runtime::draw::ColorTargetNarrowing`.
-        crate::runtime::draw::note_store_narrowing(c.format, width, height);
+        if c.storage == ColorStorage::GuestBacked {
+            crate::runtime::draw::note_store_narrowing(c.format, width, height);
+        }
         color_rts.push(ColorRt {
             slot: c.slot,
             // Host RT: 0 = RGBA8Unorm (writeback conversion path). The one
             // place this rail decides a colour target's format; the narrowing
             // it can cause is named and counted directly above.
-            pixel_format: 0,
+            pixel_format: match c.storage {
+                ColorStorage::GuestBacked => 0,
+                ColorStorage::Memoryless => u32::from(c.format),
+            },
             seed_rgba8: color_seeds[i].as_deref(),
-            out_rgba8: Some(out),
+            out_rgba8: match c.storage {
+                ColorStorage::GuestBacked => Some(out),
+                ColorStorage::Memoryless => None,
+            },
             clear_r: c.clear_color[0],
             clear_g: c.clear_color[1],
             clear_b: c.clear_color[2],
@@ -1046,14 +1036,22 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             // key and the generation this plan was made against, and a second
             // live handle here would keep an evicted texture alive past the
             // registry that stopped counting its bytes.
-            retained: resident_plan[i].as_mut().map(|plan| RetainedColorTarget {
-                key: plan.key,
-                texture: match (plan.texture.take(), plan.holds_prior) {
-                    (None, _) => RetainedColorTexture::Absent,
-                    (Some(texture), true) => RetainedColorTexture::Prior(texture),
-                    (Some(texture), false) => RetainedColorTexture::Allocation(texture),
+            target: match c.storage {
+                ColorStorage::Memoryless => match pass.target(c) {
+                    Ok(target) => ColorTarget::Memoryless(target),
+                    Err(reason) => return (EncodeStatus::BadArgs(reason), None),
                 },
-            }),
+                ColorStorage::GuestBacked => ColorTarget::Guest(
+                    resident_plan[i].as_mut().map(|plan| RetainedColorTarget {
+                        key: plan.key,
+                        texture: match (plan.texture.take(), plan.holds_prior) {
+                            (None, _) => RetainedColorTexture::Absent,
+                            (Some(texture), true) => RetainedColorTexture::Prior(texture),
+                            (Some(texture), false) => RetainedColorTexture::Allocation(texture),
+                        },
+                    }),
+                ),
+            },
         });
     }
 
@@ -1278,10 +1276,11 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             ));
         }
     }
+    // A DontCare-only pass (including memoryless colour0) owes no guest bytes.
     // Only a total writeback failure is an error: a partial MRT writeback is Ok
     // if at least one RT landed, and each RT that did not has already emitted its
     // own `metal_draw writeback fail` line above.
-    if !any_write {
+    if !any_write && color_list.iter().any(|c| c.store_action != MTL_STORE_ACTION_DONT_CARE) {
         return (
             EncodeStatus::WritebackFailed("draw_mtl_writeback_none"),
             None,

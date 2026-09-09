@@ -365,6 +365,12 @@ pub fn borrow_published(key: &ResidentColorKey, content_gen: u64) -> Option<Text
 /// format, and a wrong guess is a channel swap that renders as an orange sky
 /// rather than as a failure.
 pub fn read_published_rgba8(key: &ResidentColorKey, content_gen: u64) -> Option<Vec<u8>> {
+    // Scanout can read on a worker with no AppKit pool. Only copied pixels
+    // escape; native linearization temporaries belong to this readback.
+    objc::rc::autoreleasepool(|| read_published_rgba8_pooled(key, content_gen))
+}
+
+fn read_published_rgba8_pooled(key: &ResidentColorKey, content_gen: u64) -> Option<Vec<u8>> {
     use crate::protocol::pixel_format::RGBA8_BPP;
     // Only the format this rail actually renders colour targets in reads back as
     // RGBA8. A key naming any other one is a future this function has not been
@@ -513,6 +519,29 @@ pub fn levels() -> (usize, u64, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autorelease_scanout_readback_keeps_only_the_registered_texture_alive() {
+        use foreign_types::ForeignType;
+        use objc::rc::{autoreleasepool, WeakPtr};
+        let key = key(0xffff_a110);
+        let pixels = [13u8, 27, 91, 255].repeat(16);
+        let texture = autoreleasepool(|| {
+            let device = crate::backend::metal::runtime::system_device().expect("Metal device");
+            let texture = create(device, &key, MTLPixelFormat::RGBA8Unorm, 4).expect("resident");
+            texture.replace_region(
+                metal::MTLRegion::new_2d(0, 0, 4, 4), 0, pixels.as_ptr().cast(), 16,
+            );
+            published(&key, 1);
+            unsafe { WeakPtr::new(texture.as_ptr().cast()) }
+        });
+        for _ in 0..4 {
+            assert_eq!(read_published_rgba8(&key, 1), Some(pixels.clone()));
+            assert!(!texture.load().is_null(), "readback must not release registry ownership");
+        }
+        forget(key.mapping_id);
+        assert!(texture.load().is_null(), "readback must not retain an unpublished texture");
+    }
 
     fn key(mapping_id: u32) -> ResidentColorKey {
         ResidentColorKey {
