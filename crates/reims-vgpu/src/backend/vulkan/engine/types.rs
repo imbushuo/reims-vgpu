@@ -12,6 +12,9 @@ use reims_vgpu_core::sampler;
 /// Named engine failure. Stable prefixes for observe greps (`vk_engine_*`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DrawError {
+    Planar(super::super::planar::Refusal),
+    SampledShader(super::super::sampled_shader::Refusal),
+    GraphicsStorage(super::graphics_storage::GraphicsStorageDecline),
     /// Init / ICD / device selection failed. Latched by `ContextOwner`, except
     /// when it is out of memory — see `ContextOwner::note_init_failure`.
     Init(super::init_decline::InitDecline),
@@ -96,6 +99,9 @@ impl DrawError {
 impl std::fmt::Display for DrawError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Planar(d) => write!(f, "vk_engine_planar: {}", d.slug()),
+            Self::SampledShader(d) => write!(f, "vk_engine_sampled_shader: {}", d.slug()),
+            Self::GraphicsStorage(d) => write!(f, "vk_engine_graphics_storage: {d}"),
             Self::Init(d) => write!(f, "vk_engine_init: {d}"),
             Self::Unsupported(r) => write!(f, "vk_engine_unsupported: {r}"),
             Self::Facade(d) => write!(f, "vk_engine_facade: {d}"),
@@ -121,6 +127,9 @@ impl crate::observe::Decline for DrawError {
     /// one event has one reason at every layer.
     fn slug(&self) -> &'static str {
         match self {
+            Self::Planar(d) => d.slug(),
+            Self::SampledShader(d) => d.slug(),
+            Self::GraphicsStorage(d) => d.slug(),
             Self::TargetRead(d) => d.slug(),
             Self::GuestPageWrite(d) => d.slug(),
             Self::Unsupported(r) => r.slug(),
@@ -149,6 +158,9 @@ impl crate::observe::Decline for DrawError {
     /// spelled the slug, not the one that passed it on.
     fn owner(&self) -> &'static str {
         match self {
+            Self::Planar(_) => "backend::vulkan::planar",
+            Self::SampledShader(_) => "backend::vulkan::sampled_shader",
+            Self::GraphicsStorage(d) => d.owner(),
             Self::TargetRead(d) => d.owner(),
             Self::GuestPageWrite(d) => d.owner(),
             Self::Unsupported(r) => r.owner(),
@@ -168,6 +180,9 @@ impl crate::observe::Decline for DrawError {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
+            Self::Planar(_) => Vec::new(),
+            Self::SampledShader(_) => Vec::new(),
+            Self::GraphicsStorage(d) => d.fields(),
             Self::TargetRead(d) => d.fields(),
             Self::GuestPageWrite(d) => d.fields(),
             Self::Unsupported(r) => r.fields(),
@@ -502,6 +517,8 @@ pub struct DrawRequest {
     pub vertex_attributes: Vec<VertexAttributeResource>,
     pub storage_buffers: Vec<StorageBufferResource>,
     pub sampled_images: Vec<SampledImageResource>,
+    /// Unique native writable images and every sampled/storage alias of them.
+    pub storage_textures: Vec<super::graphics_storage::GraphicsStorageTexture>,
     pub samplers: Vec<SamplerResource>,
     /// CPU Load seed for the color target, in the order
     /// [`DrawRequest::target_seed_order`] names.
@@ -661,13 +678,11 @@ pub struct DrawRequest {
     /// buffer, byte-identical to the pre-depth 2D path. Set only for a draw that
     /// bound a non-trivial `MTLDepthStencilState` (see `runtime::draw`).
     pub depth: Option<DepthState>,
-    /// Fragment shader reads its destination pixel (Metal framebuffer fetch:
-    /// an `air.render_target` INPUT param, translated as a `SubpassData` image
-    /// at [`COLOR_INPUT_BINDING`]). The engine then references attachment 0 as
-    /// a subpass input (GENERAL layout, BY_REGION self-dependency) and writes
-    /// an INPUT_ATTACHMENT descriptor pointing at the color target's view.
-    /// `false` (default) keeps the pass byte-identical to the pre-fetch engine.
-    pub color_input: bool,
+    /// Bit N says the fragment shader fetches color attachment N through the
+    /// SubpassData descriptor at COLOR_INPUT_BINDING+N. Slots are not compacted:
+    /// InputAttachmentIndex remains the Metal attachment index, including holes.
+    /// Ordered same-pixel reads require the rasterization-order-access feature.
+    pub color_input: u8,
     /// The preceding engine request belongs to this draw's Metal render
     /// encoder. Used only when its Vulkan pass is still open and identical.
     pub continues_render_pass: bool,
@@ -677,6 +692,16 @@ pub struct DrawRequest {
 }
 
 impl DrawRequest {
+    /// The primary attachment's interpretation, whether or not it has a
+    /// residency identity. Seeds, render passes and pooled allocations all use
+    /// this declaration; an identity alone cannot describe a texture view.
+    pub(crate) fn primary_format(&self) -> vk::Format {
+        self.color_attachment.map(|attachment| attachment.format()).unwrap_or_else(|| {
+            self.target_identity.as_ref().map(|identity| identity.resident_format())
+                .unwrap_or(crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT)
+        })
+    }
+
     /// Whether this draw binds `identity` as one of its own attachments.
     ///
     /// Sampling an attachment the same draw renders into is an attachment
@@ -789,7 +814,7 @@ pub fn viewport_slot_count(req: &DrawRequest) -> usize {
 /// This is the *device's* ColorInput band base, not the translator's: the band
 /// moved up when the texture band was widened to Metal's 128 entries
 /// (`runtime::spirv_bind::widen_sampled_bands` rewrites `dest_N` from the
-/// translator's `96+N` to `192+N`). Only `dest_0` is supported. Kept equal to
+/// translator's `96+N` to `192+N`). Kept equal to
 /// `runtime::spirv_bind::COLOR_INPUT_BINDING_BASE` by a unit test there, because
 /// the two constants live on opposite sides of the runtime/engine layering.
 /// Both fragment relocations preserve it.
@@ -831,6 +856,8 @@ pub struct SecondaryColorTarget {
 
 #[derive(Debug, Default)]
 pub struct DrawOutput {
+    /// Native texture bytes in request order, only returned after completion.
+    pub storage_textures: Vec<Vec<u8>>,
     pub pixels: Vec<u8>,
     /// Whether color attachment zero was rendered through the retained guest
     /// allocation supplied on this request.
@@ -1793,6 +1820,14 @@ pub use reims_vgpu_vulkan::pixel::StorageImageFormat;
 /// this rail's resolution outside this rail.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum TargetIdentity {
+    /// A native-format attachment owned by one guest render encoder. This
+    /// namespace has no guest address and cannot collide with resource caches.
+    PassLocal {
+        id: super::pass_local::PassLocalId,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    },
     /// Backing mapping / surface id namespace.
     Surface {
         id: u32,
@@ -2007,7 +2042,8 @@ impl TargetKeyDivergence {
 impl TargetIdentity {
     pub fn width(&self) -> u32 {
         match self {
-            Self::Surface { width, .. } | Self::Texture { width, .. } | Self::Gva { width, .. } => {
+            Self::Surface { width, .. } | Self::Texture { width, .. } | Self::Gva { width, .. }
+            | Self::PassLocal { width, .. } => {
                 *width
             }
             Self::Anonymous { .. } => 0,
@@ -2018,7 +2054,7 @@ impl TargetIdentity {
         match self {
             Self::Surface { height, .. }
             | Self::Texture { height, .. }
-            | Self::Gva { height, .. } => *height,
+            | Self::Gva { height, .. } | Self::PassLocal { height, .. } => *height,
             Self::Anonymous { .. } => 0,
         }
     }
@@ -2028,7 +2064,7 @@ impl TargetIdentity {
             Self::Surface { generation, .. }
             | Self::Texture { generation, .. }
             | Self::Gva { generation, .. } => *generation,
-            Self::Anonymous { .. } => 0,
+            Self::Anonymous { .. } | Self::PassLocal { .. } => 0,
         }
     }
 
@@ -2049,6 +2085,7 @@ impl TargetIdentity {
             Self::Texture { ref_, .. } => (1, u64::from(*ref_)),
             Self::Gva { gva, .. } => (2, *gva),
             Self::Anonymous { slot } => (3, *slot),
+            Self::PassLocal { id, .. } => (4, id.get()),
         }
     }
 
@@ -2084,7 +2121,7 @@ impl TargetIdentity {
             Self::Surface { generation: g, .. }
             | Self::Texture { generation: g, .. }
             | Self::Gva { generation: g, .. } => *g = generation,
-            Self::Anonymous { .. } => {}
+            Self::Anonymous { .. } | Self::PassLocal { .. } => {}
         }
         next
     }
@@ -2147,6 +2184,7 @@ impl TargetIdentity {
             (Self::Gva { gva: a, .. }, Self::Gva { gva: b, .. }) => a == b,
             (Self::Texture { ref_: a, .. }, Self::Texture { ref_: b, .. }) => a == b,
             (Self::Anonymous { slot: a }, Self::Anonymous { slot: b }) => a == b,
+            (Self::PassLocal { id: a, .. }, Self::PassLocal { id: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -2169,6 +2207,7 @@ impl TargetIdentity {
         match self {
             Self::Surface { format, .. } => *format,
             Self::Gva { format, .. } => *format,
+            Self::PassLocal { format, .. } => *format,
             Self::Texture { .. } | Self::Anonymous { .. } => translate::pixel::RESIDENT_RGBA_FORMAT,
         }
     }
@@ -2725,7 +2764,7 @@ mod tests {
         assert!(draw.target_identity.is_none());
         assert!(draw.depth.is_none());
         assert!(!draw.skip_readback);
-        assert!(!draw.color_input);
+        assert_eq!(draw.color_input, 0);
 
         let compute = ComputeRequest::default();
         assert_eq!(compute.dispatch, ComputeDispatch::Workgroups([0, 0, 0]));

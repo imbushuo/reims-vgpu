@@ -4166,7 +4166,7 @@ fn framebuffer_fetch_reads_destination_via_input_attachment() {
     let f = translate_words("render_frag_fetch.air", Stage::Fragment);
     let (w, h) = (16u32, 16u32);
     let mut req = engine_req(&v, &f, w, h);
-    req.color_input = true;
+    req.color_input = 1;
     // Seed (64, 128, 191, 255) → expect ~(191, 127, 64, 255).
     req.target_rgba8 = Some(std::sync::Arc::new(
         [64, 128, 191, 255].repeat((w * h) as usize),

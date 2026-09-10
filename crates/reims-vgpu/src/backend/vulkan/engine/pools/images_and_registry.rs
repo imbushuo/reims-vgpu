@@ -167,6 +167,11 @@ impl ResourcePools {
                         vk::ImageUsageFlags::STORAGE
                             | vk::ImageUsageFlags::TRANSFER_DST
                             | vk::ImageUsageFlags::TRANSFER_SRC
+                            | if key.sampled_alias {
+                                vk::ImageUsageFlags::SAMPLED
+                            } else {
+                                vk::ImageUsageFlags::empty()
+                            }
                     })
                     .initial_layout(vk::ImageLayout::UNDEFINED),
                 None,
@@ -870,7 +875,7 @@ impl ResourcePools {
     /// A caller asking for the format the slot was allocated in gets
     /// `slot.view` and no allocation happens, which is every format this device
     /// renders to except the two sRGB spellings.
-    unsafe fn registry_view(
+    pub(crate) unsafe fn registry_view(
         &mut self,
         ctx: &DeviceContext,
         identity: &TargetIdentity,
@@ -932,6 +937,9 @@ impl ResourcePools {
         let old = self.registry.remove(identity);
         self.registry_order.retain(|k| k != identity);
         let old = old?;
+        if matches!(identity, TargetIdentity::PassLocal { .. }) {
+            crate::runtime::drain::note_store_route("memoryless_native_retired");
+        }
         if old.pin_count == 0 {
             self.registry_non_pinned_adjust(Self::slot_attachment_bytes(&old), false);
         }
@@ -1015,6 +1023,9 @@ impl ResourcePools {
     ///   the order is a resident no sweep can ever choose; one in the order but
     ///   not the map is a victim that frees nothing.
     fn register_resident(&mut self, identity: &TargetIdentity, new: NewResident) {
+        if matches!(identity, TargetIdentity::PassLocal { .. }) {
+            crate::runtime::drain::note_store_route("memoryless_native_allocated");
+        }
         let last_touch_ms = self.idle_clock_ms;
         let guest_backed = new.memory.is_guest_imported();
         self.registry.insert(
@@ -1048,9 +1059,9 @@ impl ResourcePools {
                     ResidentAccess::Untouched
                 },
                 format: new.format,
-                pin_count: 0,
+                pin_count: u32::from(matches!(identity, TargetIdentity::PassLocal { .. })),
                 resource_released: false,
-                resource_owner_count: 0,
+                resource_owner_count: u32::from(matches!(identity, TargetIdentity::PassLocal { .. })),
                 // Nothing has drawn into it, so it holds no guest work to lose.
                 // A recycled image arrives here too, and its stale contents are
                 // not this identity's content.
@@ -1059,33 +1070,50 @@ impl ResourcePools {
             },
         );
         self.registry_order.push_back(identity.clone());
-        // Born unpinned (see the birth-state rule above), so it joins the
-        // non-pinned totals unconditionally.
+        // A pass-local image is born with its encoder's ownership pin. Guest
+        // residents acquire serialized ownership separately, after rendering.
         let bytes = self
             .registry
             .get(identity)
             .map(Self::slot_attachment_bytes)
             .unwrap_or(0);
-        self.registry_non_pinned_adjust(bytes, true);
+        if !matches!(identity, TargetIdentity::PassLocal { .. }) {
+            self.registry_non_pinned_adjust(bytes, true);
+        }
     }
 
-    /// Drop the resident registered under `identity`, recording `why`, returning
-    /// its image/memory/view to `target_free` and its framebuffer to the
-    /// graveyard. Returns the slot that was removed, or `None` when nothing was
-    /// registered.
+    fn resident_retirement_handle(identity: &TargetIdentity, old: &ResidentTargetSlot) -> DeferredHandle {
+        match &old.memory {
+            ResidentMemory::Recyclable(memory) if matches!(identity, TargetIdentity::PassLocal { .. }) => {
+                // Ended encoder content has no reuse lifetime. The ordinary
+                // recycler is count-bounded, not byte-bounded: retaining many
+                // one-off float attachment extents there can retain gigabytes.
+                // Disposal still waits for every command using this image.
+                DeferredHandle::PassLocalImage {
+                    image: old.image,
+                    view: old.view,
+                    memory: *memory,
+                    attachment_bytes: Self::slot_attachment_bytes(old),
+                }
+            }
+            ResidentMemory::Recyclable(memory) => DeferredHandle::RecycleTarget(FreeTargetImage {
+                image: old.image, memory: *memory, view: old.view,
+                width: old.width, height: old.height, sample_count: old.sample_count,
+                format: old.format.allocation(),
+            }),
+            ResidentMemory::GuestImported { guest } => DeferredHandle::GuestImage {
+                image: old.image, view: old.view, _import: std::sync::Arc::clone(&guest.import),
+            },
+        }
+    }
+
+    /// Drop the resident registered under `identity`, recording `why`. Ordinary
+    /// guest images may recycle; pass-local images free after their fences.
+    /// Returns the removed slot, or `None` when nothing was registered.
     ///
-    /// The recycling exit for a live registry entry: the two `registry_ensure*`
-    /// recreate arms and [`Self::reclaim_for_allocation_retry`] all take it, and
-    /// were copies of one another before they did. The MRT-secondary path recorded
-    /// no reclaim reason at all, so a later draw whose sampled source that path
-    /// had recreated could not be told "taken from under you" from "never
-    /// existed", which is the whole point of
-    /// [`Self::note_resident_reclaimed`]. The primary path was the one that
-    /// disposed `old.framebuffer` without asking whether the slot had one.
-    ///
-    /// Resource release also comes through here but is not counted as an
-    /// eviction: the guest ended that lifetime. Bookkeeping and the framebuffer
-    /// null question remain centralized so removal paths cannot diverge.
+    /// Both `registry_ensure*` recreate arms, allocation recovery and resource
+    /// release use this exit, so handles and reclaim reasons cannot diverge.
+    /// Resource release is not eviction: the guest ended that lifetime.
     unsafe fn retire_resident(
         &mut self,
         ctx: &DeviceContext,
@@ -1098,22 +1126,7 @@ impl ResourcePools {
         for (_, view) in &old.alternate_views {
             self.dispose(&ctx.device, DeferredHandle::ImageView(*view));
         }
-        let retired = match &old.memory {
-            ResidentMemory::Recyclable(memory) => DeferredHandle::RecycleTarget(FreeTargetImage {
-                image: old.image,
-                memory: *memory,
-                view: old.view,
-                width: old.width,
-                height: old.height,
-                sample_count: old.sample_count,
-                format: old.format.allocation(),
-            }),
-            ResidentMemory::GuestImported { guest } => DeferredHandle::GuestImage {
-                image: old.image,
-                view: old.view,
-                _import: std::sync::Arc::clone(&guest.import),
-            },
-        };
+        let retired = Self::resident_retirement_handle(identity, &old);
         self.dispose(&ctx.device, retired);
         if why != ResidentReclaim::ResourceReleased {
             counters
@@ -2203,6 +2216,12 @@ impl ResourcePools {
         }
         slot.resource_owner_count -= 1;
         slot.resource_released = slot.resource_owner_count == 0;
+        if slot.resource_released && matches!(identity, TargetIdentity::PassLocal { .. }) {
+            // Native texels are the only copy while the encoder is alive, but
+            // its DontCare end discards them. Otherwise rendered memoryless
+            // targets remain permanently uncollectable after the owner unpins.
+            self.set_sole_copy(identity, false);
+        }
         self.pin_resident_target(identity, false);
         Some(
             self.registry
@@ -2455,8 +2474,12 @@ impl ResourcePools {
     /// Instantaneous registry populations for the once-per-second census.
     pub(crate) fn registry_levels(&self) -> RegistryLevels {
         let mut levels = RegistryLevels::default();
-        for slot in self.registry.values() {
+        for (identity, slot) in &self.registry {
             let bytes = Self::slot_attachment_bytes(slot);
+            if matches!(identity, TargetIdentity::PassLocal { .. }) {
+                levels.pass_local.count += 1;
+                levels.pass_local.bytes += bytes;
+            }
             levels.current.count += 1;
             levels.current.bytes += bytes;
             if slot.pin_count != 0 {
@@ -3904,6 +3927,46 @@ pub(super) mod pin_count_tests {
     }
 
     #[test]
+    fn memoryless_native_registry_storage_is_owned_at_birth_and_released_at_pass_end() {
+        let mut pools = ResourcePools::new();
+        let owner = crate::backend::vulkan::engine::pass_local::PassLocalTarget::new(
+            8, 4, vk::Format::R32_SFLOAT,
+        ).unwrap();
+        let id = owner.identity();
+        pools.register_resident(id, NewResident {
+            image: vk::Image::null(),
+            memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
+            view: vk::ImageView::null(),
+            framebuffer: vk::Framebuffer::null(),
+            render_pass: vk::RenderPass::null(),
+            framebuffer_compatibility: None,
+            width: 8, height: 4, sample_count: 1, generation: 0,
+            format: translate::pixel::ResidentFormat::of(vk::Format::R32_SFLOAT),
+            attachment_view: None,
+        });
+        assert_eq!(pools.registry[id].pin_count, 1);
+        assert_eq!(pools.registry[id].resource_owner_count, 1);
+        assert_eq!(pools.registry_levels().pass_local, NonPinnedTotals { count: 1, bytes: 8 * 4 * 4 });
+        assert!(!pools.registry[id].content_ready);
+        assert_eq!(pools.non_pinned_registry_len(), 0,
+            "allocation pressure cannot evict a pass's only texels, even before its first draw");
+        pools.registry_mark_ready(id);
+        assert!(pools.registry[id].gpu_only_content);
+        assert!(pools.pin_resident_target(id, true), "an outstanding native reader");
+        assert_eq!(pools.release_resident_ownership(id), Some(false));
+        assert!(!pools.registry[id].gpu_only_content, "pass end no longer owes a stored copy");
+        assert!(pools.released_resident_keys(1).is_empty(), "the transient reader still pins the image");
+        assert!(pools.pin_resident_target(id, false));
+        assert_eq!(pools.released_resident_keys(1), vec![id.clone()]);
+        let old = pools.unregister_resident(id, ResidentReclaim::ResourceReleased).unwrap();
+        assert_eq!(pools.registry_levels().pass_local, NonPinnedTotals::default());
+        assert!(matches!(ResourcePools::resident_retirement_handle(id, &old), DeferredHandle::PassLocalImage { .. }),
+            "ended pass storage must be freed after its fences, not retained by a count-only cache");
+        assert!(matches!(ResourcePools::resident_retirement_handle(&surf(1), &old),
+            DeferredHandle::RecycleTarget(_)), "ordinary guest resident reuse is unchanged");
+    }
+
+    #[test]
     fn one_alias_release_does_not_end_another_resources_ownership() {
         let mut pools = ResourcePools::new();
         let id = pinned_identity();
@@ -3923,6 +3986,58 @@ pub(super) mod pin_count_tests {
             Some(false),
             "the surviving alias keeps the shared allocation retainable"
         );
+    }
+
+    #[test]
+    fn memoryless_repeated_passes_and_partial_allocation_refusals_leave_no_native_residents() {
+        use crate::backend::vulkan::engine::pass_local::PassLocalTarget;
+        let mut pools = ResourcePools::new();
+        let mut allocated = 0;
+        let mut retired = 0;
+        for pass in 0..256 {
+            let owners: Vec<_> = (0..8).map(|slot| {
+                PassLocalTarget::new(1920, 1080, if slot == 0 {
+                    vk::Format::R32_SFLOAT
+                } else { vk::Format::R16G16B16A16_SFLOAT }).unwrap()
+            }).collect();
+            // Include refusals before any GPU allocation and after each
+            // possible partial attachment set, beside fully encoded passes.
+            let acquired = pass % 9;
+            for owner in owners.iter().take(acquired) {
+                let id = owner.identity();
+                pools.register_resident(id, NewResident {
+                    image: vk::Image::null(),
+                    memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
+                    view: vk::ImageView::null(),
+                    framebuffer: vk::Framebuffer::null(),
+                    render_pass: vk::RenderPass::null(),
+                    framebuffer_compatibility: None,
+                    width: id.width(), height: id.height(), sample_count: 1, generation: 0,
+                    format: translate::pixel::ResidentFormat::of(id.resident_format()),
+                    attachment_view: None,
+                });
+                if pass % 2 == 0 { pools.registry_mark_ready(id); }
+                allocated += 1;
+            }
+            assert_eq!(pools.registry_levels().pass_local.count, acquired);
+            for owner in &owners {
+                let id = owner.identity();
+                match pools.release_resident_ownership(id) {
+                    None => assert!(!pools.registry.contains_key(id), "never allocated"),
+                    Some(true) => {
+                        let old = pools.unregister_resident(id, ResidentReclaim::ResourceReleased).unwrap();
+                        assert!(matches!(ResourcePools::resident_retirement_handle(id, &old),
+                            DeferredHandle::PassLocalImage { .. }));
+                        retired += 1;
+                    }
+                    Some(false) => panic!("a completed/refused pass retained an ownership pin"),
+                }
+            }
+            assert_eq!(pools.registry_levels().pass_local, NonPinnedTotals::default());
+            assert!(pools.registry_order.is_empty());
+            assert_eq!(allocated, retired, "pass {pass} leaked native attachment ownership");
+            assert_eq!(pools.non_pinned_registry_totals_by_walk(), NonPinnedTotals::default());
+        }
     }
 
     #[test]

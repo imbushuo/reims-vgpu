@@ -71,6 +71,7 @@
 use crate::access::BackingId;
 use crate::identity::{ObjectListRef, ResourceId, SlotGeneration};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Why a namespace operation did not happen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,10 +262,25 @@ struct Slot {
     outstanding: usize,
 }
 
+/// Resource ids reach device-wide tables without a task id. All namespaces in
+/// one lifecycle therefore share these counters, including replacement tasks.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Generations(Arc<Mutex<HashMap<ObjectListRef, SlotGeneration>>>);
+
+impl Generations {
+    fn next(&self, slot: ObjectListRef) -> SlotGeneration {
+        let mut generations = self.0.lock().expect("resource generations");
+        let generation = generations.entry(slot).or_default();
+        *generation = generation.next();
+        *generation
+    }
+}
+
 /// One session generation's object namespace.
 #[derive(Debug, Default)]
 pub struct Namespace {
     slots: HashMap<ObjectListRef, Slot>,
+    generations: Generations,
     /// Backings detached from a slot by a delete or a replacement, still held
     /// by accepted work, counted *per backing* rather than per detachment.
     ///
@@ -293,6 +309,13 @@ impl Namespace {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_generations(generations: Generations) -> Self {
+        Self {
+            generations,
+            ..Self::default()
+        }
     }
 
     /// Declare an object into a slot.
@@ -331,8 +354,7 @@ impl Namespace {
     /// previous occupant left behind.
     pub fn declare(&mut self, slot: ObjectListRef, backing: Option<BackingId>) -> Declared {
         let existing = self.slots.get(&slot).copied();
-        let generation =
-            existing.map_or_else(|| SlotGeneration::default().next(), |e| e.generation.next());
+        let generation = self.generations.next(slot);
         // Only a *live* occupant is displaced. A deleted one already handed its
         // backing over.
         let displaced = existing.filter(|e| !e.deleted);

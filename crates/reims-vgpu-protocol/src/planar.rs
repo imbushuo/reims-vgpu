@@ -16,6 +16,8 @@ use crate::endian::{ld16, ld32};
 use crate::iosurface_pages::{self as pages, DevicePlaneRecord};
 use reims_vgpu_wire::ops::backed_texture;
 
+pub mod sampling;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum SampleFormat {

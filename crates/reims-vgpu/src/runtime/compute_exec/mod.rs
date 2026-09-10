@@ -1529,7 +1529,7 @@ impl ResidentServe {
 /// guest may have written anything into, and folding it into the image is
 /// exactly the failure the conformance battery fills padding with a distinct
 /// pattern to catch.
-fn stage_buffer_texture<R: RailStage, M: HostMemory + HostOps>(
+pub(crate) fn stage_buffer_texture<R: RailStage, M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,

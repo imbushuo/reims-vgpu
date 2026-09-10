@@ -21,6 +21,8 @@ use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 use crate::runtime::surface_currency::{surface_currency, CurrencyStandard, SurfaceCurrency};
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
+mod sampled;
+
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
 ///
 /// The engine caps array layers at 1 (a single-layer array is still a distinct
@@ -111,15 +113,24 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     host: &mut M,
     req: &mut DrawEncodeRequest,
     writeback_guest: bool,
+    force_full_store: bool,
+) -> (EncodeStatus, Option<Vec<u8>>) {
+    crate::backend::vulkan::render_pass::VulkanRenderPass::default()
+        .encode_draw(state, host, req, writeback_guest, force_full_store)
+}
+
+pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    req: &mut DrawEncodeRequest,
+    writeback_guest: bool,
     // Inert on this arm, and by construction rather than by omission: the Metal
     // arm consults it in `store_seed_policy` to suppress a scissor-local store,
     // and this rail has no scissor-local store to suppress — `req.scissor` only
     // ever reaches the pipeline scissor rect, never the Store extent.
     _force_full_store: bool,
+    pass: &crate::backend::vulkan::render_pass::VulkanRenderPass,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
-    if req.colors.iter().any(|c| c.storage == ColorStorage::Memoryless) {
-        return (EncodeStatus::BadArgs("draw_vk_memoryless_unsupported"), None);
-    }
     // Charges this chain to one phase at a time all the way down, including the
     // parts of it that live inside `try_metal2vulkan_draw`. Held here rather
     // than there because the Store routing below the engine is on the same
@@ -200,7 +211,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         record_plane_draw(req);
         req.chain_resident_established = false;
-        let engine = try_metal2vulkan_draw(state, host, req, writeback_guest);
+        let engine = try_metal2vulkan_draw(state, host, req, writeback_guest, pass);
         // Set from the result itself rather than inside the arms, because the
         // arms are where this went wrong: the refusal slug was assigned only in
         // `Err`, every `Ok` arm left it `None`, and the tail spelled `None`
@@ -796,6 +807,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
 
 /// Sampled texture source + geometry for an engine draw.
 pub(super) enum SampledSourceRequest {
+    Planar(crate::backend::vulkan::planar::Image),
     /// Shared texel bytes + optional producer identity (see
     /// [`LinearSampleIdentity`]) + what those texels are; the Arc lets memoized
     /// repeat binds skip the per-draw copy and the engine skip re-hashing.
@@ -1162,6 +1174,25 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     if texture_ref == 0 {
         return None;
     }
+    let resource = resource.or_else(|| objects::resolve_resource(state, host, task_id, texture_ref).ok());
+    if resource.as_ref().is_some_and(|resource|
+        resource.entry.object_type == OBJECT_TYPE_MAPPER_REF_TEXTURE
+            && crate::protocol::planar::type11_sample_format(&resource.descriptor).is_some())
+    {
+        use crate::runtime::compute_exec::{stage_texture_raw, vulkan::VulkanStage};
+        return match stage_texture_raw::<VulkanStage, _>(
+            state, host, task_id, texture_ref, 0, false,
+        ) {
+            Ok(mut staged) => staged.rail.planar.take().map(|image|
+                (image.width, image.height, 0, SampledSourceRequest::Planar(image))),
+            Err(reason) => {
+                crate::observe::Emit::refusal("draw_vk_planar_texture", &reason)
+                    .expect("planar staging error is a refusal")
+                    .field("task", task_id).field("ref", texture_ref).fail();
+                None
+            }
+        };
+    }
 
     // Opcode-9 buffer-backed texture (texture-view): the sampled bytes are an MTLBuffer's
     // guest storage, not a view over another texture. Resolve it directly before
@@ -1171,22 +1202,18 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     if let Some(bt) =
         buffer_texture_descriptor(state, host, task_id, texture_ref, resource.as_deref())
     {
-        // The opcode-9 descriptor's own pixel format. The loader converts to
-        // RGBA8 order and decodes nothing, so the transfer function the guest
-        // declared is still the one these bytes carry.
-        let source = bt.desc.pixel_format;
-        let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)?;
-        return Some((
-            w,
-            h,
-            0,
-            SampledSourceRequest::Bytes(
-                std::sync::Arc::new(rgba),
-                None,
-                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
-                crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
-            ),
-        ));
+        return match sampled::buffer_source(
+            state, host, task_id, texture_ref, &bt,
+            crate::backend::vulkan::engine::supports_sampled_layout_bind,
+        ) {
+            Ok((w, h, source)) => Some((w, h, 0, source)),
+            Err(reason) => {
+                crate::observe::Emit::refusal("draw_vk_buffer_texture", &reason)
+                    .expect("sampled staging error is a refusal")
+                    .field("task", task_id).field("ref", texture_ref).fail();
+                None
+            }
+        };
     }
 
     // The object list names exactly ONE surface for a sampled ref. Which one is
@@ -1207,8 +1234,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     let mut is_ref_texture = false;
     let mut ref_texture_view: Option<objects::RefTextureView> = None;
     let mut surface: Option<u32> = None;
-    let resolved_resource =
-        resource.or_else(|| objects::resolve_resource(state, host, task_id, texture_ref).ok());
+    let resolved_resource = resource;
     if let Some(resource) = resolved_resource.as_ref() {
         let entry = resource.entry;
         if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
@@ -2590,43 +2616,20 @@ pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
         view.height,
         view.pixel_format,
     );
-    // A single/dual-channel plane (biplanar video Y = R8, CbCr = RG8) uploads at
-    // its native footprint: `texel_to_rgba8` places R8→(r,0,0,255) and
-    // RG8→(r,g,0,255), which is exactly what an R8_UNORM / R8G8_UNORM Vulkan
-    // image samples to (`.r` / `.rg`, zero-filled tail). Skipping the CPU expand
-    // and uploading native cuts 4×/2× the staging bytes with byte-exact texels.
-    // The ten-bit pair (`'x420'`, `R16Unorm` / `RG16Unorm`) takes the same
-    // native rail for the same reason and one more: `texel_to_rgba8` has no arm
-    // for them, because an arm would have to narrow ten bits of graded luma to
-    // eight. `TexelLayout::has_cpu_loader_arm` is where that is stated.
-    //
-    // The half-float colour pair is deliberately **not** here yet. It belongs
-    // by the same argument the linear rails took — `texel_to_rgba8`'s arm for
-    // it clamps to `[0, 1]` and quantizes to 256 levels — but nothing has ever
-    // measured a ref-texture view arriving in one, and this rail is the video-plane
-    // rail. `ref_texture_view_narrowed` below is the measurement; add the arm when it
-    // fires, not before.
-    //
-    // The packed 32-bit colour formats take the native rail for the same
-    // reason and a sharper one: their channel boundaries are not byte
-    // boundaries, so `TexelLayout::Rgba8` would not merely quantize them, it
-    // would read the word as four unrelated bytes. Four bytes wide is exactly
-    // what the default arm below tests for and exactly what makes that wrong,
-    // which is why they are named here rather than left to it.
-    // The layout is the view's own; the transfer function travels with it,
-    // because the default arm below converts to RGBA8 order and decodes nothing.
-    let byte_format = SampledByteFormat::from_source(
-        match view.pixel_format {
-            pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
-            pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
-            pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
-            pixel_format::MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
-            pixel_format::MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
-            pixel_format::MTL_FORMAT_RG11B10_FLOAT => TexelLayout::Rg11b10Float,
-            _ => TexelLayout::Rgba8,
-        },
-        view.pixel_format,
-    );
+    let byte_format = match sampled::native_byte_format(
+        view.pixel_format, crate::backend::vulkan::engine::supports_sampled_layout_bind,
+    ) {
+        Ok(format) => format.unwrap_or_else(|| SampledByteFormat::from_source(
+            TexelLayout::Rgba8, view.pixel_format,
+        )),
+        Err(reason) => {
+            crate::observe::Emit::refusal("ref_texture_draw_view", &reason)
+                .expect("native upload error is a refusal")
+                .field("task", task_id).field("ref", texture_ref)
+                .field("fmt", view.pixel_format).fail();
+            return None;
+        }
+    };
     let ok_line = |generation_source: &str, rgba: &[u8]| {
         // Per-draw success echo — fires on EVERY ref-texture plane bind (thousands/sec
         // under video → ~36k lines/boot, 61% of the fail log), burying real
@@ -5174,13 +5177,13 @@ fn native_uploads_for(sample_format: u16) -> NativeUploads {
 fn native_uploads_asking_host() -> NativeUploads {
     use crate::backend::vulkan::engine;
     NativeUploads {
-        // One flag for both half-float layouts, so the answer is the
-        // conjunction: a host that filters one and not the other keeps neither
-        // on the native rail. Nothing on record separates them — both carry
+        // One flag for the half-float layouts, so the answer is the
+        // conjunction. Nothing on record separates them — all carry
         // `SAMPLED_IMAGE_FILTER_LINEAR` by mandate — and a per-layout flag
-        // would be two fields nobody could point at a host that needed them.
+        // would be separate fields nobody could point at a host that needed them.
         float16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Float)
-            && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float),
+            && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float)
+            && engine::supports_sampled_layout_linear_filter(TexelLayout::R16Float),
         // One flag for BC1 through BC7 because Vulkan gates them behind one
         // feature — see `caps::device_features::DeviceFeatures::
         // texture_compression_bc`. A per-family flag would be ten fields nobody
@@ -6562,6 +6565,7 @@ fn note_mapper_ref_texture_store_route(route: &'static str) {
     clippy::too_many_arguments,
     reason = "every argument is a distinct wire-derived input to the attachment set"
 )]
+#[cfg(test)]
 pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -6575,6 +6579,26 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
 > {
+    build_secondary_targets_in_pass(
+        state, host, task_id, colors, pipeline, primary, fb_w, fb_h,
+        &crate::backend::vulkan::render_pass::VulkanRenderPass::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_secondary_targets_in_pass<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    colors: &[ColorRtRequest],
+    pipeline: &crate::runtime::decode::resource::RenderPipelineDescriptor,
+    primary: &crate::backend::vulkan::engine::TargetIdentity,
+    fb_w: u32,
+    fb_h: u32,
+    pass: &crate::backend::vulkan::render_pass::VulkanRenderPass,
+) -> Result<Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
+    crate::runtime::census::present_proxy::SecondaryMrtRefusal>
+{
     use crate::backend::vulkan::engine::{SecondaryColorTarget, TargetIdentity};
     use crate::runtime::census::present_proxy::SecondaryMrtRefusal;
     if colors.len() <= 1 {
@@ -6610,7 +6634,12 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // Unknown wire format stays unknown — never guess a secondary layout —
         // and a known format whose sRGB qualifier this attachment cannot carry
         // says so instead of folding silently.
-        let attachment = match translate::pixel::color_attachment(c.format) {
+        let translated = if c.storage == ColorStorage::Memoryless {
+            translate::pixel::memoryless_color_attachment(c.format).map(|format| (format, None))
+        } else {
+            translate::pixel::color_attachment(c.format)
+        };
+        let attachment = match translated {
             Ok((attachment, decline)) => {
                 if decline.is_some() {
                     srgb_census::note_downgrade(
@@ -6642,7 +6671,9 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // Without one this attachment is keyed on `(gva, width, height)` alone
         // and two guest allocations reusing that address at that geometry share
         // one GPU image — the wrong-content class `74748d2` closed for color0.
-        let identity = if c.target_gva != 0 {
+        let identity = if let Some(identity) = pass.identity(c) {
+            identity.clone()
+        } else if c.target_gva != 0 {
             TargetIdentity::Gva {
                 gva: c.target_gva,
                 width: c.width,
@@ -6755,7 +6786,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         if matches!(
             declared,
             reims_vgpu_protocol::pass_action::LoadAction::DontCare
-        ) && !load
+        ) && !load && c.storage != ColorStorage::Memoryless
         {
             // Reported only where it still costs the guest: a DontCare whose
             // resident cannot answer for the attachment is the one that still
@@ -6923,11 +6954,14 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
     }
 }
 
+mod storage;
+
 fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     req: &mut DrawEncodeRequest,
     writeback_guest: bool,
+    pass: &crate::backend::vulkan::render_pass::VulkanRenderPass,
 ) -> Result<M2vDrawSpan, DrawError> {
     // Only the final record of a portability render-pass chain reads back CPU
     // pixels; used by the resident-chain rail below (harmless on other paths).
@@ -7015,33 +7049,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         ));
     }
 
-    for (stage, shader, textures) in [
-        ("vertex", &v_shader, &req.vertex_textures),
-        ("fragment", &f_shader, &req.fragment_textures),
-    ] {
-        if let Some((index, descriptor)) =
-            crate::runtime::spirv_bind::first_non_sampled_texture_descriptor(&shader.reflection)
-        {
-            let access = match descriptor.access {
-                crate::runtime::spirv_bind::ReflectedTextureAccess::Storage => "storage",
-                crate::runtime::spirv_bind::ReflectedTextureAccess::Unknown => "unknown",
-                crate::runtime::spirv_bind::ReflectedTextureAccess::Sampled => continue,
-            };
-            return Err(DrawError::DrawPreparation(
-                DrawPreparationDecline::TextureAccessUnsupported {
-                    stage,
-                    index,
-                    texture_ref: textures
-                        .iter()
-                        .find(|texture| texture.index == index)
-                        .map(|texture| texture.texture_ref)
-                        .unwrap_or(0),
-                    binding: descriptor.binding,
-                    access,
-                },
-            ));
-        }
-    }
     for (stage, expected_stage, shader) in [
         (
             "vertex",
@@ -7108,7 +7115,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     // `m2v_cache::ShaderVariant` — so nothing here re-walks a module per draw.
     // A vertex module never relocates, so it is always the base variant.
     let v_variant = v_shader.variant(false, false);
-    let v_words = v_variant.words.clone();
+    let mut v_words = v_variant.words.clone();
     #[allow(unused_mut)]
     let mut f_variant = f_shader.variant(false, false);
 
@@ -7347,7 +7354,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         if separate_sampled || buf_collide {
             f_variant = f_shader.variant(separate_sampled, buf_collide);
         }
-        let f_words = f_variant.words.clone();
+        let mut f_words = f_variant.words.clone();
+        let mut storage_textures = storage::StorageTextures::stage(
+            state, host, req, &v_shader.reflection, &f_shader.reflection,
+        )?;
+        if !storage_textures.is_empty() {
+            crate::runtime::spirv_bind::offset_fragment_storage_bindings(
+                std::sync::Arc::make_mut(&mut f_words).as_mut_slice(),
+            );
+        }
 
         // Non-stage-in vertex buffers + fragment buffers as storage buffers.
         //
@@ -7515,18 +7530,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             frag_unbound_textures_to_neutralize(&uses)
         };
 
-        // Framebuffer fetch (`air.render_target` INPUT param `dest_N` →
-        // reflection `ColorInput` at binding 96+N): the engine supports the
-        // attachment-0 fetch as a Vulkan subpass input. `dest_N>0` (fetching a
-        // secondary MRT attachment) has no engine path yet — fail visibly, never
-        // execute a shader whose destination read would be unbound.
+        // Framebuffer fetch uses the original attachment slot as both
+        // InputAttachmentIndex and the offset within the ColorInput band.
         let frag_color_input = {
             use metal2vulkan::reflect::ResourceKind;
-            let mut fetch0 = false;
+            let mut fetch = 0u8;
             for rb in &f_shader.reflection.bindings {
                 if rb.kind == ResourceKind::ColorInput {
-                    if rb.metal_index == 0 {
-                        fetch0 = true;
+                    if rb.metal_index < 8 && req.colors.iter().any(|color| color.slot == rb.metal_index) {
+                        fetch |= 1 << rb.metal_index;
                     } else {
                         return Err(DrawError::DrawPreparation(
                             DrawPreparationDecline::ColorInputMrtUnsupported {
@@ -7536,7 +7548,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     }
                 }
             }
-            fetch0
+            fetch
         };
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Sampled);
         // The four `sampled_phase` spans below divide this phase's `sampled_us`,
@@ -7551,6 +7563,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Fragment sampled resources use +FRAG_SAMPLED when either both stages
         // sample or fragment buffers moved into the sampled/static-sampler band.
         let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> = Vec::new();
+        let mut planar_q11_bindings = Vec::new();
         let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
         // Where each provisioned sampler's state came from, keyed by binding, for
@@ -7584,7 +7597,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let img_bind = reflected_descriptor
                     .map(|descriptor| descriptor.binding)
                     .unwrap_or(TEXTURE_BINDING_BASE + index)
-                    + base_off;
+                    + if frag_stage && reflected_descriptor.is_some_and(|d| {
+                        d.access == crate::runtime::spirv_bind::ReflectedTextureAccess::Storage
+                    }) {
+                        FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+                    } else { base_off };
+                if storage_textures.bind(texture_ref, index, reflection, img_bind, frag_stage)? {
+                    return Ok(());
+                }
                 if let Some(descriptor) = reflected_descriptor {
                     use crate::runtime::spirv_bind::ReflectedTextureAccess;
                     let unsupported = match descriptor.access {
@@ -7739,6 +7759,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         if frag_stage {
                             let route = match &src {
                                 SampledSourceRequest::Bytes(..) => "bytes",
+                                SampledSourceRequest::Planar(..) => "planar",
                                 SampledSourceRequest::Target(..) => "target",
                                 SampledSourceRequest::GuestRuns(..) => "guest_runs",
                             };
@@ -7812,7 +7833,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let mut sampled_components = pixel_format::swizzle_identity();
                 let mut source_planes = 1;
                 let source_is_target = matches!(&loaded, SampledSourceRequest::Target(_, _));
+                let source_is_planar = matches!(&loaded, SampledSourceRequest::Planar(_));
                 let source = match loaded {
+                    SampledSourceRequest::Planar(image) => {
+                        if image.format == crate::protocol::planar::SampleFormat::Ycbcr10_420TwoPlane {
+                            planar_q11_bindings.push(img_bind);
+                        }
+                        sampled_vk_format = translate::pixel::vk_sampled_bytes(image.byte_format());
+                        crate::backend::vulkan::engine::SampledSource::Bytes(
+                            std::sync::Arc::new(image.bytes),
+                        )
+                    }
                     SampledSourceRequest::Bytes(rgba, identity, byte_format, origin) => {
                         bytes_identity = identity;
                         sampled_vk_format = translate::pixel::vk_sampled_bytes(byte_format);
@@ -7906,6 +7937,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let volume = image_shape.is_volume();
                 let one_dim = image_shape.is_one_dim();
                 let cube = image_shape.is_cube();
+                if source_is_planar && image_shape != reims_vgpu_core::texture_shape::TextureKind::D2 {
+                    return Err(DrawError::Planar(crate::backend::vulkan::planar::Refusal::Shader(
+                        "vulkan_planar_shader_image_shape",
+                    )));
+                }
                 if multisampled && !source_is_target {
                     return Err(DrawError::DrawPreparation(
                         DrawPreparationDecline::TextureDimensionUnsupported {
@@ -8148,6 +8184,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     0
                 };
                 let smp_bind = SAMPLER_BINDING_BASE + index + base_off;
+                let variant = if frag_stage { &f_variant } else { &v_variant };
+                if !variant.samplers.iter().any(|sampler|
+                    sampler.binding == smp_bind && sampler.guest_supplied())
+                { return Ok(()); }
                 if sampler_binds.insert(smp_bind) {
                     let mut sampler = if sampler_ref != 0 {
                         sampler_origin.insert(smp_bind, b'g');
@@ -8228,7 +8268,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 for reflected in variant.samplers.iter() {
                     if sampler_binds.insert(reflected.binding) {
                         let binding = reflected.binding;
-                        if let Some(state) = reflected.static_state {
+                        if let Some(state) = reflected.static_state() {
                             sampler_origin.insert(binding, b'c');
                             samplers.push(
                                 reflected_static_sampler_resource(stage, binding, state)
@@ -8486,6 +8526,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // `passbegin_clear` ran exactly `color0_declared_dontcare` above
             // the clears the guest actually asked for.
             match declared {
+                LoadAction::Load | LoadAction::DontCare if c0.storage == ColorStorage::Memoryless => {
+                    chain_load_from_target = req.continues_render_pass;
+                }
                 LoadAction::Load | LoadAction::DontCare if chain_load_from_target => {
                     // Resident target carries the chain; no CPU seed bytes.
                 }
@@ -8819,6 +8862,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.vertex_attributes = attrs;
         resources.storage_buffers = storage;
         resources.sampled_images = images;
+        resources.storage_textures = storage_textures.resources(
+            &v_shader.reflection, &f_shader.reflection, &mut v_words, &mut f_words,
+        )?;
         resources.color_input = frag_color_input;
         resources.continues_render_pass = req.continues_render_pass;
         resources.render_pass_continues = req.render_pass_continues;
@@ -8856,6 +8902,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // final record back and perform the normal synchronous guest Store.
         // Cross-pass deferred ownership remains gated below.
         let mut resident_render_chain = false;
+        if let Some(identity) = req.colors.first().and_then(|color| pass.identity(color)) {
+            resources.target_identity = Some(identity.clone());
+            resources.skip_readback = true;
+            resident_render_chain = true;
+        }
         // Host-authoritative GVA Store rail: the final/single record also stays
         // on the registry resident (skip_readback). The caller records the
         // resource declaration and transfers only when synchronization or an
@@ -8910,6 +8961,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             None;
         if resources.target_identity.is_none() {
             resources.target_identity = mapper_ref_texture_resident_target.clone();
+        }
+        if req.colors.len() > 1 && resources.target_identity.is_none() {
+            resources.target_identity = render_chain_identity(state, req);
+            if resources.target_identity.is_none() {
+                return Err(DrawError::DrawPreparation(
+                    DrawPreparationDecline::ChainResidentIdentityMissing {
+                        target_gva: 0, width: w, height: h,
+                    },
+                ));
+            }
         }
         // Whether the slot this record renders into is the one this rail would
         // pin, asked by comparing the two identities rather than by testing that
@@ -9334,7 +9395,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .iter()
             .map(|s| s.binding)
             .chain(resources.sampled_images.iter().map(|i| i.binding))
+            .chain(resources.storage_textures.iter()
+                .flat_map(|texture| texture.bindings.iter().map(|binding| binding.binding)))
             .chain(resources.samplers.iter().map(|s| s.binding))
+            .chain((0..8).filter(|slot| resources.color_input & (1 << slot) != 0)
+                .map(|slot| crate::backend::vulkan::engine::COLOR_INPUT_BINDING + slot))
             .collect();
         let frag_gap =
             crate::runtime::gpu_hang_trail::gap(&frag_declared_bindings, &frag_layout_bindings);
@@ -9461,14 +9526,34 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.vert_spirv = v_words;
         resources.frag_spirv = f_words;
+        if !planar_q11_bindings.is_empty()
+            || resources.samplers.iter().any(|s| s.unnormalized_coordinates)
+        {
+            resources.vert_spirv = crate::backend::vulkan::sampled_shader::specialize(
+                &resources.vert_spirv, &planar_q11_bindings, &resources.samplers,
+            ).map_err(DrawError::SampledShader)?.into();
+            resources.frag_spirv = crate::backend::vulkan::sampled_shader::specialize(
+                &resources.frag_spirv, &planar_q11_bindings, &resources.samplers,
+            ).map_err(DrawError::SampledShader)?.into();
+        }
         resources.vert_used_descriptor_bindings = v_variant.used_descriptor_bindings.clone();
         resources.frag_used_descriptor_bindings = f_variant.used_descriptor_bindings.clone();
+        if !resources.storage_textures.is_empty() {
+            resources.vert_used_descriptor_bindings =
+                storage::used_bindings(&resources.vert_spirv);
+            resources.frag_used_descriptor_bindings =
+                storage::used_bindings(&resources.frag_spirv);
+        }
         resources.width = w;
         resources.height = h;
         resources.vertex_count = vertex_count;
         if let Some(c0) = req.colors.first() {
-            let (attachment, _) =
-                translate::pixel::color_attachment(c0.format).map_err(|reason| {
+            let translated = if c0.storage == ColorStorage::Memoryless {
+                translate::pixel::memoryless_color_attachment(c0.format).map(|format| (format, None))
+            } else {
+                translate::pixel::color_attachment(c0.format)
+            };
+            let (attachment, _) = translated.map_err(|reason| {
                     DrawError::Unsupported(
                         crate::backend::vulkan::engine::reason::DrawReason::ColorAttachmentFormat(
                             reason,
@@ -9514,7 +9599,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // on a resident primary; an `Ok(empty)` is the guest's own single-RT
         // draw and is byte-identical to the classic path.
         if let Some(primary_id) = resources.target_identity.clone() {
-            let secs = build_secondary_targets(
+            let secs = build_secondary_targets_in_pass(
                 state,
                 host,
                 req.task_id,
@@ -9523,6 +9608,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 &primary_id,
                 w,
                 h,
+                pass,
             );
             // Second half of the census: `built` vs `refused` separates "the
             // guest issued an MRT draw and we render every attachment" from
@@ -9557,6 +9643,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
         let out = crate::backend::vulkan::engine::execute_draw_request(state, &resources)?;
+        // Shader side effects are independent of the attachment's Store route.
+        // The engine waited completion and retained every image/readback slot.
+        storage_textures.publish(state, host, req.task_id, out.storage_textures)?;
         // Carried back on the request so `runtime::exec` can sum the chain's
         // draws into the guest's buffer. The engine reports per draw because a
         // Metal pass whose counter spans several draws is several Vulkan
@@ -12659,7 +12748,8 @@ mod vulkan_split_tests {
             ..DrawEncodeRequest::default()
         };
 
-        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true) {
+        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true,
+            &crate::backend::vulkan::render_pass::VulkanRenderPass::default()) {
             Err(err) => err,
             Ok(_) => panic!("an empty state cannot resolve pipeline 41"),
         };
@@ -12700,7 +12790,8 @@ mod vulkan_split_tests {
             ..DrawEncodeRequest::default()
         };
 
-        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true) {
+        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true,
+            &crate::backend::vulkan::render_pass::VulkanRenderPass::default()) {
             Err(err) => err,
             Ok(_) => panic!("a texture bind past the table cannot encode"),
         };
@@ -12721,7 +12812,8 @@ mod vulkan_split_tests {
         // which is what says the refusal is about live guest work and not about
         // the index alone.
         std::sync::Arc::make_mut(&mut req.fragment_textures)[0].texture_ref = 0;
-        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true) {
+        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true,
+            &crate::backend::vulkan::render_pass::VulkanRenderPass::default()) {
             Err(err) => err,
             Ok(_) => panic!("an empty state cannot resolve pipeline 41"),
         };

@@ -23,11 +23,13 @@ pub(crate) mod draw_validation;
 mod driver_breadcrumb;
 mod exec;
 mod exec_compute;
+pub mod graphics_storage;
 mod facade_decline;
 mod guest_scatter;
 mod host_ram;
 pub mod init_decline;
 mod linear_target_import;
+pub(crate) mod pass_local;
 mod pools;
 mod queue_owner;
 /// This rail's half of a serialized resource's rail state: the resident-target
@@ -5680,6 +5682,11 @@ pub fn counter_snapshot() -> CounterSnapshot {
     snap.registry_recoverable_bytes = levels.recoverable.bytes;
     snap.registry_pinned_count = levels.pinned.count as u64;
     snap.registry_pinned_bytes = levels.pinned.bytes;
+    snap.registry_pass_local_count = levels.pass_local.count as u64;
+    snap.registry_pass_local_bytes = levels.pass_local.bytes;
+    let retiring = eng.pools.pass_local_retiring_levels();
+    snap.pass_local_retiring_count = retiring.count as u64;
+    snap.pass_local_retiring_bytes = retiring.bytes;
     let (sole_peak, sole_peak_bytes) = eng.pools.registry_sole_copy_stats();
     snap.registry_sole_copy_peak = sole_peak;
     snap.registry_sole_copy_peak_bytes = sole_peak_bytes;

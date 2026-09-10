@@ -131,10 +131,12 @@ mod planar_staging {
                 Err(ComputeStatus::Unsupported("planar_sampling_metal_only"))
             ));
             #[cfg(feature = "backend-vulkan")]
-            assert!(matches!(
-                stage_texture_raw::<super::super::vulkan::VulkanStage, _>(&mut state, &mut host, 1, 11, 33, false),
-                Err(ComputeStatus::Unsupported("planar_sampling_metal_only"))
-            ));
+            {
+                let staged = stage_texture_raw::<super::super::vulkan::VulkanStage, _>(
+                    &mut state, &mut host, 1, 11, 33, false,
+                ).expect("Vulkan stages composite samples without Metal objects");
+                assert!(staged.rail.planar.is_some());
+            }
             assert!(matches!(
                 stage_texture_raw::<MetalStage, _>(&mut state, &mut host, 1, 11, 33, true),
                 Err(ComputeStatus::Unsupported("planar_storage_binding"))
@@ -254,24 +256,20 @@ fn compute_rounding_decode_failure_keeps_precise_slug_on_every_load() {
 
 #[test]
 #[cfg(feature = "backend-vulkan")]
-fn compute_rounding_vulkan_refuses_nondefault_before_shader_loading() {
-    assert_eq!(validate_texture_write_rounding(TextureWriteRoundingMode::Default), Ok(()));
+fn compute_rounding_vulkan_defers_conversion_until_storage_formats_are_known() {
     for mode in [TextureWriteRoundingMode::TowardZero, TextureWriteRoundingMode::ToNearestEven] {
         let (mut state, mut host) = compute_rounding_pipeline(mode.word());
         let mut acc = ComputeAccum::default();
         acc.set_pipeline(6);
         let cap = crate::observe::FailCapture::start();
-        // No shader object was installed. A missing-MTLB result would mean the
-        // descriptor requirement was silently passed over.
+        // No shader object was installed. Descriptor modes must reach translation; their actual
+        // conversion is specialized only after resolving the dispatch's storage-image views.
         let status = execute_dispatch_linux(
             &mut state, &mut host, 1, &acc, &threadgroups([1, 1, 1], [1, 1, 1]),
         );
-        assert_eq!(status, ComputeStatus::Unsupported("compute_vk_texture_write_rounding_unsupported"));
+        assert_eq!(status, ComputeStatus::MissingMtlb("compute_vk_mtlb_load"));
         let lines = cap.lines();
-        assert!(lines.iter().any(|line| {
-            line.contains("reason=compute_vk_texture_write_rounding_unsupported")
-                && line.contains(&format!("mode={} task=1 pipe=6", mode.word()))
-        }), "{lines:?}");
+        assert!(!lines.iter().any(|line| line.contains("compute_vk_texture_write_rounding_unsupported")), "{lines:?}");
     }
 }
 

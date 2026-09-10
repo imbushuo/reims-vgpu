@@ -379,6 +379,8 @@ pub enum SampledClass {
     Bgra8Unorm,
     Rgba16Float,
     Rg16Float,
+    /// Scalar binary16 CPU-origin uploads, native or refused rather than narrowed.
+    R16Float,
     /// The packed 32-bit word `MTLPixelFormatBGR10A2Unorm` stores a texel in.
     ///
     /// Declared for the cross-check and not for a CPU upload rail. This class is
@@ -1787,8 +1789,8 @@ pub fn is_srgb(format: u16) -> bool {
 /// format belongs here when its guest bytes are already in a final upload order,
 /// and nowhere else does membership mean anything.
 ///
-/// `Rgba16Float` is the one member no upload fast path reads. It is here as the
-/// independent statement of a byte layout that
+/// The float classes feed the caller-gated native upload path and also state
+/// the byte layout that
 /// `a_byte_copy_destination_is_the_texel_every_other_table_agrees_it_is` checks
 /// [`store_texel_order`] against — a consistency cross-check between two tables,
 /// again not a capability claim.
@@ -1801,6 +1803,7 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => SampledClass::Bgra8Unorm,
         MTL_FORMAT_RGBA16_FLOAT => SampledClass::Rgba16Float,
         MTL_FORMAT_RG16_FLOAT => SampledClass::Rg16Float,
+        MTL_FORMAT_R16_FLOAT => SampledClass::R16Float,
         MTL_FORMAT_BGR10A2_UNORM => SampledClass::Bgr10a2Unorm,
         MTL_FORMAT_RG16_UINT => SampledClass::Rg16Uint,
         MTL_FORMAT_RGBA32_FLOAT => SampledClass::Rgba32Float,
@@ -1865,12 +1868,11 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
 /// The gap that had to close first was the third rail, not the sampler: the CPU
 /// Store converter reaches [`rgba8_to_texel`], which carried no `R16_FLOAT` arm,
 /// so the format would have rendered fine and then lost every frame on any host
-/// without a guest-RAM import. [`sampled_class`] answering `None` for it is
-/// **not** a blocker and was once recorded as one — read that function's doc
-/// before believing otherwise; it selects a CPU-upload fast path and cannot
-/// refuse a bind. What admits a sampled `R16_FLOAT` is
-/// `translate::pixel::sampled_pixels`, which has carried it as a native
-/// [`TexelLayout::R16Float`] rail throughout.
+/// without a guest-RAM import. Native GPU sampling is admitted by
+/// `translate::pixel::sampled_pixels`; CPU-origin samples additionally need
+/// [`sampled_class`]'s scalar-half native upload arm. There is no RGBA8 CPU
+/// conversion for this layout, so omitting that arm loses CPU-written masks
+/// even on a host that supports the native [`TexelLayout::R16Float`] image.
 ///
 /// `R8_UNORM` is here for the same kind of reading one rail over: macOS 26 also
 /// renders into a single-channel *eight-bit* linear GVA target — a coverage,
@@ -3958,17 +3960,13 @@ mod tests {
                 SampledClass::Rg8Unorm => TexelLayout::Rg8,
                 SampledClass::Rgba16Float => TexelLayout::Rgba16Float,
                 SampledClass::Rg16Float => TexelLayout::Rg16Float,
+                SampledClass::R16Float => TexelLayout::R16Float,
                 SampledClass::Bgr10a2Unorm => TexelLayout::Bgr10a2Unorm,
                 SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
                 SampledClass::Rgba32Float => TexelLayout::Rgba32Float,
             });
-            // Renderable, single-channel, and named by neither table above —
-            // admitted for macOS 26's blur intermediate.
-            let single_channel_float =
-                (format == MTL_FORMAT_R16_FLOAT).then_some(TexelLayout::R16Float);
             let layout = store_texel_order(format)
                 .or(from_class)
-                .or(single_channel_float)
                 .unwrap_or_else(|| panic!("{format:#x} is renderable with no layout"));
             if !from_formats.contains(&layout) {
                 from_formats.push(layout);

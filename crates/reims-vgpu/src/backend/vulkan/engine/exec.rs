@@ -1420,6 +1420,13 @@ fn validate_buffer_content(
 }
 
 pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
+    let attachments = req.secondary_targets.len() + 1;
+    if attachments < 8 && u32::from(req.color_input) >> attachments != 0 {
+        return Err(DrawError::Unsupported(super::reason::DrawReason::ColorInputAttachmentMissing {
+            mask: req.color_input, attachments,
+        }));
+    }
+    super::graphics_storage::validate(req)?;
     if req.width == 0 || req.height == 0 {
         return Err(DrawError::DrawValidation(
             DrawValidationDecline::ZeroTargetGeometry {
@@ -1499,11 +1506,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         }
     }
     if let Some(seed) = &req.target_guest_seed {
-        let target_format = req
-            .target_identity
-            .as_ref()
-            .map(|identity| identity.resident_format())
-            .unwrap_or(super::super::translate::pixel::RESIDENT_RGBA_FORMAT);
+        let target_format = req.primary_format();
         if seed.format != target_format {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::TargetGuestSeedFormat {
@@ -2439,6 +2442,17 @@ fn draw_has_no_invocations(req: &DrawRequest) -> bool {
     element_count == 0 || req.instance_count == Some(0)
 }
 
+fn seed_requires_rb_swap(order: SeedOrder, attachment_format: vk::Format) -> bool {
+    let attachment_bgra = matches!(attachment_format,
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB);
+    matches!(order, SeedOrder::Bgra8) != attachment_bgra
+}
+
+fn seed_formats_match(source: vk::Format, destination: vk::Format) -> bool {
+    use crate::backend::vulkan::translate::pixel::ResidentFormat;
+    ResidentFormat::of(source).allocation() == ResidentFormat::of(destination).allocation()
+}
+
 /// A depth image a single draw allocated for itself and must destroy after
 /// submit, because the pass named no guest texture to hold it under.
 ///
@@ -2699,6 +2713,19 @@ pub(crate) unsafe fn execute_draw_inner(
         owner.force_device_lost = false;
     }
     let ctx = owner.ensure(counters)?;
+    super::pass_local::validate_formats(ctx, req)?;
+    let color_count = req.secondary_targets.len() + 1;
+    if color_count > ctx.features.max_color_attachments as usize {
+        return Err(DrawError::Unsupported(super::reason::DrawReason::ColorAttachmentLimit {
+            requested: color_count, limit: ctx.features.max_color_attachments,
+        }));
+    }
+    let input_count = u8::BITS - req.color_input.leading_zeros();
+    if input_count > ctx.features.max_input_attachments {
+        return Err(DrawError::Unsupported(super::reason::DrawReason::ColorInputAttachmentLimit {
+            requested: input_count, limit: ctx.features.max_input_attachments,
+        }));
+    }
     pools.ensure_init(ctx, counters)?;
 
     // Draw batching (deferred submit): a draw that hands the CPU nothing
@@ -2730,12 +2757,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Slot 0's view supplies the attachment format. The identity names the
     // allocation behind it; treating those as the same question loses Metal's
     // compatible-format texture views (most visibly UNORM versus sRGB).
-    let color0_format = req.color_attachment.map(|a| a.format()).unwrap_or_else(|| {
-        req.target_identity
-            .as_ref()
-            .map(|id| id.resident_format())
-            .unwrap_or(crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT)
-    });
+    let color0_format = req.primary_format();
     // A guest-sourced sampled bind used to force the immediate-submit path.
     // Its read of guest RAM happens when the CB *executes*, and this device
     // acked the packet as soon as it was consumed, so deferred submit stretched
@@ -2878,7 +2900,7 @@ pub(crate) unsafe fn execute_draw_inner(
         quirk: ctx.caps.quirks.no_deferred_draw_batching,
         is_mrt,
         depth_barred: depth_bars_batching(req.depth.is_some()),
-        reads_back: !req.skip_readback,
+        reads_back: !req.skip_readback || super::graphics_storage::requires_completion(req),
         has_query: req.occlusion_query.is_some(),
         no_identity: req.target_identity.is_none(),
         cpu_seed: req.target_rgba8.is_some(),
@@ -2947,6 +2969,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // draw, and the layout cache is looked up by a slice of these, so the buffer
     // that survives between draws is the one the lookup can borrow from.
     let layout_bindings = pools.layout_bindings_scratch();
+    super::graphics_storage::layout_bindings(req, layout_bindings);
     for b in &req.storage_buffers {
         layout_bindings.push(BindingSig {
             binding: b.binding,
@@ -2971,9 +2994,10 @@ pub(crate) unsafe fn execute_draw_inner(
             count: 1,
         });
     }
-    if req.color_input {
+    for slot in 0..8u32 {
+        if req.color_input & (1 << slot) == 0 { continue; }
         layout_bindings.push(BindingSig {
-            binding: super::types::COLOR_INPUT_BINDING,
+            binding: super::types::COLOR_INPUT_BINDING + slot,
             ty: vk::DescriptorType::INPUT_ATTACHMENT.as_raw() as u32,
             stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
             count: 1,
@@ -3150,12 +3174,12 @@ pub(crate) unsafe fn execute_draw_inner(
                 },
             ));
         }
-        if !req.secondary_targets.is_empty() || req.color_input {
+        if !req.secondary_targets.is_empty() || req.color_input != 0 {
             return Err(DrawError::Unsupported(
                 super::reason::DrawReason::MultisampleResolveShapeUnsupported {
                     color_targets: 1u32.saturating_add(req.secondary_targets.len() as u32),
                     depth: req.depth.is_some(),
-                    color_input: req.color_input,
+                    color_input: req.color_input != 0,
                 },
             ));
         }
@@ -3275,6 +3299,27 @@ pub(crate) unsafe fn execute_draw_inner(
             return Err(DrawError::Unsupported(reason));
         }
     };
+    let fetch_primitives = reims_vgpu_vulkan::framebuffer_fetch::plan(
+        reims_vgpu_vulkan::framebuffer_fetch::Cell {
+            ordered_color_access: ctx.features.rasterization_order_color_access,
+            dynamic_front_face: ctx.features.extended_dynamic_state,
+        },
+        reims_vgpu_vulkan::framebuffer_fetch::Draw {
+            reads_attachment: req.color_input != 0,
+            topology: req.primitive_topology.0,
+            count: req.indexed.as_ref().map_or(req.vertex_count, |i| i.index_count),
+            first: if req.indexed.is_some() { 0 } else { req.first_vertex },
+            instances: req.instance_count.unwrap_or(1),
+            first_instance: req.base_instance,
+            indexed: req.indexed.is_some(),
+            samples: raster_sample_count,
+            polygon_mode: raster_plan.polygon_mode(),
+        },
+        &req.vert_spirv,
+        &req.frag_spirv,
+    ).map_err(|reason| DrawError::Unsupported(
+        super::reason::DrawReason::ColorInputOrderingUnsupported(reason),
+    ))?;
     // The primitive type, under the same split. `extendedDynamicState` is the
     // same feature bit the cull mode and winding above ride on — it reaches
     // `vkCmdSetPrimitiveTopology` too — and the unrestricted property says
@@ -3587,10 +3632,11 @@ pub(crate) unsafe fn execute_draw_inner(
         // Vulkan buffer→image copies do not perform format conversion, so the
         // staged bytes must already be in the attachment's physical order —
         // otherwise partial draws preserve an exact R/B-exchanged seed outside
-        // their damaged geometry. The attachment is BGRA when `output_bgra`; the
-        // seed states its own order. Exchange exactly when they disagree, inside
+        // their damaged geometry. The attachment's declared format supplies
+        // its order even without a residency identity; the seed states its own
+        // order. Exchange exactly when they disagree, inside
         // the copy that has to happen anyway.
-        if matches!(req.target_seed_order, SeedOrder::Bgra8) != output_bgra {
+        if seed_requires_rb_swap(req.target_seed_order, color0_format) {
             let _s = stage_phase::Span::moving(stage_phase::Part::Swap, rgba8.len() as u64);
             pools.write_staging_swap_rb(ctx, &slot, rgba8)?;
         } else {
@@ -3620,7 +3666,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // slot's cached framebuffer was built against. One predicate, because the
     // two answers it feeds have to agree: which pass the slot is ensured under,
     // and whether the draw builds (and later disposes) a framebuffer of its own.
-    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
+    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input != 0;
     let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
         let mut color_only = PassKey::single(pass_key.color0_load, pass_key.color0_format);
@@ -3734,7 +3780,9 @@ pub(crate) unsafe fn execute_draw_inner(
             let target_key = TargetKey {
                 width: req.width,
                 height: req.height,
-                with_transfer_dst: seed_bytes.is_some(),
+                format: color0_format,
+                with_transfer_dst: seed_bytes.is_some()
+                    || req.target_guest_seed.is_some() || req.seed_from_target.is_some(),
             };
             // Acquire the pooled slot under the color-only `primary_pass` (same as
             // its cached framebuffer), and build the draw's own framebuffer under
@@ -3891,12 +3939,12 @@ pub(crate) unsafe fn execute_draw_inner(
                 },
             ));
         }
-        if slot.scanout_order() != output_bgra {
+        if !seed_formats_match(slot.format.declared(), color0_format) {
             return Err(DrawError::DrawExecution(
                 DrawExecutionDecline::SeedFormatMismatch {
                     identity: seed_identity.clone(),
-                    resident_bgra: slot.scanout_order(),
-                    draw_bgra: output_bgra,
+                    resident_format: slot.format.declared(),
+                    draw_format: color0_format,
                 },
             ));
         }
@@ -4267,6 +4315,7 @@ pub(crate) unsafe fn execute_draw_inner(
     };
 
     phase.enter(super::draw_phase::Phase::Descriptors);
+    let graphics_storage = super::graphics_storage::prepare(ctx, pools, counters, req)?;
     // Push descriptors are the Vulkan spelling closest to Metal encoder
     // binding state: the writes become commands in this command buffer, with no
     // separately allocated object. The layout cache made the same decision.
@@ -4301,14 +4350,31 @@ pub(crate) unsafe fn execute_draw_inner(
     //
     // Built into the command buffer's own scratch, which keeps its capacity
     // across draws, so this list itself costs no allocation.
+    let mut secondary_inputs = Vec::new();
+    for (index, target) in req.secondary_targets.iter().enumerate() {
+        let slot = index + 1;
+        if req.color_input & (1 << slot) == 0 { continue; }
+        let view = pools.registry_view(ctx, &target.identity, target.attachment.format(), counters)?
+            .expect("the framebuffer just acquired this attachment");
+        secondary_inputs.push(super::pools::PushDescriptorBinding::Image {
+            binding: super::types::COLOR_INPUT_BINDING + slot as u32,
+            array_element: 0,
+            ty: vk::DescriptorType::INPUT_ATTACHMENT,
+            sampler: vk::Sampler::null(),
+            view,
+            layout: pass_key.color_layout(slot),
+        });
+    }
     let (descriptor_scratch, storage_binds) = pools.descriptor_scratch_and_storage_binds();
     fill_descriptor_bindings(
         descriptor_scratch,
         storage_binds,
         &sampled,
         &sampler_handles,
-        req.color_input.then_some((target_view, color_input_layout)),
+        (req.color_input & 1 != 0).then_some((target_view, color_input_layout)),
     );
+    descriptor_scratch.extend(secondary_inputs);
+    super::graphics_storage::descriptors(req, &graphics_storage, descriptor_scratch);
     if let Some(dset) = dset {
         // An allocated set is fresh out of the pool and carries nothing, so
         // there is no unchanged case to elide: it is written every draw.
@@ -4338,6 +4404,11 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     phase.enter(super::draw_phase::Phase::RecordBarrier);
+    // Storage draws cannot join an open batch: their side effects publish at
+    // this draw's completion even when attachment Store remains deferred.
+    for texture in &graphics_storage {
+        texture.seed(ctx, cb);
+    }
     // What this draw records that a render pass instance cannot contain, on the
     // two ladders [`PassObstacles`] keeps.
     //
@@ -4365,6 +4436,8 @@ pub(crate) unsafe fn execute_draw_inner(
     let target_feedback = pass_key.color_feedback(0);
     let target_pass_layout = pass_key.color_layout(0);
     let target_dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+        | if req.color_input & 1 != 0 { vk::PipelineStageFlags::FRAGMENT_SHADER }
+            else { vk::PipelineStageFlags::empty() }
         | if target_feedback {
             vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
         } else {
@@ -4372,6 +4445,8 @@ pub(crate) unsafe fn execute_draw_inner(
         };
     let target_dst_access = vk::AccessFlags::COLOR_ATTACHMENT_READ
         | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+        | if req.color_input & 1 != 0 { vk::AccessFlags::INPUT_ATTACHMENT_READ }
+            else { vk::AccessFlags::empty() }
         | if target_feedback {
             vk::AccessFlags::SHADER_READ
         } else {
@@ -5012,6 +5087,9 @@ pub(crate) unsafe fn execute_draw_inner(
             continue;
         }
         let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            | if req.color_input & (1 << attachment_index) != 0 {
+                vk::PipelineStageFlags::FRAGMENT_SHADER
+            } else { vk::PipelineStageFlags::empty() }
             | if feedback {
                 vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
             } else {
@@ -5019,6 +5097,9 @@ pub(crate) unsafe fn execute_draw_inner(
             };
         let dst_access = vk::AccessFlags::COLOR_ATTACHMENT_READ
             | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+            | if req.color_input & (1 << attachment_index) != 0 {
+                vk::AccessFlags::INPUT_ATTACHMENT_READ
+            } else { vk::AccessFlags::empty() }
             | if feedback {
                 vk::AccessFlags::SHADER_READ
             } else {
@@ -5369,27 +5450,63 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     phase.enter(super::draw_phase::Phase::RecordDraw);
     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters) };
-    match (&req.indexed, &index_slot) {
-        (Some(indexed), Some(ibuf)) => {
-            ctx.device
-                .cmd_bind_index_buffer(cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk());
-            ctx.device.cmd_draw_indexed(
-                cb,
-                indexed.index_count,
-                req.instance_count.unwrap_or(1),
-                0,
-                indexed.vertex_offset,
-                req.base_instance,
+    if let Some(primitives) = fetch_primitives {
+        if let (Some(indexed), Some(ibuf)) = (&req.indexed, &index_slot) {
+            ctx.device.cmd_bind_index_buffer(
+                cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk(),
             );
         }
-        _ => {
-            ctx.device.cmd_draw(
-                cb,
-                req.vertex_count,
-                req.instance_count.unwrap_or(1),
-                req.first_vertex,
-                req.base_instance,
+        let dependency = reims_vgpu_vulkan::framebuffer_fetch::dependency();
+        let memory = [vk::MemoryBarrier::default()
+            .src_access_mask(dependency.src_access_mask)
+            .dst_access_mask(dependency.dst_access_mask)];
+        for primitive in primitives.iter() {
+            ctx.device.cmd_pipeline_barrier(
+                cb, dependency.src_stage_mask, dependency.dst_stage_mask,
+                dependency.dependency_flags, &memory, &[], &[],
             );
+            let mut dynamic = raster_plan.dynamic;
+            if primitive.reverse_winding {
+                dynamic.front_face = dynamic.front_face.map(|front| {
+                    if front == vk::FrontFace::CLOCKWISE {
+                        vk::FrontFace::COUNTER_CLOCKWISE
+                    } else {
+                        vk::FrontFace::CLOCKWISE
+                    }
+                });
+            }
+            pools.set_dynamic_raster(ctx, cb, counters, dynamic);
+            if let Some(indexed) = &req.indexed {
+                ctx.device.cmd_draw_indexed(cb, primitive.count, 1, primitive.first,
+                    indexed.vertex_offset, primitive.first_instance);
+            } else {
+                ctx.device.cmd_draw(cb, primitive.count, 1, primitive.first,
+                    primitive.first_instance);
+            }
+        }
+    } else {
+        match (&req.indexed, &index_slot) {
+            (Some(indexed), Some(ibuf)) => {
+                ctx.device
+                    .cmd_bind_index_buffer(cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk());
+                ctx.device.cmd_draw_indexed(
+                    cb,
+                    indexed.index_count,
+                    req.instance_count.unwrap_or(1),
+                    0,
+                    indexed.vertex_offset,
+                    req.base_instance,
+                );
+            }
+            _ => {
+                ctx.device.cmd_draw(
+                    cb,
+                    req.vertex_count,
+                    req.instance_count.unwrap_or(1),
+                    req.first_vertex,
+                    req.base_instance,
+                );
+            }
         }
     }
     // Back to the remainder: the query end, the pass-close decision and
@@ -5406,6 +5523,9 @@ pub(crate) unsafe fn execute_draw_inner(
         crate::runtime::drain::note_store_route("pass_left_open");
     } else {
         unsafe { pools.close_open_pass(&ctx.device, cb) };
+    }
+    for texture in &graphics_storage {
+        texture.copy_output(ctx, cb);
     }
     if pass_churn_probe_enabled() && load_uses_gpu_content && !target_feedback {
         // PROBE — `REIMS_VGPU_PASS_CHURN=on`. One extra render pass instance on
@@ -5822,6 +5942,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(DrawOutput {
+            storage_textures: Vec::new(),
             pixels: Vec::new(),
             target_guest_backed,
             guest_store_recorded,
@@ -5883,6 +6004,13 @@ pub(crate) unsafe fn execute_draw_inner(
     // `gva_store_defer_eligible` and keeps its readback. Delete this and that
     // Store loses its frame silently, which is the one outcome the ground rules
     // forbid outright. What the equality licenses is not re-measuring it.
+    let has_cpu_results = readback.is_some() || occlusion.is_some() || !graphics_storage.is_empty();
+    if has_cpu_results {
+        phase.enter(super::draw_phase::Phase::Wait);
+        pools.wait_entry_fence(ctx, counters, fence)?;
+    }
+    let storage_textures = graphics_storage.iter()
+        .map(|texture| texture.read(ctx)).collect::<Result<Vec<_>, _>>()?;
     let Some(ref rb) = readback else {
         // A queried draw has no pixels to read back and still cannot take this
         // return: the sample count *is* its result, and it is not readable
@@ -5891,9 +6019,8 @@ pub(crate) unsafe fn execute_draw_inner(
         // for queried draws only, which on every workload measured so far is
         // none of them.
         if occlusion.is_some() {
-            phase.enter(super::draw_phase::Phase::Wait);
-            pools.wait_entry_fence(ctx, counters, fence)?;
             return Ok(DrawOutput {
+                storage_textures,
                 pixels: Vec::new(),
                 target_guest_backed,
                 guest_store_recorded,
@@ -5902,10 +6029,13 @@ pub(crate) unsafe fn execute_draw_inner(
                 occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
             });
         }
-        counters
-            .render_post_wait_skips
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !has_cpu_results {
+            counters
+                .render_post_wait_skips
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return Ok(DrawOutput {
+            storage_textures,
             pixels: Vec::new(),
             target_guest_backed,
             guest_store_recorded,
@@ -5923,9 +6053,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // `finish_us` tail). The cleanup is already parked with `finish_entry_async`
     // above, so the slot stays pending and the ring retires it later with no
     // extra wait (its fence is already signaled).
-    phase.enter(super::draw_phase::Phase::Wait);
-    pools.wait_entry_fence(ctx, counters, fence)?;
-
     phase.enter(super::draw_phase::Phase::Readback);
     let out = super::pools::read_back_slot(
         ctx,
@@ -5970,6 +6097,7 @@ pub(crate) unsafe fn execute_draw_inner(
     };
 
     Ok(DrawOutput {
+        storage_textures,
         pixels,
         target_guest_backed,
         guest_store_recorded,
@@ -6516,6 +6644,33 @@ pub(super) unsafe fn barrier_resident_for_transfer_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anonymous_target_seed_order_follows_native_attachment_not_residency_identity() {
+        for format in [vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB] {
+            assert!(seed_requires_rb_swap(SeedOrder::Rgba8, format));
+            assert!(!seed_requires_rb_swap(SeedOrder::Bgra8, format));
+        }
+        for format in [vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB] {
+            assert!(!seed_requires_rb_swap(SeedOrder::Rgba8, format));
+            assert!(seed_requires_rb_swap(SeedOrder::Bgra8, format));
+        }
+    }
+
+    #[test]
+    fn anonymous_target_native_seed_formats_match_the_attachment_declaration() {
+        let mut req = guest_target_seed_req(4, 2, 40, 40, 6);
+        req.color_attachment = Some(crate::backend::vulkan::translate::pixel::color_attachment(
+            crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        ).unwrap().0.with_clear([0.0; 4]));
+        assert_eq!(req.primary_format(), vk::Format::B8G8R8A8_UNORM);
+        assert_eq!(validation_slug(&req), "vk_draw_validate_target_guest_seed_format");
+        req.target_guest_seed.as_mut().unwrap().format = vk::Format::B8G8R8A8_UNORM;
+        assert!(validate_v1(&req).is_ok());
+        assert!(seed_formats_match(vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB));
+        assert!(!seed_formats_match(vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM));
+        assert!(!seed_formats_match(vk::Format::R16G16B16A16_SFLOAT, vk::Format::R8G8B8A8_UNORM));
+    }
 
     fn sampled_identity() -> TargetIdentity {
         TargetIdentity::Surface {

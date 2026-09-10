@@ -624,17 +624,11 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<usize, DrawError> {
         unsafe { self.batch_flush(ctx, counters)? };
-        // The window's bit is given back here and not by the presenter, which
-        // is the whole point of spelling it as an atomic the presenter owns and
-        // this side only reads: the presenter must not have to reach into the
-        // registry to say it has finished, because the registry is on its way to
-        // the guest's device and the presenter holds none. Polling it from the
-        // maintenance tick costs one relaxed load and keeps the dependency
-        // one-way.
+        // Poll each entry's captured present completions, even while newer
+        // presents remain outstanding and no engine fence retires this tick.
+        // The presenter still never reaches into the resource registry.
         #[cfg(feature = "host-window")]
-        if !super::super::window_present::window_presents_in_flight() {
-            unsafe { self.release_graveyard(&ctx.device, super::WINDOW_PRESENT_SLOT) };
-        }
+        unsafe { self.release_graveyard(&ctx.device, 0) };
         unsafe {
             self.retire_signaled_slots(ctx, counters, DeviceLostOp::PoolsFenceStatusMaintenance)
         }
@@ -946,11 +940,11 @@ impl ResourcePools {
     /// Destroy `handle` now if nothing can be reading it, else park it in the
     /// graveyard until each slot open at this instant has retired.
     pub(crate) unsafe fn dispose(&mut self, device: &ash::Device, handle: DeferredHandle) {
-        let waiting = self.open_slot_mask();
-        if waiting == 0 {
-            self.destroy_or_recycle(device, handle);
+        let entry = GraveyardEntry::new(self.open_slot_mask(), handle);
+        if entry.waiting == 0 {
+            self.destroy_or_recycle(device, entry.handle);
         } else {
-            self.graveyard.push((waiting, handle));
+            self.graveyard.push(entry);
         }
     }
 
@@ -1172,10 +1166,21 @@ impl ResourcePools {
     fn take_released_graveyard(&mut self, retired: SlotMask) -> Vec<DeferredHandle> {
         let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.graveyard)
             .into_iter()
-            .map(|(mask, handle)| (mask & !retired, handle))
-            .partition(|(mask, _)| *mask == 0);
+            .map(|mut entry| { entry.advance(retired); entry })
+            .partition(|entry| entry.waiting == 0);
         self.graveyard = waiting;
-        ready.into_iter().map(|(_, handle)| handle).collect()
+        ready.into_iter().map(|entry| entry.handle).collect()
+    }
+
+    pub(crate) fn pass_local_retiring_levels(&self) -> NonPinnedTotals {
+        let mut levels = NonPinnedTotals::default();
+        for entry in &self.graveyard {
+            if let DeferredHandle::PassLocalImage { attachment_bytes, .. } = &entry.handle {
+                levels.count += 1;
+                levels.bytes += attachment_bytes;
+            }
+        }
+        levels
     }
 
     /// Terminally handle every graveyard entry released by `retired` retiring.
@@ -3855,33 +3860,9 @@ impl ResourcePools {
         if self.targets.contains_key(&map_key) {
             return Ok(self.targets.get(&map_key).unwrap());
         }
-        let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
-            | vk::ImageUsageFlags::INPUT_ATTACHMENT
-            | vk::ImageUsageFlags::TRANSFER_SRC
-            | if key.with_transfer_dst {
-                vk::ImageUsageFlags::TRANSFER_DST
-            } else {
-                vk::ImageUsageFlags::empty()
-            };
         let image = ctx
             .device
-            .create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(translate::pixel::RESIDENT_RGBA_FORMAT)
-                    .extent(vk::Extent3D {
-                        width: key.width,
-                        height: key.height,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(usage)
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
-            )
+            .create_image(&key.image_info(), None)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetImage, e)))?;
         counters.note_create(CreateSite::TargetImage);
         let ireq = ctx.device.get_image_memory_requirements(image);
@@ -3893,14 +3874,7 @@ impl ResourcePools {
                 return Err(error);
             }
         };
-        let view = match ctx.device.create_image_view(
-            &vk::ImageViewCreateInfo::default()
-                .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(translate::pixel::RESIDENT_RGBA_FORMAT)
-                .subresource_range(color_subresource_range()),
-            None,
-        ) {
+        let view = match ctx.device.create_image_view(&key.view_info(image), None) {
             Ok(v) => v,
             Err(e) => {
                 self.free_image_slab(&ctx.device, image);
@@ -5640,6 +5614,7 @@ mod recycle_tests {
             memory: vk::DeviceMemory::null(),
             view: vk::ImageView::null(),
             key: StorageImageKey {
+                sampled_alias: false,
                 mip_levels: 1,
                 width: w,
                 height: h,
@@ -6064,6 +6039,7 @@ mod recycle_tests {
         let pinned = admit_compute_resident(&mut pools, 1, 0, true);
         let unpinned = admit_compute_resident(&mut pools, 2, 0, false);
         let same = StorageImageKey {
+            sampled_alias: false,
             mip_levels: 1,
             width: 8,
             height: 8,
@@ -6723,7 +6699,7 @@ mod recycle_tests {
 
         let waiting = pools.open_slot_mask();
         assert_eq!(waiting, 0b0011, "slots 0 and 1 are in flight");
-        pools.graveyard.push((
+        pools.graveyard.push(GraveyardEntry::new(
             waiting,
             DeferredHandle::Framebuffer(vk::Framebuffer::null()),
         ));
@@ -6874,7 +6850,7 @@ mod recycle_tests {
              arm is for"
         );
 
-        let _present =
+        let present =
             crate::backend::vulkan::engine::window_present::PresentInFlightForTest::claim();
         let waiting = pools.open_slot_mask();
         assert_eq!(
@@ -6883,9 +6859,11 @@ mod recycle_tests {
             "the window is the only thing outstanding, so it is the only bit"
         );
 
-        pools.graveyard.push((
+        pools.graveyard.push(GraveyardEntry::new(
             waiting,
-            DeferredHandle::Framebuffer(vk::Framebuffer::null()),
+            DeferredHandle::Image {
+                image: vk::Image::null(), view: vk::ImageView::null(), memory: vk::DeviceMemory::null(),
+            },
         ));
 
         // Every engine slot retiring is not what this handle waits on.
@@ -6896,13 +6874,16 @@ mod recycle_tests {
             );
         }
         assert_eq!(pools.graveyard.len(), 1);
+        assert!(pools.take_released_graveyard(super::WINDOW_PRESENT_SLOT).is_empty(),
+            "an aggregate slot bit cannot substitute for the real present completion");
+        let _newer =
+            crate::backend::vulkan::engine::window_present::PresentInFlightForTest::claim();
+        drop(present);
 
         assert_eq!(
-            pools
-                .take_released_graveyard(super::WINDOW_PRESENT_SLOT)
-                .len(),
+            pools.take_released_graveyard(0).len(),
             1,
-            "the window giving its slot back is what frees it"
+            "the captured blit completed; later window work cannot retain its source"
         );
         assert!(pools.graveyard.is_empty());
     }
@@ -6945,7 +6926,7 @@ mod recycle_tests {
             // ring is never idle and `open_slot_mask()` is never zero.
             let waiting = pools.open_slot_mask();
             assert_ne!(waiting, 0, "step {step}: ring must stay busy");
-            pools.graveyard.push((
+            pools.graveyard.push(GraveyardEntry::new(
                 waiting,
                 DeferredHandle::Framebuffer(vk::Framebuffer::null()),
             ));
@@ -6969,6 +6950,76 @@ mod recycle_tests {
             peak <= depth,
             "outstanding population is bounded by the ring depth, got {peak}"
         );
+    }
+
+    #[test]
+    fn memoryless_image_retirement_does_not_accumulate_across_busy_ring_wraps() {
+        let mut pools = ResourcePools::new();
+        let depth = RING_DEPTH;
+        let attachments = crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS;
+        let attachment_bytes = 1920 * 1080 * 8;
+        pools.slots = (0..depth).map(|_| pending_slot()).collect();
+        let mut released = 0;
+        for step in 0..256 {
+            let waiting = pools.open_slot_mask();
+            for _ in 0..attachments {
+                pools.graveyard.push(GraveyardEntry::new(waiting, DeferredHandle::PassLocalImage {
+                    image: vk::Image::null(),
+                    view: vk::ImageView::null(),
+                    memory: vk::DeviceMemory::null(),
+                    attachment_bytes,
+                }));
+            }
+            assert!(pools.graveyard.len() <= depth * attachments,
+                "ended pass allocations outlived a full ring wrap");
+            let levels = pools.pass_local_retiring_levels();
+            assert_eq!(levels.count, pools.graveyard.len());
+            assert_eq!(levels.bytes, levels.count as u64 * attachment_bytes);
+            let index = step % depth;
+            pools.slots[index].pending = None;
+            let ready = pools.take_released_graveyard(1 << index);
+            assert!(ready.iter().all(|handle| matches!(handle, DeferredHandle::PassLocalImage { .. })),
+                "pass allocations are freed, not returned to a cache");
+            released += ready.len();
+            pools.slots[index] = pending_slot();
+        }
+        released += pools.take_released_graveyard(!0).len();
+        assert_eq!(released, 256 * attachments);
+        assert!(pools.graveyard.is_empty());
+        assert_eq!(pools.pass_local_retiring_levels(), NonPinnedTotals::default());
+    }
+
+    #[cfg(feature = "host-window")]
+    #[test]
+    fn memoryless_retirement_advances_while_window_presents_never_go_idle() {
+        use crate::backend::vulkan::engine::window_present::{self, PresentInFlightForTest};
+        let mut windows: std::collections::VecDeque<_> =
+            (0..3).map(|_| PresentInFlightForTest::claim()).collect();
+        let mut pools = ResourcePools::new();
+        pools.slots = (0..RING_DEPTH).map(|_| pending_slot()).collect();
+        let mut released = 0;
+        for step in 0..64 {
+            pools.graveyard.push(GraveyardEntry::new(pools.open_slot_mask(), DeferredHandle::PassLocalImage {
+                image: vk::Image::null(), view: vk::ImageView::null(),
+                memory: vk::DeviceMemory::null(), attachment_bytes: 1920 * 1080 * 8,
+            }));
+            let index = step % RING_DEPTH;
+            pools.slots[index].pending = None;
+            released += pools.take_released_graveyard(1 << index).len();
+            pools.slots[index] = pending_slot();
+            // Every individual present retires, but a newer present is already
+            // outstanding. Global all-window-idle is never observable.
+            windows.push_back(PresentInFlightForTest::claim());
+            windows.pop_front();
+            released += pools.take_released_graveyard(0).len();
+            assert!(window_present::window_presents_in_flight());
+            assert!(pools.graveyard.len() <= RING_DEPTH.max(3),
+                "old native allocations wait for new, unrelated window work at step {step}");
+        }
+        drop(windows);
+        released += pools.take_released_graveyard(!0).len();
+        assert_eq!(released, 64);
+        assert_eq!(pools.pass_local_retiring_levels(), NonPinnedTotals::default());
     }
 }
 

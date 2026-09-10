@@ -26,6 +26,46 @@ use crate::observe::Decline;
 type FragmentRelocationCache = HashMap<(bool, bool), Arc<ShaderVariant>>;
 type M2vResult<T> = Result<T, M2vCacheDecline>;
 
+#[cfg(all(test, feature = "backend-vulkan"))]
+#[path = "m2v_cache_rounding_gpu.rs"]
+mod rounding_gpu_tests;
+
+/// AIR translation is format independent. Runtime compute variants own the complete image-write
+/// contract, including the rounding mode and actual storage views, without translating AIR again
+/// on the synchronous execution path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "backend-vulkan")]
+pub(crate) struct ComputeTextureOptions {
+    pub rounding_mode: crate::protocol::compute::TextureWriteRoundingMode,
+    pub native_rounding_mode: metal2vulkan::texture_write_rounding::TextureWriteRoundingMode,
+    pub image_formats: Vec<(u32, crate::runtime::spirv_bind::ImageFormat)>,
+    pub rounding_targets: Vec<metal2vulkan::texture_write_rounding::TextureWriteTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "backend-vulkan")]
+pub(crate) struct ComputeTextureSpecializeDecline {
+    mode: crate::protocol::compute::TextureWriteRoundingMode,
+    detail: String,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl Decline for ComputeTextureSpecializeDecline {
+    fn slug(&self) -> &'static str {
+        "compute_vk_texture_write_specialize"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("mode", self.mode.word().to_string()), ("detail", log_token(&self.detail))]
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+type ComputeTextureVariants = Vec<(
+    ComputeTextureOptions,
+    Result<Arc<Vec<u32>>, ComputeTextureSpecializeDecline>,
+)>;
+
 /// A specific failure while caching, translating, or post-processing AIR.
 ///
 /// Raw tool/IO/layout text stays payload; the reason itself is stable and
@@ -280,6 +320,8 @@ pub struct CachedShader {
     /// the module and those two flags, so each variant is computed once per
     /// shader lifetime instead of mutating a fresh copy per draw.
     frag_reloc: Mutex<FragmentRelocationCache>,
+    #[cfg(feature = "backend-vulkan")]
+    compute_textures: Mutex<ComputeTextureVariants>,
 }
 
 /// One binding numbering of a translated module, beside the reflected
@@ -399,7 +441,39 @@ impl CachedShader {
             words: Arc::new(words),
             base: OnceLock::new(),
             frag_reloc: Mutex::new(HashMap::new()),
+            #[cfg(feature = "backend-vulkan")]
+            compute_textures: Mutex::new(Vec::new()),
         }
+    }
+
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn compute_texture_variant(
+        &self,
+        mut options: ComputeTextureOptions,
+    ) -> Result<Arc<Vec<u32>>, ComputeTextureSpecializeDecline> {
+        use metal2vulkan::texture_write_rounding as rounding;
+        options.image_formats.sort_by_key(|(binding, _)| *binding);
+        options.rounding_targets.sort_by_key(|target| (target.descriptor_set, target.binding));
+        let mut cache = self.compute_textures.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((_, result)) = cache.iter().find(|(key, _)| *key == options) {
+            return result.clone();
+        }
+        let result = (|| {
+            let mut words = (*self.words).clone();
+            crate::runtime::spirv_bind::specialize_image_formats(&mut words, &options.image_formats)
+                .map_err(|error| format!("{error:?}"))?;
+            if options.image_formats.iter().any(|(_, format)| {
+                *format == crate::runtime::spirv_bind::ImageFormat::Unknown
+            }) {
+                crate::runtime::spirv_bind::ensure_storage_write_without_format_capability(&mut words);
+            }
+            rounding::specialize_texture_write_rounding(
+                &words, options.native_rounding_mode, &options.rounding_targets,
+            )
+                .map(Arc::new)
+        })().map_err(|detail| ComputeTextureSpecializeDecline { mode: options.rounding_mode, detail });
+        cache.push((options, result.clone()));
+        result
     }
 
     /// This module in the binding numbering the two stage-collision flags name,
@@ -1292,6 +1366,51 @@ pub fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "backend-vulkan")]
+    fn compute_texture_variants_key_rounding_and_runtime_format() {
+        use crate::protocol::compute::TextureWriteRoundingMode as R;
+        use crate::runtime::spirv_bind::ImageFormat as F;
+        let source = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @write_image(ptr addrspace(1) %image) {
+entry:
+  call void @air.write_texture_2d.v4f32(ptr addrspace(1) %image, <2 x i32> zeroinitializer, <4 x float> <float f0x3f803000, float f0x3f803000, float f0x3f803000, float f0x3f803000>, i32 0, i32 2)
+  ret void
+}
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
+!air.kernel = !{!0}
+!0 = !{ptr @write_image, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"image"}
+"#;
+        let scratch = std::env::temp_dir().join(format!("reims-rounding-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let bytes = metal2vulkan::translate_sanitized_native(source, Stage::Kernel, &scratch).unwrap();
+        std::fs::remove_dir_all(scratch).unwrap();
+        let shader = synth_shader(Stage::Kernel, bytes);
+        let binding = metal2vulkan::reflect::DEFAULT_DESCRIPTOR_LAYOUT.storage_textures.start;
+        let options = |rounding_mode, format| ComputeTextureOptions {
+            rounding_mode,
+            native_rounding_mode: metal2vulkan::texture_write_rounding::TextureWriteRoundingMode::TowardZero,
+            image_formats: vec![(binding, format)],
+            rounding_targets: vec![],
+        };
+        let nearest = shader.compute_texture_variant(options(R::ToNearestEven, F::Rgba16Float)).unwrap();
+        let zero = shader.compute_texture_variant(options(R::TowardZero, F::Rgba16Float)).unwrap();
+        let full = shader.compute_texture_variant(options(R::ToNearestEven, F::Rgba32Float)).unwrap();
+        assert_eq!(nearest, zero, "descriptors do not override the AIR native-write contract");
+        assert_ne!(nearest, full, "float16 and float32 views cannot alias");
+        let mut different_native = options(R::ToNearestEven, F::Rgba16Float);
+        different_native.native_rounding_mode = metal2vulkan::texture_write_rounding::TextureWriteRoundingMode::ToNearestEven;
+        let different_native = shader.compute_texture_variant(different_native).unwrap();
+        assert_ne!(nearest, different_native, "source-native policy is an executable cache input");
+        let repeat = shader.compute_texture_variant(options(R::ToNearestEven, F::Rgba16Float)).unwrap();
+        assert!(Arc::ptr_eq(&nearest, &repeat), "repeat dispatch must reuse specialization");
+        assert_eq!(shader.compute_textures.lock().unwrap().len(), 4);
+    }
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

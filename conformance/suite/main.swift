@@ -12,6 +12,15 @@ if CommandLine.arguments.contains("--depth-task-child") {
     exit(depthTaskIsolationChild())
 }
 
+if CommandLine.arguments.contains("--pipeline-task-child") {
+    exit(pipelineTaskIsolationChild())
+}
+
+if CommandLine.arguments.contains("--pipeline-task-isolation-only") {
+    pipelineTaskIsolationCases()
+    finish()
+}
+
 if CommandLine.arguments.contains("--integer-clear-only") {
     integerClearCases()
     finish()
@@ -38,6 +47,11 @@ if CommandLine.arguments.contains("--fragment-texture-writes-only") {
     finish()
 }
 
+if CommandLine.arguments.contains("--texture-write-rounding-only") {
+    textureWriteRoundingCases()
+    finish()
+}
+
 if CommandLine.arguments.contains("--indexed-draw-only") {
     _ = library
     report("shader_compile", true, "runtime library built")
@@ -61,6 +75,7 @@ floatSamplingCases()
 indexedDrawCases()
 
 depthTaskIsolationCase()
+pipelineTaskIsolationCases()
 
 for f in formats {
     linearAliasCase(f, 64, 16, pitch: .tight, sampler: false)
@@ -116,6 +131,7 @@ vertexBufferCase()
 
 fragmentBufferCase()
 fragmentTextureWriteCases()
+textureWriteRoundingCases()
 renderBarrierCase()
 computeBarrierCase(resourceBarrier: true)
 computeBarrierCase(resourceBarrier: false)

@@ -55,6 +55,11 @@ pub enum DrawReason {
     /// Fieldless because the variant is `Copy` and compared by value at every
     /// negative cache; the key and the call's description ride the fail line.
     DriverCallQuarantined,
+    ColorInputOrderingUnsupported(reims_vgpu_vulkan::framebuffer_fetch::Refusal),
+    ColorInputAttachmentMissing { mask: u8, attachments: usize },
+    ColorAttachmentLimit { requested: usize, limit: u32 },
+    ColorInputAttachmentLimit { requested: u32, limit: u32 },
+    PassLocalFormatUnsupported { format: ash::vk::Format, blend: bool },
     /// A resident target bound as a sampled image must be a plain 2D image;
     /// arrayed and volume residents have no bind path.
     ResidentSampledNot2d {
@@ -334,6 +339,11 @@ impl crate::observe::Decline for DrawReason {
             Self::SpirvInvalid => "spirv_module_invalid",
             Self::UsedBindingAbsentFromLayout { .. } => "draw_used_binding_absent_from_layout",
             Self::DriverCallQuarantined => "driver_call_quarantined",
+            Self::ColorInputOrderingUnsupported(_) => "draw_color_input_ordering_unsupported",
+            Self::ColorInputAttachmentMissing { .. } => "draw_color_input_attachment_missing",
+            Self::ColorAttachmentLimit { .. } => "draw_color_attachment_limit",
+            Self::ColorInputAttachmentLimit { .. } => "draw_color_input_attachment_limit",
+            Self::PassLocalFormatUnsupported { .. } => "draw_memoryless_format_unsupported",
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
@@ -408,6 +418,19 @@ impl std::fmt::Display for DrawReason {
             Self::UsedBindingAbsentFromLayout { binding, fragment } => {
                 let stage = if *fragment { "fragment" } else { "vertex" };
                 write!(f, " binding={binding} stage={stage}")
+            }
+            Self::ColorInputOrderingUnsupported(detail) => write!(f, " detail={detail:?}"),
+            Self::ColorInputAttachmentMissing { mask, attachments } => {
+                write!(f, " mask={mask:#x} attachments={attachments}")
+            }
+            Self::ColorAttachmentLimit { requested, limit } => {
+                write!(f, " requested={requested} limit={limit}")
+            }
+            Self::ColorInputAttachmentLimit { requested, limit } => {
+                write!(f, " requested={requested} limit={limit}")
+            }
+            Self::PassLocalFormatUnsupported { format, blend } => {
+                write!(f, " format={format:?} blend={blend}")
             }
             Self::ResidentSampledNot2d { binding } | Self::GuestRunSampledNot2d { binding } => {
                 write!(f, " binding={binding}")

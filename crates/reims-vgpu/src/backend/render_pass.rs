@@ -12,7 +12,7 @@ pub enum RenderPass {
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     Metal(super::metal::render_pass::MetalRenderPass),
     #[cfg(feature = "backend-vulkan")]
-    Vulkan,
+    Vulkan(super::vulkan::render_pass::VulkanRenderPass),
 }
 
 impl RenderPass {
@@ -30,7 +30,7 @@ impl RenderPass {
                 state, host, request, writeback_guest, force_full_store,
             ),
             #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan => crate::runtime::draw::vulkan::encode_draw_chain(
+            Self::Vulkan(pass) => pass.encode_draw(
                 state, host, request, writeback_guest, force_full_store,
             ),
         }

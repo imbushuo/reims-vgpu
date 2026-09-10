@@ -180,8 +180,41 @@ a fragment shader with no color output saves the framebuffer into a writable
 texture, and a later draw in the same encoder uses it to restore rounded
 corners. BGRA8 and RGBA16Float run with shared and separate command buffers.
 This distinguishes missing shader texture side effects from alpha blending.
+On Vulkan, writable graphics textures currently support ordinary type-2/type-3,
+single-mip, depth-1, sample-1 2D textures. All bindings of one texture share a
+native-format image, including sampled aliases. Shader writes are published after
+each completed draw, before deferred attachment Store. Unsupported shapes and
+attachment aliases refuse explicitly. Raster-order textures additionally require
+the host's `VK_EXT_fragment_shader_interlock` pixel-interlock feature.
+Framebuffer-fetch ordering uses rasterization-order attachment access when
+available. Otherwise Vulkan serializes single-sample primitives with explicit
+framebuffer-local barriers, retaining native blending and depth/stencil tests.
+Triangle strips require dynamic front-face state to preserve odd-primitive
+winding. Wireframe triangles, changed draw builtins, and vertex side effects
+that cannot safely survive splitting refuse explicitly; a subpass
+self-dependency alone is not treated as synchronization.
+
+`--pipeline-task-isolation-only` launches four sequential child processes with
+different shader constants. Each must finish a cold compute pipeline and render
+pipeline; a previous task's equal-numbered object references must not satisfy
+its translation waits or retire its pipelines.
 
 ## Running it
+
+`--texture-write-rounding-only` runs a 72-case authored compute conversion matrix. It crosses
+native/RTZ/RTE compiler modes with every descriptor mode, repeats a descriptor to check cache reuse,
+and changes R16Float/RG16Float/RGBA16Float/RGBA32Float and
+normalized color views. The cases cover halfway values, signed zero, subnormal boundaries,
+overflow, NaN/Inf classes, and repeated cache reuse. Normalized-format results are compared with
+the same device's default conversion because the rounding property applies only to floating-point
+pixel formats. The independent descriptor-only and mismatched cases retain the native-calibrated
+precedence: on the Apple M2 oracle, the pipeline property does not override a source-compiled
+library's AIR write mode, and unqualified native writes use RTZ. Libraries compiled in different
+modes do not claim identical AIR bytes; variants within a compiler mode use the same function.
+The Vulkan compatibility profile declares that calibrated source-native RTZ policy explicitly;
+it is not inferred from the Vulkan driver's default. Run the binary
+natively first, then unchanged on the selected guest rail; compiling
+these cases alone is not GPU parity evidence.
 
 Native, on the oracle — this also cross-builds the x86_64 fallback:
 

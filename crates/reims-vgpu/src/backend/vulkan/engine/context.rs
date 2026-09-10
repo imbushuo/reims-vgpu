@@ -1221,6 +1221,8 @@ impl DeviceContext {
         // asking for a feature a device declined fails `vkCreateDevice`.
         let mut en_image_robustness = features.enabled_image_robustness();
         let mut en_attachment_feedback = features.enabled_attachment_feedback_loop_layout();
+        let mut en_rasterization_order = features.enabled_rasterization_order_attachment_access();
+        let mut en_fragment_interlock = features.enabled_fragment_shader_interlock();
         let mut en_extended_dynamic_state = features.enabled_extended_dynamic_state();
         let mut en_extended_dynamic_state3 = features.enabled_extended_dynamic_state3();
         let mut dci = vk::DeviceCreateInfo::default()
@@ -1239,6 +1241,12 @@ impl DeviceContext {
         }
         if features.attachment_feedback_loop_layout {
             dci = dci.push_next(&mut en_attachment_feedback);
+        }
+        if features.rasterization_order_color_access {
+            dci = dci.push_next(&mut en_rasterization_order);
+        }
+        if features.fragment_shader_pixel_interlock {
+            dci = dci.push_next(&mut en_fragment_interlock);
         }
         if features.extended_dynamic_state {
             dci = dci.push_next(&mut en_extended_dynamic_state);

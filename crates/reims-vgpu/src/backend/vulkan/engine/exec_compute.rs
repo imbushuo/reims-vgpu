@@ -634,6 +634,7 @@ pub(crate) unsafe fn execute_compute_inner(
             continue;
         }
         let key = StorageImageKey {
+            sampled_alias: false,
             width: resource.width,
             height: resource.height,
             format: resource.format,
@@ -730,6 +731,7 @@ pub(crate) unsafe fn execute_compute_inner(
     let mut simg_slots = Vec::new();
     for resource in &req.storage_images {
         let key = StorageImageKey {
+            sampled_alias: false,
             width: resource.width,
             height: resource.height,
             format: resource.format,
@@ -1618,6 +1620,7 @@ mod tests {
     }
     fn resident_sample_key() -> StorageImageKey {
         StorageImageKey {
+            sampled_alias: false,
             mip_levels: 1,
             width: 1,
             height: 1,

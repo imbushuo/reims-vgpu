@@ -312,6 +312,11 @@ pub struct DeviceFeatures {
     /// attachment self-sampling contract; hosts without it keep the snapshot
     /// copy rail.
     pub attachment_feedback_loop_layout: bool,
+    /// Vulkan 1.2 extension providing ordered same-pixel input-attachment reads.
+    pub rasterization_order_color_access: bool,
+    pub max_color_attachments: u32,
+    pub max_input_attachments: u32,
+    pub fragment_shader_pixel_interlock: bool,
     /// `VK_EXT_image_drm_format_modifier`, used only for the explicit linear
     /// plane layout that gives a shared guest target its declared row pitch.
     /// This is an extension capability rather than a device feature bit: when
@@ -616,6 +621,20 @@ impl DeviceFeatures {
             .attachment_feedback_loop_layout(self.attachment_feedback_loop_layout)
     }
 
+    pub fn enabled_rasterization_order_attachment_access(
+        &self,
+    ) -> vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT<'static> {
+        vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT::default()
+            .rasterization_order_color_attachment_access(self.rasterization_order_color_access)
+    }
+
+    pub fn enabled_fragment_shader_interlock(
+        &self,
+    ) -> vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT<'static> {
+        vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT::default()
+            .fragment_shader_pixel_interlock(self.fragment_shader_pixel_interlock)
+    }
+
     /// The `VK_EXT_extended_dynamic_state` feature struct to chain, for the
     /// rung that took the extension. Chained only when the flag is set —
     /// asking a device for a feature it declined fails `vkCreateDevice`.
@@ -700,6 +719,10 @@ impl DeviceFeatures {
             mirror_clamp_to_edge,
             image_robustness,
             attachment_feedback_loop_layout,
+            rasterization_order_color_access,
+            max_color_attachments,
+            max_input_attachments,
+            fragment_shader_pixel_interlock,
             image_drm_format_modifier,
             dual_src_blend,
             independent_blend,
@@ -731,6 +754,9 @@ impl DeviceFeatures {
             "vk_features robust_buffer_access={robust_buffer_access} \
              image_robustness={image_robustness:?} \
              attachment_feedback_loop_layout={attachment_feedback_loop_layout} \
+             rasterization_order_color_access={rasterization_order_color_access} \
+             max_color_attachments={max_color_attachments} max_input_attachments={max_input_attachments} \
+             fragment_shader_pixel_interlock={fragment_shader_pixel_interlock} \
              image_drm_format_modifier={image_drm_format_modifier} \
              sampler_anisotropy={sampler_anisotropy} max_sampler_anisotropy={max_sampler_anisotropy} \
              max_image_dimension_2d={max_image_dimension_2d} \
@@ -782,6 +808,12 @@ impl DeviceFeatures {
         }
         if self.attachment_feedback_loop_layout {
             out.push(vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME.as_ptr());
+        }
+        if self.rasterization_order_color_access {
+            out.push(vk::EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_NAME.as_ptr());
+        }
+        if self.fragment_shader_pixel_interlock {
+            out.push(vk::EXT_FRAGMENT_SHADER_INTERLOCK_NAME.as_ptr());
         }
         if self.image_drm_format_modifier {
             out.push(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr());
@@ -933,7 +965,22 @@ pub unsafe fn query(
         } else {
             false
         };
+    let fragment_shader_pixel_interlock = if has_extension(vk::EXT_FRAGMENT_SHADER_INTERLOCK_NAME) {
+        let mut supported = vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT::default();
+        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported);
+        unsafe { instance.get_physical_device_features2(pd, &mut features) };
+        supported.fragment_shader_pixel_interlock == vk::TRUE
+    } else {
+        false
+    };
     let image_drm_format_modifier = has_extension(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME);
+    let rasterization_order_color_access =
+        if has_extension(vk::EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_NAME) {
+            let mut access = vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut access);
+            unsafe { instance.get_physical_device_features2(pd, &mut features) };
+            access.rasterization_order_color_attachment_access == vk::TRUE
+        } else { false };
 
     // The same rule as `attachment_feedback_loop_layout` above: a structure
     // that exists only with its extension is chained only on a device that
@@ -980,6 +1027,11 @@ pub unsafe fn query(
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         image_robustness,
         attachment_feedback_loop_layout,
+        rasterization_order_color_access,
+        max_color_attachments: props.limits.max_color_attachments,
+        max_input_attachments: props.limits.max_per_stage_descriptor_input_attachments
+            .min(props.limits.max_descriptor_set_input_attachments),
+        fragment_shader_pixel_interlock,
         image_drm_format_modifier,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
@@ -1059,6 +1111,25 @@ pub unsafe fn query(
 mod tests {
     use super::*;
 
+    #[test]
+    fn graphics_storage_pixel_interlock_is_enabled_only_with_its_extension() {
+        for supported in [false, true] {
+            let features = DeviceFeatures {
+                fragment_shader_pixel_interlock: supported,
+                ..DeviceFeatures::default()
+            };
+            assert_eq!(
+                features.enabled_fragment_shader_interlock().fragment_shader_pixel_interlock == vk::TRUE,
+                supported,
+            );
+            assert_eq!(
+                features.required_extensions().contains(&vk::EXT_FRAGMENT_SHADER_INTERLOCK_NAME.as_ptr()),
+                supported,
+            );
+            assert_eq!(features.enabled_fragment_shader_interlock().fragment_shader_sample_interlock, vk::FALSE);
+        }
+    }
+
     fn all_supported() -> DeviceFeatures {
         DeviceFeatures {
             occlusion_query_precise: true,
@@ -1103,6 +1174,10 @@ mod tests {
             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
             image_robustness: ImageRobustness::Core13,
             attachment_feedback_loop_layout: true,
+            rasterization_order_color_access: true,
+            max_color_attachments: 8,
+            max_input_attachments: 8,
+            fragment_shader_pixel_interlock: true,
             image_drm_format_modifier: true,
             dual_src_blend: true,
             independent_blend: true,
@@ -1409,6 +1484,20 @@ mod tests {
         assert!(!DeviceFeatures::default()
             .required_extensions()
             .contains(&name));
+    }
+
+    #[test]
+    fn memoryless_ordered_fetch_feature_and_extension_move_together() {
+        let name = vk::EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_NAME.as_ptr();
+        for available in [false, true] {
+            let features = DeviceFeatures {
+                rasterization_order_color_access: available,
+                ..Default::default()
+            };
+            assert_eq!(features.required_extensions().contains(&name), available);
+            assert_eq!(features.enabled_rasterization_order_attachment_access()
+                .rasterization_order_color_attachment_access == vk::TRUE, available);
+        }
     }
 
     /// A feature the device declines is never enabled — the enable list is a

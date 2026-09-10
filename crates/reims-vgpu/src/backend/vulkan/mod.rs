@@ -27,8 +27,11 @@ mod census;
 pub mod engine;
 /// A draw's pipeline and both its shaders, resolved once per pipeline object.
 pub mod pipeline_resolve;
+pub mod planar;
+pub mod sampled_shader;
 /// The resident identity a mapper-ref-texture guest surface renders into.
 pub mod present_identity;
+pub mod render_pass;
 pub mod translate;
 
 use crate::backend::compute_session::ComputeSession;
@@ -152,7 +155,7 @@ pub(crate) fn gva_window(identity: &engine::TargetIdentity) -> Option<GvaWindow>
 
 impl Backend for VulkanBackend {
     fn begin_render_pass(&self) -> crate::backend::RenderPass {
-        crate::backend::RenderPass::Vulkan
+        crate::backend::RenderPass::Vulkan(render_pass::VulkanRenderPass::default())
     }
 
     fn name(&self) -> &'static str {

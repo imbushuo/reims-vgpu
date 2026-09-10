@@ -9,8 +9,10 @@
 
 use ash::vk;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
+
+mod retirement;
+pub(crate) use retirement::WindowRetirement;
 
 use super::context::DeviceContext;
 use super::pools::ResourcePools;
@@ -31,9 +33,9 @@ use crate::backend::vulkan::translate;
 /// submit, or make its recording slot visible here the way `open_batch` is".
 /// This is that slot.
 ///
-/// A count and not a flag: the presenter runs a ring of entries
-/// ([`WindowPresenter::present_depth`]) and several can be in flight at once, so
-/// the last one to retire is what clears the slot.
+/// A snapshot and not a global all-idle condition: a continuously busy window
+/// can retire every present without ever becoming idle. Each graveyard entry
+/// waits only on the frame completions that existed when it was disposed.
 ///
 /// A `static` rather than a field on either side, because it is a fact about the
 /// process: `backend::select` latches one rail, the engine owns one
@@ -42,19 +44,21 @@ use crate::backend::vulkan::translate;
 /// guest-derived state on its way to the device the guest declared it against,
 /// and a presenter that had to reach into it to say "I am still running" would
 /// be the coupling that move exists to remove.
-static WINDOW_PRESENTS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+pub(crate) fn window_retirement() -> WindowRetirement {
+    retirement::snapshot()
+}
 
 /// Whether any host-window present is submitted and unretired.
 pub(crate) fn window_presents_in_flight() -> bool {
-    WINDOW_PRESENTS_IN_FLIGHT.load(Ordering::Acquire) != 0
+    retirement::in_flight()
 }
 
 /// Claim the window's graveyard slot for one submitted present.
 ///
 /// Called only where `PresentFrame::submitted` is set, and paired with
 /// [`WindowPresenter::end_present_in_flight`] at every place it is cleared.
-fn begin_present_in_flight() {
-    WINDOW_PRESENTS_IN_FLIGHT.fetch_add(1, Ordering::Release);
+fn begin_present_in_flight() -> retirement::WindowWork {
+    retirement::begin()
 }
 
 /// Hold the window's graveyard slot for the body of a test, and give it back on
@@ -65,20 +69,19 @@ fn begin_present_in_flight() {
 /// claim and its release would leave every later test believing a present is
 /// outstanding, and the failure would land on an innocent test.
 #[cfg(test)]
-pub(crate) struct PresentInFlightForTest;
+pub(crate) struct PresentInFlightForTest(retirement::WindowWork);
 
 #[cfg(test)]
 impl PresentInFlightForTest {
     pub(crate) fn claim() -> Self {
-        begin_present_in_flight();
-        Self
+        Self(begin_present_in_flight())
     }
 }
 
 #[cfg(test)]
 impl Drop for PresentInFlightForTest {
     fn drop(&mut self) {
-        WINDOW_PRESENTS_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+        self.0.complete();
     }
 }
 
@@ -100,8 +103,8 @@ impl Drop for PresentInFlightForTest {
 /// `destroy` both clear latches that may already be clear, so the decrement has
 /// to be per claim rather than per call or it underflows.
 fn end_present_in_flight(frame: &mut PresentFrame) {
-    if std::mem::replace(&mut frame.submitted, false) {
-        WINDOW_PRESENTS_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+    if let Some(work) = frame.submitted.take() {
+        work.complete();
     }
 }
 
@@ -571,7 +574,7 @@ struct PresentFrame {
     /// gone — `ResourcePools::window_holds` keeps a displayed resident off the
     /// reclaim paths from the publish that named it, which is both wider in time
     /// and not a write this thread has to make.
-    submitted: bool,
+    submitted: Option<retirement::WindowWork>,
 }
 
 /// The stage the acquire semaphore is waited at, and therefore the stage the
@@ -767,7 +770,7 @@ impl WindowPresenter {
                     cmd,
                     image_available,
                     in_flight,
-                    submitted: false,
+                    submitted: None,
                 });
             }
             Ok(())
@@ -852,7 +855,7 @@ impl WindowPresenter {
     /// that is the only one the caller is about to record into.
     unsafe fn retire(&mut self, ctx: &DeviceContext) -> Result<bool, DrawError> {
         for ix in 0..self.frames.len() {
-            if !self.frames[ix].submitted {
+            if self.frames[ix].submitted.is_none() {
                 continue;
             }
             let signaled = ctx
@@ -864,7 +867,7 @@ impl WindowPresenter {
             }
             end_present_in_flight(&mut self.frames[ix]);
         }
-        Ok(!self.frames[self.frame_ix].submitted)
+        Ok(self.frames[self.frame_ix].submitted.is_none())
     }
 
     /// Block until every submitted entry's blit has finished.
@@ -883,7 +886,7 @@ impl WindowPresenter {
         let fences: Vec<vk::Fence> = self
             .frames
             .iter()
-            .filter(|frame| frame.submitted)
+            .filter(|frame| frame.submitted.is_some())
             .map(|frame| frame.in_flight)
             .collect();
         if fences.is_empty() {
@@ -1395,8 +1398,7 @@ impl WindowPresenter {
         let submission = submit_result?;
         // Claimed before the latch, so the slot is never observed clear while
         // the latch says an entry is outstanding.
-        begin_present_in_flight();
-        self.frames[frame_ix].submitted = true;
+        self.frames[frame_ix].submitted = Some(begin_present_in_flight());
         // Only a successful submit advances the ring; a `Busy` return above
         // leaves the slot for the next attempt.
         self.frame_ix = (frame_ix + 1) % self.frames.len();

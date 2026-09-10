@@ -1531,11 +1531,11 @@ pub struct ObjectList {
 }
 
 impl Task {
-    fn new(directory: DirectoryFrame) -> Self {
+    fn new(directory: DirectoryFrame, generations: namespace::Generations) -> Self {
         Self {
             directory,
             object_list: None,
-            namespace: Namespace::new(),
+            namespace: Namespace::with_generations(generations),
             heaps: Heaps::default(),
             resident: HashMap::new(),
         }
@@ -1581,6 +1581,7 @@ impl Task {
 pub struct Lifecycle {
     tasks: HashMap<TaskId, Task>,
     content: ContentLedger,
+    generations: namespace::Generations,
 }
 
 impl Lifecycle {
@@ -2031,7 +2032,8 @@ impl Lifecycle {
             }
             None => Effects::default(),
         };
-        self.tasks.insert(task, Task::new(directory));
+        self.tasks
+            .insert(task, Task::new(directory, self.generations.clone()));
         Ok(effects)
     }
 
@@ -2536,6 +2538,79 @@ mod tests {
             slot: ObjectListRef(slot),
             generation: SlotGeneration::default().next(),
         }
+    }
+
+    #[test]
+    fn resource_names_are_unique_across_task_lifetimes() {
+        use crate::resolve::TaskNamespaces as _;
+
+        let mut owner = Lifecycle::new();
+        let mut names = Vec::new();
+        for task in [TaskId(1), TaskId(2), TaskId(1)] {
+            let effects = owner
+                .apply(&LifecycleOp::DefineTask {
+                    task,
+                    kernel: false,
+                    directory: DirectoryFrame(0x1000 + task.0),
+                })
+                .expect("define task");
+            assert!(effects.storage_freed.is_empty());
+            apply_inert(
+                &mut owner,
+                &LifecycleOp::CreateResource {
+                    task,
+                    slot: ObjectListRef(7),
+                    storage: Storage::NoBytes,
+                },
+            );
+            let current = owner.resource(task, 7).expect("declared resource");
+            assert!(
+                !names.contains(&current),
+                "a device-wide pipeline table must not confuse tasks or task incarnations"
+            );
+            names.push(current);
+        }
+    }
+
+    #[test]
+    fn pipeline_readiness_and_retirement_are_isolated_between_tasks() {
+        use crate::identity::SessionGeneration;
+        use crate::pipeline::{PipelineState, PipelineTable};
+        use crate::resolve::TaskNamespaces as _;
+
+        let mut owner = Lifecycle::new();
+        let mut pipelines = PipelineTable::new();
+        let mut names = Vec::new();
+        for task in [TaskId(1), TaskId(2)] {
+            apply_inert(
+                &mut owner,
+                &LifecycleOp::DefineTask {
+                    task,
+                    kernel: false,
+                    directory: DirectoryFrame(task.0),
+                },
+            );
+            apply_inert(
+                &mut owner,
+                &LifecycleOp::CreateResource {
+                    task,
+                    slot: ObjectListRef(7),
+                    storage: Storage::NoBytes,
+                },
+            );
+            let name = owner.resource(task, 7).expect("declared pipeline");
+            assert!(pipelines.declare(name, SessionGeneration::FIRST));
+            names.push(name);
+        }
+        assert!(pipelines.advance(names[0], PipelineState::Translating));
+        assert!(pipelines.advance(names[0], PipelineState::Compiling));
+        assert!(pipelines.advance(names[0], PipelineState::Ready));
+        assert_eq!(pipelines.resting().ready, 1);
+        assert_eq!(pipelines.resting().pending(), 1);
+        assert!(pipelines.retire(names[0]));
+        assert!(pipelines.advance(names[1], PipelineState::Translating));
+        assert!(pipelines.advance(names[1], PipelineState::Compiling));
+        assert!(pipelines.advance(names[1], PipelineState::Ready));
     }
 
     /// One operation of every kind, so a sweep over the vocabulary is a sweep
@@ -5344,7 +5419,7 @@ mod tests {
             let mut live: HashMap<TaskId, HashMap<ObjectListRef, (ResourceId, BackingId)>> =
                 HashMap::new();
             let mut storage: HashMap<TaskId, HashMap<u64, BackingId>> = HashMap::new();
-            let mut generations: HashMap<(TaskId, ObjectListRef), SlotGeneration> = HashMap::new();
+            let mut generations: HashMap<ObjectListRef, SlotGeneration> = HashMap::new();
             let mut handed: Vec<Handed> = Vec::new();
             // Backings the ledger knew at the previous step. A backing
             // something still holds may not stop being known.
@@ -5607,7 +5682,7 @@ mod tests {
         op: &LifecycleOp,
         live: &mut HashMap<TaskId, HashMap<ObjectListRef, (ResourceId, BackingId)>>,
         storage: &mut HashMap<TaskId, HashMap<u64, BackingId>>,
-        generations: &mut HashMap<(TaskId, ObjectListRef), SlotGeneration>,
+        generations: &mut HashMap<ObjectListRef, SlotGeneration>,
         handed: &mut Vec<Handed>,
         census: &mut Census,
     ) {
@@ -5616,17 +5691,14 @@ mod tests {
                 if live.insert(*task, HashMap::new()).is_some() {
                     census.redefinitions += 1;
                 }
-                // A new namespace and new heaps: the generations restart with
-                // them, which is what makes a name from the previous
-                // definition refuse rather than resolve to its successor.
+                // Storage ends, but issued identities remain spent for the
+                // lifecycle, including after this task id is reused.
                 storage.insert(*task, HashMap::new());
-                generations.retain(|(t, _), _| t != task);
             }
             LifecycleOp::DeleteTask { task } => {
                 census.deleted_tasks += 1;
                 live.remove(task);
                 storage.remove(task);
-                generations.retain(|(t, _), _| t != task);
             }
             LifecycleOp::CreateResource {
                 task,
@@ -5634,9 +5706,9 @@ mod tests {
                 storage: what,
             } => {
                 let generation = generations
-                    .get(&(*task, *slot))
+                    .get(slot)
                     .map_or_else(|| SlotGeneration::default().next(), |g| g.next());
-                generations.insert((*task, *slot), generation);
+                generations.insert(*slot, generation);
                 let id = ResourceId {
                     slot: *slot,
                     generation,

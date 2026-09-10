@@ -2038,6 +2038,7 @@ fn the_host_gated_sampled_formats_are_the_ones_whose_bind_the_host_decides() {
         pixel_format::MTL_FORMAT_RGBA32_FLOAT,
         pixel_format::MTL_FORMAT_RGBA16_FLOAT,
         pixel_format::MTL_FORMAT_RG16_FLOAT,
+        pixel_format::MTL_FORMAT_R16_FLOAT,
         pixel_format::MTL_FORMAT_BC7_RGBA_UNORM,
     ] {
         assert!(

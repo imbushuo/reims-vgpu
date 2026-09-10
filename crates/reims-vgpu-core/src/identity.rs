@@ -201,14 +201,16 @@ pub struct SerializerRef {
 /// Work holds one of these and never a bare slot. A guest that deletes an
 /// object and creates another in the same slot produces a new generation, so
 /// work still holding the old id resolves to nothing rather than to the new
-/// object.
+/// object. A lifecycle shares generation counters across its task namespaces,
+/// so the same slot in another task or a replacement task cannot alias this id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceId {
     pub slot: ObjectListRef,
     pub generation: SlotGeneration,
 }
 
-/// How many times a namespace slot has been filled.
+/// How many times this slot number has been filled in its generation domain.
+/// A lifecycle's task namespaces share one domain.
 ///
 /// Wrapping is not a concern the way it is for a completion stamp: this counts
 /// creations of one object slot, and it is 64 bits.

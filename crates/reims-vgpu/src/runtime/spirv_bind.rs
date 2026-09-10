@@ -99,6 +99,21 @@ const IMAGE_SAMPLED_STORAGE: u32 = 2;
 /// SPIR-V `Decoration Binding`.
 const DECORATION_BINDING: u32 = 33;
 const HEADER_WORDS: usize = 5;
+
+/// SPV_EXT_fragment_shader_interlock's ordered/unordered per-pixel modes.
+/// These require the pixel-interlock device feature, not just storage writes.
+pub fn requires_pixel_interlock(words: &[u32]) -> bool {
+    let mut index = HEADER_WORDS;
+    while index < words.len() {
+        let count = (words[index] >> 16) as usize;
+        if count == 0 || count > words.len() - index { return false }
+        if words[index] & 0xffff == 16 && count >= 3 && matches!(words[index + 2], 5366 | 5367) {
+            return true;
+        }
+        index += count;
+    }
+    false
+}
 /// First binding of the translator's sampled-resource band, and therefore the
 /// exclusive end of its buffer band — the two are the same number because the
 /// bands abut.
@@ -2123,6 +2138,17 @@ pub fn offset_fragment_sampled_resource_bindings(words: &mut [u32]) -> usize {
     )
 }
 
+/// Storage descriptors occupy a separate translator band. Graphics stages
+/// have independent Metal argument tables, including their writable slots.
+pub fn offset_fragment_storage_bindings(words: &mut [u32]) -> usize {
+    relocate_by_class(
+        words,
+        &[BindingClass::StorageTexture],
+        |binding| M2V_DEFAULT_DESCRIPTOR_LAYOUT.storage_textures.contains(binding),
+        FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Reflection-derived reflectors (single source of truth) + divergence census
 // ---------------------------------------------------------------------------
@@ -2221,7 +2247,7 @@ pub fn reflected_storage_image_format(
 /// SPIR-V has no such ambiguity — [`widen_sampled_bands`] separated the two —
 /// but a lookup into reflection still has to say which one it meant, and the
 /// kind is the field that says it.
-fn is_texture_kind(kind: ResourceKind) -> bool {
+pub(crate) fn is_texture_kind(kind: ResourceKind) -> bool {
     matches!(
         kind,
         ResourceKind::Texture
@@ -2341,7 +2367,7 @@ pub fn reflected_sampler_binding(
 ) -> Option<u32> {
     if !matches!(
         resource.kind,
-        ResourceKind::Sampler | ResourceKind::StaticSampler
+        ResourceKind::Sampler | ResourceKind::StaticSampler | ResourceKind::SynthesizedReadSampler
     ) {
         return None;
     }
@@ -2354,13 +2380,32 @@ pub fn reflected_sampler_binding(
     })
 }
 
-/// One sampler in the executable descriptor interface. `static_state` is the
-/// exact AIR constexpr state; `None` means the guest supplies a sampler object
-/// or the runtime provisions the neutral default when that slot is unbound.
+/// Who supplies the state at one executable sampler binding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ReflectedSamplerSource {
+    Guest,
+    Static(metal2vulkan::reflect::StaticSamplerState),
+    /// The translator's sampler-less read placeholder has no Metal table slot.
+    SynthesizedRead,
+}
+
+/// One sampler in the executable descriptor interface. A compiler-owned
+/// binding must not be overridden by an unrelated guest sampler-table entry.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReflectedSamplerDescriptor {
     pub binding: u32,
-    pub static_state: Option<metal2vulkan::reflect::StaticSamplerState>,
+    pub source: ReflectedSamplerSource,
+}
+
+impl ReflectedSamplerDescriptor {
+    pub fn guest_supplied(self) -> bool { matches!(self.source, ReflectedSamplerSource::Guest) }
+
+    pub fn static_state(self) -> Option<metal2vulkan::reflect::StaticSamplerState> {
+        match self.source {
+            ReflectedSamplerSource::Static(state) => Some(state),
+            _ => None,
+        }
+    }
 }
 
 /// Every sampler descriptor declared by a reflected shader, transformed into
@@ -2374,14 +2419,14 @@ pub fn reflected_sampler_descriptors(
         .bindings
         .iter()
         .filter_map(|resource| {
-            reflected_sampler_binding(resource, fragment_relocated).map(|binding| {
-                ReflectedSamplerDescriptor {
-                    binding,
-                    static_state: (resource.kind == ResourceKind::StaticSampler)
-                        .then_some(resource.static_sampler)
-                        .flatten(),
-                }
-            })
+            let binding = reflected_sampler_binding(resource, fragment_relocated)?;
+            let source = match resource.kind {
+                ResourceKind::Sampler => ReflectedSamplerSource::Guest,
+                ResourceKind::StaticSampler => ReflectedSamplerSource::Static(resource.static_sampler?),
+                ResourceKind::SynthesizedReadSampler => ReflectedSamplerSource::SynthesizedRead,
+                _ => return None,
+            };
+            Some(ReflectedSamplerDescriptor { binding, source })
         })
         .collect();
     descriptors.sort_by_key(|descriptor| descriptor.binding);
@@ -2431,8 +2476,8 @@ pub fn reflected_texture_descriptor(
     )
 }
 
-/// First texture descriptor that cannot be exposed through a sampled-image
-/// render binding. Compute has a storage-image request path; render does not.
+/// First texture descriptor that needs storage-image handling or an explicit
+/// unknown-access refusal rather than an ordinary sampled-image binding.
 pub fn first_non_sampled_texture_descriptor(
     reflection: &ShaderReflection,
 ) -> Option<(u32, ReflectedTextureDescriptor)> {
@@ -3868,6 +3913,35 @@ mod more_tests {
         DescriptorLayout, DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection,
         ShaderStage, REFLECTION_VERSION,
     };
+
+    #[test]
+    fn graphics_storage_relocation_leaves_sampled_and_color_input_bands_alone() {
+        let mut words = module_header();
+        // A scalar storage image at the first storage descriptor, its pointer
+        // and variable. The relocation class comes from OpTypeImage Sampled=2.
+        words[3] = 8;
+        words.extend_from_slice(&[
+            (4 << 16) | 71, 3, 33, M2V_DEFAULT_DESCRIPTOR_LAYOUT.storage_textures.start,
+            (4 << 16) | 71, 4, 33, COLOR_INPUT_BINDING_BASE,
+            (9 << 16) | 25, 1, 7, 1, 0, 0, 0, 2, 2,
+            (4 << 16) | 32, 2, 0, 1,
+            (4 << 16) | 59, 2, 3, 0,
+        ]);
+        assert_eq!(offset_fragment_storage_bindings(&mut words), 1);
+        let bindings = declared_binding_numbers(&words);
+        assert!(bindings.contains(&(M2V_DEFAULT_DESCRIPTOR_LAYOUT.storage_textures.start
+            + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET)));
+        assert!(bindings.contains(&COLOR_INPUT_BINDING_BASE));
+    }
+
+    #[test]
+    fn graphics_storage_pixel_interlock_requires_its_distinct_capability() {
+        let mut words = module_header();
+        words.extend_from_slice(&[(3 << 16) | 16, 1, 5366]);
+        assert!(requires_pixel_interlock(&words));
+        *words.last_mut().unwrap() = 7; // OriginUpperLeft is not an interlock.
+        assert!(!requires_pixel_interlock(&words));
+    }
 
     fn empty_reflection(stage: ShaderStage) -> ShaderReflection {
         ShaderReflection {

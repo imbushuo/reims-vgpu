@@ -194,7 +194,8 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
         "registry_pressure (levels, not per-interval) current={}/{}mib \
          recoverable={}/{}mib pinned={}/{}mib peak={} peak_mib={} \
          resident_samples={} resample_peak_ms={}/{} \
-         slab_mib={}/{} sole_copy={}/{}mib cs_sole_copy={}/{}mib",
+         slab_mib={}/{} sole_copy={}/{}mib cs_sole_copy={}/{}mib \
+         pass_local={}/{}bytes pass_local_retiring={}/{}bytes",
         now.registry_current_count,
         now.registry_current_bytes >> 20,
         now.registry_recoverable_count,
@@ -212,6 +213,10 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
         now.registry_sole_copy_peak_bytes >> 20,
         now.compute_storage_sole_copy_peak,
         now.compute_storage_sole_copy_peak_bytes >> 20,
+        now.registry_pass_local_count,
+        now.registry_pass_local_bytes,
+        now.pass_local_retiring_count,
+        now.pass_local_retiring_bytes,
     ));
 }
 

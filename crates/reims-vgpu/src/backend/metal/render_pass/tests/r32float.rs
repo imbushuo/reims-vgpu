@@ -71,16 +71,14 @@ fn memoryless_secondary_blending_is_independent_of_color_zero() {
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn memoryless_r32float_still_refuses_the_vulkan_rail() {
-    let mut req = request();
-    req.colors[0].format = MTLPixelFormat::R32Float as u16;
-    let mut state = DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_ARM64E);
-    let mut host = crate::runtime::host::FakeHost::new();
-    let result = crate::runtime::draw::vulkan::encode_draw_chain(
-        &mut state, &mut host, &mut req, true, false,
-    );
-    assert!(matches!(result.0, EncodeStatus::BadArgs("draw_vk_memoryless_unsupported")));
-    assert!(result.1.is_none());
+fn memoryless_r32float_vulkan_preserves_native_format_without_admitting_guest_store() {
+    let format = MTLPixelFormat::R32Float as u16;
+    let attachment = crate::backend::vulkan::translate::pixel::memoryless_color_attachment(format)
+        .unwrap();
+    assert_eq!(attachment.vk, ash::vk::Format::R32_SFLOAT);
+    assert_eq!(attachment.clear_value([2.0000009536743164, 0.0, 0.0, 1.0]),
+        crate::backend::vulkan::engine::ColorClearValue::Float([2.0000009536743164f32, 0.0, 0.0, 1.0]));
+    assert!(crate::backend::vulkan::translate::pixel::color_attachment(format).is_err());
 }
 
 #[test]

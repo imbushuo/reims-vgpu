@@ -27,7 +27,58 @@ use crate::model::ComputeStorageResidencyKey;
 pub(crate) struct TargetKey {
     pub width: u32,
     pub height: u32,
+    pub format: vk::Format,
     pub with_transfer_dst: bool,
+}
+
+impl TargetKey {
+    fn image_info(self) -> vk::ImageCreateInfo<'static> {
+        vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(self.format)
+            .extent(vk::Extent3D { width: self.width, height: self.height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::INPUT_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | if self.with_transfer_dst {
+                    vk::ImageUsageFlags::TRANSFER_DST
+                } else {
+                    vk::ImageUsageFlags::empty()
+                })
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+    }
+
+    fn view_info(self, image: vk::Image) -> vk::ImageViewCreateInfo<'static> {
+        vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(self.format)
+            .subresource_range(color_subresource_range())
+    }
+}
+
+#[cfg(test)]
+mod target_format_tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_target_image_and_view_keep_the_declared_native_attachment_format() {
+        let mut keys = std::collections::HashSet::new();
+        for format in [vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM,
+            vk::Format::R8G8B8A8_SRGB, vk::Format::B8G8R8A8_SRGB,
+            vk::Format::R16G16B16A16_SFLOAT, vk::Format::R32_SFLOAT]
+        {
+            let key = TargetKey { width: 64, height: 32, format, with_transfer_dst: true };
+            assert!(keys.insert(key), "format must partition pooled targets");
+            assert_eq!(key.image_info().format, format);
+            assert_eq!(key.view_info(vk::Image::null()).format, format);
+            assert!(key.image_info().usage.contains(vk::ImageUsageFlags::TRANSFER_DST));
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -561,7 +612,7 @@ pub(crate) struct ResourcePools {
     /// instant can still reference it. Clearing a slot's bit as it retires
     /// therefore frees the handle on the last fence that could be reading it,
     /// not on the whole ring going idle.
-    graveyard: Vec<(SlotMask, DeferredHandle)>,
+    graveyard: Vec<GraveyardEntry>,
     /// Resident-target recycle pool: images displaced from the identity registry
     /// (generation bump / geometry change / LRU), held by (geometry, format) for
     /// reuse instead of destroyed. Kills the per-frame `vkCreateImage`+
@@ -1225,12 +1276,48 @@ pub(crate) fn window_source_epoch() -> u64 {
 
 pub(crate) type SlotMask = u32;
 
+struct GraveyardEntry {
+    waiting: SlotMask,
+    handle: DeferredHandle,
+    #[cfg(feature = "host-window")]
+    window: super::window_present::WindowRetirement,
+}
+
+impl GraveyardEntry {
+    fn new(waiting: SlotMask, handle: DeferredHandle) -> Self {
+        #[cfg(feature = "host-window")]
+        let (waiting, window) = {
+            let window = super::window_present::window_retirement();
+            let waiting = (waiting & !WINDOW_PRESENT_SLOT)
+                | if window.is_complete() { 0 } else { WINDOW_PRESENT_SLOT };
+            (waiting, window)
+        };
+        Self { waiting, handle, #[cfg(feature = "host-window")] window }
+    }
+
+    fn advance(&mut self, retired: SlotMask) {
+        if retired == SlotMask::MAX {
+            // Explicit quiesced-device teardown may release every dependency.
+            self.waiting = 0;
+            return;
+        }
+        self.waiting &= !retired;
+        #[cfg(feature = "host-window")]
+        if self.window.is_complete() {
+            self.waiting &= !WINDOW_PRESENT_SLOT;
+        } else {
+            // Ring retirement cannot substitute for these presents' fences.
+            self.waiting |= WINDOW_PRESENT_SLOT;
+        }
+    }
+}
+
 /// The [`SlotMask`] bit standing for "a host-window present is submitted and not
 /// yet retired", rather than for one of the engine's command-buffer slots.
 ///
 /// The top bit, so it cannot collide with a slot index however `RING_DEPTH`
 /// grows — and the assertion below is what keeps that true rather than the
-/// choice of bit. [`super::window_present::WINDOW_PRESENTS_IN_FLIGHT`] carries
+/// choice of bit. [`super::window_present::window_retirement`] carries
 /// why the window needs a bit at all.
 #[cfg(feature = "host-window")]
 pub(crate) const WINDOW_PRESENT_SLOT: SlotMask = 1 << (SlotMask::BITS - 1);
@@ -1267,6 +1354,14 @@ pub(crate) enum DeferredHandle {
         image: vk::Image,
         view: vk::ImageView,
         memory: vk::DeviceMemory,
+    },
+    /// Ended memoryless storage held only by unfinished GPU work, never by a
+    /// recycler. The footprint excludes allocation padding, like the registry.
+    PassLocalImage {
+        image: vk::Image,
+        view: vk::ImageView,
+        memory: vk::DeviceMemory,
+        attachment_bytes: u64,
     },
     GuestImage {
         image: vk::Image,
@@ -1315,7 +1410,9 @@ impl DeferredHandle {
     /// one, which is the only thing that makes this total.
     fn destroyed_view(&self) -> Option<vk::ImageView> {
         match self {
-            Self::Image { view, .. } | Self::GuestImage { view, .. } => Some(*view),
+            Self::Image { view, .. }
+            | Self::PassLocalImage { view, .. }
+            | Self::GuestImage { view, .. } => Some(*view),
             Self::RecycleSampled(slot) => Some(slot.view),
             Self::RecycleTarget(img) => Some(img.view),
             Self::ImageView(view) => Some(*view),
@@ -1349,6 +1446,12 @@ impl ResourcePools {
                 image,
                 view,
                 memory,
+            }
+            | DeferredHandle::PassLocalImage {
+                image,
+                view,
+                memory,
+                ..
             } => {
                 // Destroy the image before releasing its memory: `free_image`
                 // may `vkFreeMemory` the whole block if this was its last live
@@ -1693,6 +1796,9 @@ struct ResidentSampledSlot {
 /// exactly width × height.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct StorageImageKey {
+    /// Storage images with sampled aliases require both usage bits. The pool
+    /// key keeps them separate from compute's storage-only allocations.
+    pub sampled_alias: bool,
     pub width: u32,
     pub height: u32,
     pub format: StorageImageFormat,
@@ -1922,6 +2028,7 @@ pub(crate) struct RegistryLevels {
     pub current: NonPinnedTotals,
     pub recoverable: NonPinnedTotals,
     pub pinned: NonPinnedTotals,
+    pub pass_local: NonPinnedTotals,
 }
 
 /// Where a registry-resident image sits, and what put it there, as one value.

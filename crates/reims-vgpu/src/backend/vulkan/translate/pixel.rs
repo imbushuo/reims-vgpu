@@ -114,6 +114,21 @@ pub fn color_attachment(
     Ok((ColorAttachmentFormat { vk, numeric }, None))
 }
 
+/// Native pass-local storage has no guest Store converter. In particular,
+/// admitting R32Float here must not admit an ordinary guest-backed Store.
+pub(crate) fn memoryless_color_attachment(mtl: u16) -> Result<ColorAttachmentFormat, TranslateReason> {
+    reims_vgpu_protocol::memoryless::color_target_bpp(mtl)
+        .ok_or(TranslateReason::NoColorAttachmentFormat(mtl))?;
+    if mtl == pixel_format::MTL_FORMAT_R32_FLOAT {
+        Ok(ColorAttachmentFormat {
+            vk: rail::translate(mtl).map_err(declined)?.vk,
+            numeric: pixel_format::ColorNumericType::Float,
+        })
+    } else {
+        color_attachment(mtl).map(|(format, _)| format)
+    }
+}
+
 /// A colour-renderable Metal format translated together with the numeric type
 /// its clear value must use.
 ///

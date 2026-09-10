@@ -13,32 +13,6 @@
 use super::*;
 use crate::runtime::draw::vulkan::gva_span_identity;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ComputeRoundingUnsupported {
-    mode: TextureWriteRoundingMode,
-}
-
-impl crate::observe::Decline for ComputeRoundingUnsupported {
-    fn slug(&self) -> &'static str {
-        "compute_vk_texture_write_rounding_unsupported"
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        vec![("mode", self.mode.word().to_string())]
-    }
-}
-
-pub(crate) fn validate_texture_write_rounding(
-    mode: TextureWriteRoundingMode,
-) -> Result<(), ComputeRoundingUnsupported> {
-    match mode {
-        TextureWriteRoundingMode::Default => Ok(()),
-        TextureWriteRoundingMode::TowardZero | TextureWriteRoundingMode::ToNearestEven => {
-            Err(ComputeRoundingUnsupported { mode })
-        }
-    }
-}
-
 /// The sampled-image bindings that need a neutral texture: those the module
 /// statically uses and `bound` does not cover.
 ///
@@ -309,6 +283,7 @@ pub(super) fn mapper_ref_texture_destination<M: HostMemory + HostOps>(
 /// [`RailStage`]: crate::runtime::compute_exec::RailStage
 #[derive(Debug, Default)]
 pub(crate) struct VulkanStage {
+    pub(crate) planar: Option<crate::backend::vulkan::planar::Image>,
     /// Which element of the descriptor binding's array this fills.
     pub(crate) array_element: u32,
     /// How many descriptors the binding declares.
@@ -342,6 +317,19 @@ pub(crate) struct VulkanStage {
 }
 
 impl RailStage for VulkanStage {
+    fn supports_planar_samples() -> bool { true }
+
+    fn stage_planar(
+        _texture_ref: u32,
+        description: crate::protocol::planar::TextureDescription,
+        layout: crate::protocol::planar::Layout,
+        planes: [Vec<u8>; 2],
+    ) -> Result<Self, ComputeStatus> {
+        let image = crate::backend::vulkan::planar::Image::expand(description, layout, planes)
+            .map_err(|error| ComputeStatus::Unsupported(error.slug()))?;
+        Ok(Self { planar: Some(image), descriptor_count: 1, ..Self::default() })
+    }
+
     /// The guest ref is not kept: this rail reaches its images through the
     /// engine's own registry and never names the object the guest bound.
     fn stage(
@@ -350,6 +338,7 @@ impl RailStage for VulkanStage {
         serve: Option<ResidentServe>,
     ) -> Self {
         Self {
+            planar: None,
             array_element: 0,
             descriptor_count: 1,
             residency,
@@ -525,15 +514,6 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let Some(pipeline) = load_compute_pipeline(state, host, task_id, acc.pipeline_ref) else {
         return ComputeStatus::MissingPipeline("compute_vk_pipeline_load");
     };
-    // Neither Vulkan image writes nor metal2vulkan currently implement this
-    // descriptor specialization. Compiling the default would run another program.
-    if let Err(reason) = validate_texture_write_rounding(pipeline.texture_write_rounding_mode) {
-        crate::observe::Emit::decline("compute_linux_pipeline", &reason)
-            .field("task", task_id)
-            .field("pipe", acc.pipeline_ref)
-            .fail();
-        return ComputeStatus::Unsupported(crate::observe::Decline::slug(&reason));
-    }
     if let Some(stage_input) = pipeline.stage_input.as_ref() {
         if crate::observe::first_sight("compute_stage_input_contract", u64::from(acc.pipeline_ref))
         {
@@ -981,6 +961,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         });
     }
     let mut sampled_images = Vec::with_capacity(sampled_count);
+    let mut planar_q11_bindings = Vec::new();
     let mut storage_images = Vec::with_capacity(storage_count);
     let mut storage_formats = Vec::with_capacity(storage_count);
     // Device support for format-less storage writes decides whether a guest
@@ -1028,32 +1009,35 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         };
         storage_formats.push((t.binding, guest_fmt, shader_decl, specialized));
     }
-    let specialization_requests: Vec<_> = storage_formats
-        .iter()
-        .map(|(binding, _, _, specialized)| (*binding, *specialized))
-        .collect();
-    if let Err(error) =
-        crate::runtime::spirv_bind::specialize_image_formats(&mut spirv, &specialization_requests)
-    {
-        let error: crate::runtime::spirv_bind::ImageFormatSpecializeError = error;
-        crate::observe::Emit::decline("compute_linux_storage_format", &error)
-            .field("pipe", acc.pipeline_ref)
-            .fail();
-        return ComputeStatus::Unsupported("storage_format_specialize_error");
-    }
-    // A guest BGRA8Unorm storage surface retargets to an `Unknown`-format
-    // storage image (viewed B8G8R8A8_UNORM) so the composite writes land in the
-    // guest's channel order — that write is only legal if the module declares
-    // `StorageImageWriteWithoutFormat`. Inject it once when any binding took the
-    // Unknown path (idempotent; the translator declares only Shader/Float16/…).
-    if storage_formats.iter().any(|(_, _, _, specialized)| {
-        matches!(
-            specialized,
-            crate::runtime::spirv_bind::ImageFormat::Unknown
-        )
-    }) {
-        crate::runtime::spirv_bind::ensure_storage_write_without_format_capability(&mut spirv);
-    }
+    // The image view is now known. Mode-dependent conversion cannot be chosen from AIR's generic
+    // float texture declaration, and changing a TypeImage token alone cannot implement rounding.
+    let options = crate::runtime::m2v_cache::ComputeTextureOptions {
+        rounding_mode: pipeline.texture_write_rounding_mode,
+        // This compatibility profile's source-native half write contract is RTZ, calibrated
+        // against the native Metal oracle. The private descriptor property does not override AIR
+        // write intrinsics; `.rte` remains RTE and an unqualified write remains source-native.
+        native_rounding_mode: metal2vulkan::texture_write_rounding::TextureWriteRoundingMode::TowardZero,
+        image_formats: storage_formats.iter()
+            .map(|(binding, _, _, specialized)| (*binding, *specialized)).collect(),
+        rounding_targets: storage_formats.iter().filter_map(|(binding, guest, _, specialized)| {
+            // SPIR-V has no BGRA token. Its formatless view still has a concrete numeric encoding.
+            (*specialized == crate::runtime::spirv_bind::ImageFormat::Unknown
+                && *guest == vk_engine::StorageImageFormat::Bgra8Unorm).then_some(
+                metal2vulkan::texture_write_rounding::TextureWriteTarget {
+                    descriptor_set: 0,
+                    binding: *binding,
+                    format: metal2vulkan::texture_write_rounding::TextureWriteFormat::Normalized,
+                })
+        }).collect(),
+    };
+    spirv = match kernel_shader.compute_texture_variant(options) {
+        Ok(words) => (*words).clone(),
+        Err(reason) => {
+            crate::observe::Emit::decline("compute_linux_storage_format", &reason)
+                .field("pipe", acc.pipeline_ref).fail();
+            return ComputeStatus::Unsupported(crate::observe::Decline::slug(&reason));
+        }
+    };
     // Compute-side analog of the render resident gates: a deferred storage
     // writeback leaves guest-visible bytes GPU-resident-only until a flush
     // choke point lands them, so it requires the device's
@@ -1167,6 +1151,20 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     .is_some(),
             });
         } else {
+            if let Some(image) = t.rail.planar.take() {
+                if t.rail.descriptor_count != 1 || t.rail.array_element != 0 {
+                    return ComputeStatus::Unsupported("vulkan_planar_shader_descriptor_array");
+                }
+                if image.format == crate::protocol::planar::SampleFormat::Ycbcr10_420TwoPlane {
+                    planar_q11_bindings.push(t.binding);
+                }
+                sampled_images.push(ComputeSampledImageResource {
+                    binding: t.binding, array_element: 0, descriptor_count: 1,
+                    format: image.engine_format(), width: image.width, height: image.height,
+                    mip_levels: 1, source: ComputeSampledSource::Bytes(image.bytes),
+                });
+                continue;
+            }
             let Some(sampled_fmt) = mtl_to_engine_sampled(t.pixel_format) else {
                 crate::observe::fail(format!(
                     "compute_linux sampled_format fail reason=mtl_format_unsupported pipe={} bind={} fmt={:#x}",
@@ -1257,7 +1255,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         let binding = crate::runtime::spirv_bind::SAMPLER_BINDING_BASE + s.index;
         if reflected_samplers
             .binary_search_by_key(&binding, |sampler| sampler.binding)
-            .is_err()
+            .ok().is_none_or(|index| !reflected_samplers[index].guest_supplied())
         {
             continue;
         }
@@ -1287,7 +1285,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             .iter()
             .any(|sampler| sampler.binding == reflected.binding)
         {
-            if let Some(state) = reflected.static_state {
+            if let Some(state) = reflected.static_state() {
                 let sampler = match crate::runtime::draw::vulkan::reflected_static_sampler_resource(
                     "kernel",
                     reflected.binding,
@@ -1314,6 +1312,14 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     }
 
+    if !planar_q11_bindings.is_empty() || samplers.iter().any(|s| s.unnormalized_coordinates) {
+        spirv = match crate::backend::vulkan::sampled_shader::specialize(
+            &spirv, &planar_q11_bindings, &samplers,
+        ) {
+            Ok(words) => words,
+            Err(error) => return ComputeStatus::Unsupported(error.slug()),
+        };
+    }
     let req = ComputeRequest {
         spirv,
         entry: "main".into(),
@@ -1640,7 +1646,7 @@ pub(super) fn mtl_to_engine_sampled(
     crate::backend::vulkan::translate::pixel::sampled_image(format).ok()
 }
 
-pub(super) fn spirv_image_format_to_engine_storage(
+pub(crate) fn spirv_image_format_to_engine_storage(
     format: crate::runtime::spirv_bind::ImageFormat,
 ) -> Option<crate::backend::vulkan::engine::StorageImageFormat> {
     use crate::backend::vulkan::engine::StorageImageFormat as V;
@@ -1696,7 +1702,7 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
     }
 }
 
-pub(super) fn specialized_storage_image_format(
+pub(crate) fn specialized_storage_image_format(
     guest: crate::backend::vulkan::engine::StorageImageFormat,
     shader: crate::runtime::spirv_bind::ImageFormat,
     write_without_format: bool,
@@ -2009,6 +2015,7 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
             residency: None,
             serve: None,
             multisample_target: Some(identity),
+            planar: None,
         },
     })
 }

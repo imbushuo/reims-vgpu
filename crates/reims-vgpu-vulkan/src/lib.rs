@@ -95,6 +95,7 @@ pub mod census;
 pub mod depth_stencil;
 pub mod descriptor;
 pub mod device;
+pub mod framebuffer_fetch;
 pub mod frames;
 pub mod host;
 pub mod image;

@@ -793,12 +793,13 @@ pub(crate) struct NativeUploads {
     /// channels in the order the guest stored them, instead of running a
     /// full-image CPU channel swap.
     pub bgra8: bool,
-    /// Upload guest half-float colour (`RGBA16Float`, `RG16Float`) at its own
-    /// eight- or four-byte footprint, as `R16G16B16A16_SFLOAT` /
-    /// `R16G16_SFLOAT`. Unlike the BGRA8 case this is not a saved pass — it is
-    /// the only exact path. The CPU arm for these goes through
+    /// Upload guest half-float colour (`RGBA16Float`, `RG16Float`, `R16Float`)
+    /// at its own eight-, four- or two-byte footprint. Unlike the BGRA8 case
+    /// this is not a saved pass — it is the only exact path. The CPU arm for
+    /// multi-channel half layouts goes through
     /// `f16_to_unorm8_lut`, which clamps to `[0, 1]` and quantizes to 256
     /// levels; see [`pixel_format::TexelLayout::cpu_loader_arm_is_lossy`].
+    /// Scalar half has no CPU conversion arm and must be native or refused.
     pub float16: bool,
     /// Upload the guest's BC (DXT / S3TC) blocks verbatim as the matching
     /// `VK_FORMAT_BC*_BLOCK`.
@@ -940,6 +941,7 @@ pub(crate) fn linear_native_upload_format(
         SampledClass::Bgra8Unorm if native.bgra8 => TexelLayout::Bgra8,
         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
+        SampledClass::R16Float if native.float16 => TexelLayout::R16Float,
         SampledClass::Rgba32Float if native.float32 => TexelLayout::Rgba32Float,
         // Ungated, like `Rgba8Unorm` and unlike every layout above it. Vulkan
         // mandates `SAMPLED_IMAGE` for `R16G16_UINT`, and the one capability

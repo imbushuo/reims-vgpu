@@ -546,11 +546,10 @@ pub(crate) struct PassKey {
     /// pass); the depth attachment is always appended AFTER color + secondaries
     /// so slot 0 stays the primary color (the zero-copy readback assumes this).
     pub depth: Option<DepthAttachKey>,
-    /// Attachment 0 is ALSO referenced as a subpass input (framebuffer fetch).
-    /// Both references use GENERAL layout and the subpass carries a BY_REGION
-    /// self-dependency — the Vulkan feedback-loop form MoltenVK lowers to Metal
-    /// programmable blending. `false` keeps the pass byte-identical.
-    pub color_input: bool,
+    /// Bit N references attachment N as a subpass input (framebuffer fetch).
+    /// Inputs retain their attachment indices, even when earlier slots are not
+    /// fetched. Ordered color access is enabled only on capable Vulkan devices.
+    pub color_input: u8,
     /// Bit N says colour attachment N is also sampled through
     /// `VK_EXT_attachment_feedback_loop_layout`. The decoded render pass has at
     /// most eight colour attachments, so the wire-derived attachment table is
@@ -563,6 +562,27 @@ pub(crate) struct PassKey {
     pub multisample_resolve: bool,
 }
 
+#[cfg(test)]
+mod memoryless_tests {
+    use super::*;
+
+    #[test]
+    fn memoryless_secondary_fetch_preserves_input_attachment_indices() {
+        let mut key = PassKey::single(Color0Load::Clear, vk::Format::R32G32B32A32_SFLOAT);
+        key.secondary_count = 1;
+        key.secondary[0].format = vk::Format::R32_SFLOAT;
+        key.color_input = 2;
+        let refs = key.color_input_references();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].attachment, vk::ATTACHMENT_UNUSED);
+        assert_eq!(refs[1].attachment, 1);
+        assert_eq!(refs[1].layout, vk::ImageLayout::GENERAL);
+        let mut other = key;
+        other.color_input = 1;
+        assert_ne!(key.framebuffer_compatibility(), other.framebuffer_compatibility());
+    }
+}
+
 impl PassKey {
     /// Single-color-attachment pass (the pre-MRT constructor).
     pub(crate) fn single(color0_load: Color0Load, color0_format: ash::vk::Format) -> Self {
@@ -573,11 +593,25 @@ impl PassKey {
             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
             secondary_count: 0,
             depth: None,
-            color_input: false,
+            color_input: 0,
             feedback_colors: 0,
             sample_count: 1,
             multisample_resolve: false,
         }
+    }
+
+    /// InputAttachmentIndex is the guest color slot, not a compact index into
+    /// the fetched subset. Holes stay UNUSED so dest_1 cannot read color zero.
+    fn color_input_references(self) -> Vec<vk::AttachmentReference> {
+        let count = u8::BITS - self.color_input.leading_zeros();
+        (0..count).map(|slot| {
+            if self.color_input & (1 << slot) != 0 {
+                vk::AttachmentReference::default().attachment(slot).layout(self.color_layout(slot as usize))
+            } else {
+                vk::AttachmentReference::default().attachment(vk::ATTACHMENT_UNUSED)
+                    .layout(vk::ImageLayout::UNDEFINED)
+            }
+        }).collect()
     }
 
     pub(crate) fn color_feedback(self, index: usize) -> bool {
@@ -646,7 +680,8 @@ impl PassKey {
     pub(crate) fn color_layout(self, index: usize) -> vk::ImageLayout {
         if self.color_feedback(index) {
             color_feedback_layout()
-        } else if index == 0 && (self.color_input || self.host_accessible_color0) {
+        } else if (index < 8 && self.color_input & (1 << index) != 0)
+            || (index == 0 && self.host_accessible_color0) {
             vk::ImageLayout::GENERAL
         } else {
             // The same layout the pass exits at, so an ordinary pass performs no
@@ -1862,6 +1897,11 @@ impl ObjectCaches {
         counters: &EngineCounters,
         pools: &mut ResourcePools,
     ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
+        if crate::runtime::spirv_bind::requires_pixel_interlock(words)
+            && !ctx.features.fragment_shader_pixel_interlock
+        {
+            return Err(super::graphics_storage::GraphicsStorageDecline::PixelInterlockUnsupported.into());
+        }
         // Declare the storage-image capabilities this module's own contents
         // require, before it is keyed or validated.
         //
@@ -2255,17 +2295,20 @@ impl ObjectCaches {
                 .attachment(index)
                 .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
         });
-        let input_ref = [vk::AttachmentReference::default()
-            .attachment(0)
-            .layout(key.color_layout(0))];
+        let input_ref = key.color_input_references();
         let mut subpass_desc = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_ref);
         if !resolve_ref.is_empty() {
             subpass_desc = subpass_desc.resolve_attachments(&resolve_ref);
         }
-        if key.color_input {
+        if key.color_input != 0 {
             subpass_desc = subpass_desc.input_attachments(&input_ref);
+            if ctx.features.rasterization_order_color_access {
+                subpass_desc = subpass_desc.flags(
+                    vk::SubpassDescriptionFlags::RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_EXT,
+                );
+            }
         }
         if let Some(depth_ref) = &depth_ref {
             subpass_desc = subpass_desc.depth_stencil_attachment(depth_ref);
@@ -2274,22 +2317,15 @@ impl ObjectCaches {
         // Framebuffer-fetch feedback loop: the same-pixel color-write →
         // input-read ordering within the one subpass. BY_REGION keeps it
         // framebuffer-local (the form MoltenVK lowers to tile-memory fetch).
-        let fetch_dep = vk::SubpassDependency::default()
-            .src_subpass(0)
-            .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::INPUT_ATTACHMENT_READ)
-            .dependency_flags(vk::DependencyFlags::BY_REGION);
+        let fetch_dep = reims_vgpu_vulkan::framebuffer_fetch::dependency();
         let mut deps: Vec<vk::SubpassDependency> = external_dependencies(
             key.depth.is_some(),
-            key.color_input,
+            key.color_input != 0,
             key.host_accessible_color0,
             pass_exit_scope_narrow(),
         )
         .to_vec();
-        if key.color_input {
+        if key.color_input != 0 {
             deps.push(fetch_dep);
         }
         deps.push(color_feedback_self_dependency(key.color_layout(0)));
@@ -2342,13 +2378,10 @@ impl ObjectCaches {
         //
         // # What this is measuring, and why it is not a decline
         //
-        // `VUID-vkCmdDispatch-None-08610`/`-08611` forbid an unnormalized
-        // sampler being *used* by an implicit-LOD, `Proj`, `Dref`, `Bias` or
-        // `Offset` sample, and `-08611` is the one violation a driven macos-11
-        // boot under the Khronos validation layer still reports after every
-        // other one here was fixed. That is a property of the SPIR-V
-        // instruction, so this device cannot repair it — but it can say which
-        // samplers are candidates.
+        // `VUID-vkCmdDispatch-None-08610`/`-08611` also restrict the SPIR-V
+        // instructions using an unnormalized sampler. The final sampled-shader
+        // owner lowers pixel offsets and zero bias without changing coordinate
+        // units; this sampler-state plan alone cannot establish that legality.
         //
         // # The VUID is real and it is **not** what hangs this GPU
         //
@@ -2815,7 +2848,10 @@ impl ObjectCaches {
         // `reims_vgpu_vulkan::blend` performs it, above.
         let blend_att: Vec<vk::PipelineColorBlendAttachmentState> =
             blend_plans.iter().map(|p| p.native()).collect();
-        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_att);
+        let mut blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_att);
+        if key.pass.0.color_input != 0 && ctx.features.rasterization_order_color_access {
+            blend = blend.flags(vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT);
+        }
         // Depth-stencil state: attached ONLY when the pass carries a depth
         // attachment (Vulkan requires the pipeline's depth-stencil state to be
         // consistent with the subpass). Without it the color-only pipeline is
@@ -3198,7 +3234,7 @@ mod object_cache_tests {
         assert_ne!(clear.compatibility(), different_format.compatibility());
 
         let mut different_subpass = load;
-        different_subpass.color_input = true;
+        different_subpass.color_input = 1;
         assert_ne!(clear.compatibility(), different_subpass.compatibility());
 
         let mut different_depth = load;
@@ -3273,7 +3309,7 @@ mod object_cache_tests {
             ),
             (
                 "color input",
-                |k| k.color_input = true,
+                |k| k.color_input = 1,
                 Some(PassCompatField::ColorInput),
             ),
             // Feedback is a property of the draw, and it makes two passes
@@ -3335,7 +3371,7 @@ mod object_cache_tests {
         assert_ne!(plain.compatibility(), transported.compatibility());
 
         let mut input = transported;
-        input.color_input = true;
+        input.color_input = 1;
         assert_ne!(
             plain.framebuffer_compatibility(),
             input.framebuffer_compatibility()
@@ -4251,7 +4287,7 @@ mod object_cache_tests {
         key.host_accessible_color0 = true;
         for color_input in [false, true] {
             for feedback in [false, true] {
-                key.color_input = color_input;
+                key.color_input = u8::from(color_input);
                 key.feedback_colors = u8::from(feedback);
                 assert_eq!(
                     key.color_layout(0),
@@ -4283,7 +4319,7 @@ mod object_cache_tests {
     #[test]
     fn feedback_attachment_layout_is_derived_consistently_from_the_mask() {
         let mut key = PassKey::single(Color0Load::Preserve, vk::Format::R8G8B8A8_UNORM);
-        key.color_input = true;
+        key.color_input = 1;
         key.feedback_colors = (1 << 0) | (1 << 3);
 
         for index in 0..=MAX_SECONDARY_ATTACH {
@@ -4365,12 +4401,12 @@ mod object_cache_tests {
     fn pass_dependency_count(key: PassKey) -> usize {
         external_dependencies(
             key.depth.is_some(),
-            key.color_input,
+            key.color_input != 0,
             key.host_accessible_color0,
             pass_exit_scope_narrow(),
         )
         .len()
-            + usize::from(key.color_input)
+            + usize::from(key.color_input != 0)
             + 1
     }
 

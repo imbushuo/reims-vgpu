@@ -65,8 +65,8 @@ pub enum DrawExecutionDecline {
     },
     SeedFormatMismatch {
         identity: TargetIdentity,
-        resident_bgra: bool,
-        draw_bgra: bool,
+        resident_format: ash::vk::Format,
+        draw_format: ash::vk::Format,
     },
     /// A CPU `MTLLoadActionLoad` seed was offered for a colour attachment whose
     /// texel this device cannot write a seed as.
@@ -231,13 +231,13 @@ impl Decline for DrawExecutionDecline {
             }
             Self::SeedFormatMismatch {
                 identity,
-                resident_bgra,
-                draw_bgra,
+                resident_format,
+                draw_format,
             } => {
                 let mut fields = identity_fields(identity);
                 fields.extend([
-                    ("resident_bgra", resident_bgra.to_string()),
-                    ("draw_bgra", draw_bgra.to_string()),
+                    ("resident_format", format!("{resident_format:?}")),
+                    ("draw_format", format!("{draw_format:?}")),
                 ]);
                 fields
             }
@@ -367,6 +367,13 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             ("identity_kind", "anonymous".into()),
             ("identity_slot", slot.to_string()),
         ],
+        TargetIdentity::PassLocal { id, width, height, format } => vec![
+            ("identity_kind", "pass_local".into()),
+            ("identity_slot", id.get().to_string()),
+            ("identity_width", width.to_string()),
+            ("identity_height", height.to_string()),
+            ("identity_format", format!("{format:?}")),
+        ],
     }
 }
 
@@ -418,8 +425,8 @@ mod tests {
             },
             DrawExecutionDecline::SeedFormatMismatch {
                 identity: identity(),
-                resident_bgra: false,
-                draw_bgra: true,
+                resident_format: ash::vk::Format::R8G8B8A8_UNORM,
+                draw_format: ash::vk::Format::B8G8R8A8_UNORM,
             },
             DrawExecutionDecline::SampledResidentMissing {
                 binding: 32,

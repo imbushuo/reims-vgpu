@@ -859,6 +859,13 @@ engine_counters! {
         /// Current residents held by one or more deferred-work pins.
         registry_pinned_count,
         registry_pinned_bytes,
+        /// Live render-encoder-owned native attachments, never guest residents.
+        registry_pass_local_count,
+        registry_pass_local_bytes,
+        /// Ended pass allocations still awaiting in-flight fences; attachment
+        /// footprint only, excluding native allocation padding.
+        pass_local_retiring_count,
+        pass_local_retiring_bytes,
         /// High-water mark of the non-pinned resident population, in slots.
         ///
         /// The demand, with no ceiling to read it against: this population is
