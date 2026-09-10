@@ -1033,7 +1033,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
                 resolve_ref: att.resolve_texture_ref,
             }.at(resolved_ref));
         }
-        if pixel_format::render_target_bpp(texture.pixel_format).is_none() {
+        if reims_vgpu_protocol::memoryless::color_target_bpp(texture.pixel_format).is_none() {
             return Err(C::MemorylessFormat { fmt: texture.pixel_format }.at(resolved_ref));
         }
         return Ok(ResolvedRenderTarget {
@@ -1505,6 +1505,17 @@ mod tests {
 
     #[test]
     fn memoryless_render_target_uses_the_serializer_and_never_invents_pages() {
+        check_memoryless_render_target_format(pixel_format::MTL_FORMAT_RGBA16_FLOAT);
+    }
+
+    #[test]
+    fn memoryless_r32float_resolves_through_single_and_mrt_request_builders() {
+        check_memoryless_render_target_format(pixel_format::MTL_FORMAT_R32_FLOAT);
+        assert_eq!(pixel_format::render_target_bpp(pixel_format::MTL_FORMAT_R32_FLOAT), None,
+            "guest-backed render publication remains unsupported");
+    }
+
+    fn check_memoryless_render_target_format(format: u16) {
         use crate::model::PAGE_SHIFT_ARM64E;
         use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
         use crate::runtime::gva_mem::{define_task_pages_arm64e, write_task_gva_arm64e};
@@ -1514,7 +1525,7 @@ mod tests {
         assert!(state.set_object_list(1, 0, 256));
         let texture_ref = 203;
         let descriptor: Vec<u8> = [1u32, 44, texture_ref,
-            (115 << 16) | (5 << 8) | 0x42, 23, 17, 1,
+            (u32::from(format) << 16) | (5 << 8) | 0x42, 23, 17, 1,
             0x0001_0001, 0x0030_0001, 0, 0]
             .into_iter().flat_map(u32::to_le_bytes).collect();
         let descriptor_gva = 0x1800u64;
@@ -1527,7 +1538,7 @@ mod tests {
         let target = resolve_render_target(&mut state, &host, 1, attach(texture_ref)).unwrap();
         assert_eq!(target.storage, ColorStorage::Memoryless);
         assert_eq!((target.mapping_id, target.target_gva, target.row_stride), (0, 0, 0));
-        assert_eq!((target.width, target.height, target.format, target.sample_count), (23, 17, 115, 1));
+        assert_eq!((target.width, target.height, target.format, target.sample_count), (23, 17, format, 1));
         let clear = ColorAttachment {
             load_action: MTL_LOAD_ACTION_CLEAR,
             clear_color: [0.25, 0.5, 0.75, 1.0],

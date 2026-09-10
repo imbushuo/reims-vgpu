@@ -300,6 +300,42 @@ pub struct ReimsVgpuPackedSampledImage {
 pub(crate) enum ReimsVgpuSampledImage {
     Packed(ReimsVgpuPackedSampledImage),
     Planar { binding: u32, image: std::sync::Arc<super::planar::SampledImage> },
+    Native { binding: u32, texture: metal::Texture },
+}
+
+impl ReimsVgpuSampledImage {
+    pub(crate) fn binding(&self) -> u32 {
+        match self {
+            Self::Packed(image) => image.binding,
+            Self::Planar { binding, .. } | Self::Native { binding, .. } => *binding,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenderTextureAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl RenderTextureAccess {
+    pub(crate) fn writes(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RenderTextureUsage {
+    /// Banded binding, matching ReimsVgpuSampledImage rather than a raw slot.
+    pub binding: u32,
+    pub access: RenderTextureAccess,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RenderTextureUsages {
+    pub vertex: Vec<RenderTextureUsage>,
+    pub fragment: Vec<RenderTextureUsage>,
 }
 
 #[repr(C)]

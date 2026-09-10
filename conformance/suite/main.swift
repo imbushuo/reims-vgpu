@@ -31,6 +31,13 @@ if CommandLine.arguments.contains("--float-sampling-only") {
     finish()
 }
 
+if CommandLine.arguments.contains("--fragment-texture-writes-only") {
+    _ = library
+    report("shader_compile", true, "runtime library built")
+    fragmentTextureWriteCases()
+    finish()
+}
+
 if CommandLine.arguments.contains("--indexed-draw-only") {
     _ = library
     report("shader_compile", true, "runtime library built")
@@ -108,6 +115,7 @@ mipBlitCase()
 vertexBufferCase()
 
 fragmentBufferCase()
+fragmentTextureWriteCases()
 renderBarrierCase()
 computeBarrierCase(resourceBarrier: true)
 computeBarrierCase(resourceBarrier: false)

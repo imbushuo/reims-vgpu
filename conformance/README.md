@@ -175,6 +175,12 @@ Declaration order across files does not matter in Swift, so a case file may use
 anything in `Support.swift` and vice versa. Adding a case is: a function in the
 right `cases/` file, and a call in `main.swift`.
 
+`--fragment-texture-writes-only` runs the framebuffer-snapshot regression:
+a fragment shader with no color output saves the framebuffer into a writable
+texture, and a later draw in the same encoder uses it to restore rounded
+corners. BGRA8 and RGBA16Float run with shared and separate command buffers.
+This distinguishes missing shader texture side effects from alpha blending.
+
 ## Running it
 
 Native, on the oracle — this also cross-builds the x86_64 fallback:

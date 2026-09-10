@@ -28,6 +28,10 @@ use metal::*;
 use reims_vgpu_protocol::extent::tight_image_bytes;
 use std::ptr;
 
+#[cfg(test)]
+#[path = "render_texture_tests.rs"]
+mod render_texture_tests;
+
 struct AttrBufferSlot {
     data: *const u8,
     len: usize,
@@ -422,12 +426,11 @@ fn find_or_add_attr_slot(
 }
 
 fn make_vertex_descriptor(
-    device: &Device,
     attrs: &[ReimsVgpuVertexAttr],
     err: ErrOut<'_>,
-) -> Result<(Option<VertexDescriptor>, Vec<AttrBufferSlot>), Status> {
+) -> Result<Option<VertexDescriptor>, Status> {
     if attrs.is_empty() {
-        return Ok((None, Vec::new()));
+        return Ok(None);
     }
     if attrs.len() > REIMS_VGPU_METAL_MAX_ATTRS {
         set_err(err, "invalid vertex attribute list");
@@ -436,7 +439,6 @@ fn make_vertex_descriptor(
             .field("limit", REIMS_VGPU_METAL_MAX_ATTRS));
     }
     let descriptor = VertexDescriptor::new().to_owned();
-    let mut slots = Vec::new();
     let mut any_layout = false;
     for attr in attrs {
         if attr.format == 0 || attr.stride == 0 {
@@ -522,8 +524,6 @@ fn make_vertex_descriptor(
                 .field("location", attr.location)
                 .field("step", step_ordinal));
         }
-        // Optional host bytes → Metal buffer slot for encode-time bind.
-        find_or_add_attr_slot(device, &mut slots, attr, err)?;
         if let Some(a) = descriptor.attributes().object_at(attr.location as u64) {
             a.set_format(format);
             a.set_offset(attr.offset as u64);
@@ -537,9 +537,9 @@ fn make_vertex_descriptor(
         any_layout = true;
     }
     if any_layout {
-        Ok((Some(descriptor), slots))
+        Ok(Some(descriptor))
     } else {
-        Ok((None, slots))
+        Ok(None)
     }
 }
 
@@ -553,6 +553,43 @@ pub struct ColorRtKey {
     pub write_mask: u32,
 }
 
+pub(crate) struct RenderPipelineLayout<'a> {
+    pub attrs: &'a [ReimsVgpuVertexAttr],
+    pub blend: Option<&'a ReimsVgpuBlendState>,
+    /// Actual native attachment formats; guest-backed runtime targets use RGBA8.
+    pub colors: &'a [ColorRtKey],
+    pub depth_format: u32,
+    pub stencil_format: u32,
+}
+
+/// Reflect before staging resources, using the same functions, vertex layout,
+/// attachment formats and PSO cache as the draw. This renderer is single-sample.
+pub(crate) fn reflect_render_textures_mtlb(
+    vertex_mtlb: &[u8],
+    fragment_mtlb: &[u8],
+    layout: RenderPipelineLayout<'_>,
+) -> Result<std::sync::Arc<RenderTextureUsages>, Status> {
+    objc::rc::autoreleasepool(|| {
+        let device = system_device().ok_or_else(|| Status::execute("metal_render_device_unavailable"))?;
+        let err = (std::ptr::null_mut(), 0);
+        let vertex = load_only_function(device, vertex_mtlb, "vertex", err)?;
+        let fragment = load_only_function(device, fragment_mtlb, "fragment", err)?;
+        let descriptor = make_vertex_descriptor(layout.attrs, err)?;
+        let key = fill_render_pso_key(
+            layout.attrs, layout.blend, layout.colors, layout.depth_format, layout.stencil_format,
+        );
+        let lookup = RenderPsoLookup {
+            desc: &key,
+            vert: BlobKey::new(vertex_mtlb),
+            frag: BlobKey::new(fragment_mtlb),
+        };
+        let (_, _, _, textures) = get_render_pipeline_state(
+            device, &vertex, &fragment, descriptor.as_ref(), &lookup, err,
+        )?;
+        Ok(textures)
+    })
+}
+
 // Every argument is one component of the pipeline-state key, and the point of
 // the function is that the key is built from exactly these and nothing else.
 //
@@ -562,7 +599,7 @@ pub struct ColorRtKey {
 // retained bytes decides two pipelines are one. They now travel to the cache as
 // `BlobKey`s beside this descriptor, so there is no pairing left for this
 // function to get wrong and no reason for it to see a shader at all.
-fn fill_render_pso_key(
+pub(super) fn fill_render_pso_key(
     attrs: &[ReimsVgpuVertexAttr],
     blend: Option<&ReimsVgpuBlendState>,
     color_rts: &[ColorRtKey],
@@ -651,7 +688,7 @@ fn fill_render_pso_key(
             key.color_blend_src_alpha[i] = b.src_alpha;
             key.color_blend_dst_alpha[i] = b.dst_alpha;
             key.color_blend_op_alpha[i] = b.op_alpha;
-        } else if key.blend_enable != 0 && rt.slot == 0 {
+        } else if rt.blend.is_none() && key.blend_enable != 0 && rt.slot == 0 {
             key.color_blend_enable[i] = 1;
             key.color_blend_src_rgb[i] = key.blend_src_rgb;
             key.color_blend_dst_rgb[i] = key.blend_dst_rgb;
@@ -672,14 +709,14 @@ fn fill_render_pso_key(
     key
 }
 
-fn get_render_pipeline_state(
+pub(super) fn get_render_pipeline_state(
     device: &Device,
     vertex: &Function,
     fragment: &Function,
     vertex_descriptor: Option<&VertexDescriptor>,
     lookup: &RenderPsoLookup<'_>,
     err: ErrOut<'_>,
-) -> Result<(RenderPipelineState, u32, u32), Status> {
+) -> Result<(RenderPipelineState, u32, u32, std::sync::Arc<RenderTextureUsages>), Status> {
     if let Some(hit) = render_pso_lookup(lookup) {
         return Ok(hit);
     }
@@ -787,7 +824,82 @@ fn get_render_pipeline_state(
     let vert_mask = sampler_mask(true)?;
     let frag_mask = sampler_mask(false)?;
 
-    Ok(render_pso_insert(lookup, pso, vert_mask, frag_mask))
+    let textures = std::sync::Arc::new(RenderTextureUsages {
+        vertex: reflect_texture_stage(reflection_ptr, true)?,
+        fragment: reflect_texture_stage(reflection_ptr, false)?,
+    });
+    Ok(render_pso_insert(lookup, pso, vert_mask, frag_mask, textures))
+}
+
+fn reflect_texture_stage(
+    reflection: *mut objc::runtime::Object,
+    vertex: bool,
+) -> Result<Vec<RenderTextureUsage>, Status> {
+    let bindings = super::raw_metal::render_reflection_texture_bindings(reflection, vertex)
+        .ok_or_else(|| Status::execute("metal_render_texture_reflection_missing").field("vertex", vertex))?;
+    texture_usages(&bindings, vertex)
+}
+
+fn texture_usages(
+    bindings: &[super::raw_metal::BindingInfo],
+    vertex: bool,
+) -> Result<Vec<RenderTextureUsage>, Status> {
+    use super::raw_metal::{
+        BINDING_ACCESS_READ_ONLY, BINDING_ACCESS_READ_WRITE, BINDING_ACCESS_WRITE_ONLY,
+    };
+    let mut result: Vec<RenderTextureUsage> = Vec::new();
+    for binding in bindings {
+        let access = match binding.access {
+            BINDING_ACCESS_READ_ONLY => RenderTextureAccess::Read,
+            BINDING_ACCESS_READ_WRITE => RenderTextureAccess::ReadWrite,
+            BINDING_ACCESS_WRITE_ONLY => RenderTextureAccess::Write,
+            unknown => return Err(Status::execute("metal_render_texture_access_unknown")
+                .field("vertex", vertex).field("index", binding.index).field("access", unknown)),
+        };
+        let count = binding.array_length.max(1);
+        let end = binding.index.checked_add(count)
+            .filter(|end| *end <= REIMS_VGPU_METAL_MAX_TEXTURES as u64)
+            .ok_or_else(|| Status::execute("metal_render_texture_reflection_past_table")
+                .field("vertex", vertex).field("index", binding.index).field("count", count))?;
+        for index in binding.index..end {
+            let banded = REIMS_VGPU_BINDING_TEXTURE_BASE + index as u32;
+            if result.iter().any(|prior| prior.binding == banded) {
+                return Err(Status::execute("metal_render_texture_reflection_overlap")
+                    .field("vertex", vertex).field("index", index));
+            }
+            result.push(RenderTextureUsage { binding: banded, access });
+        }
+    }
+    Ok(result)
+}
+
+fn validate_render_texture_bindings(
+    images: &[ReimsVgpuSampledImage],
+    usages: &[RenderTextureUsage],
+    vertex: bool,
+) -> Status {
+    for usage in usages.iter().filter(|usage| usage.access.writes()) {
+        let mut matches = images.iter().filter(|image| image.binding() == usage.binding);
+        let image = matches.next();
+        if matches.next().is_some() {
+            return Status::args("metal_render_writable_texture_duplicate")
+                .field("vertex", vertex).field("binding", usage.binding);
+        }
+        let required = if usage.access == RenderTextureAccess::ReadWrite {
+            MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
+        } else {
+            MTLTextureUsage::ShaderWrite
+        };
+        match image {
+            Some(ReimsVgpuSampledImage::Native { texture, .. })
+                if texture.usage().contains(required) => {}
+            Some(_) => return Status::args("metal_render_writable_texture_requires_native")
+                .field("vertex", vertex).field("binding", usage.binding),
+            None => return Status::args("metal_render_writable_texture_unbound")
+                .field("vertex", vertex).field("binding", usage.binding),
+        }
+    }
+    Status::OK
 }
 
 fn bind_storage_buffers(
@@ -910,6 +1022,18 @@ fn bind_sampled_images(
     for source in images {
         let image = match source {
             ReimsVgpuSampledImage::Packed(image) => image,
+            ReimsVgpuSampledImage::Native { binding, texture } => {
+                let Some(index) = texture_index(*binding) else {
+                    return Status::args("metal_render_sampled_binding_invalid").field("binding", *binding);
+                };
+                if fragment_stage {
+                    encoder.set_fragment_texture(index as u64, Some(texture));
+                } else {
+                    encoder.set_vertex_texture(index as u64, Some(texture));
+                }
+                retained.push(texture.clone());
+                continue;
+            }
             ReimsVgpuSampledImage::Planar { binding, image } => {
                 let Some(index) = texture_index(*binding) else {
                     return Status::args("metal_render_sampled_binding_invalid")
@@ -1609,6 +1733,22 @@ pub struct ColorRt<'a> {
 }
 
 impl ColorRt<'_> {
+    pub(crate) fn native_pixel_format(&self) -> u32 {
+        if self.pixel_format == 0 { MTLPixelFormat::RGBA8Unorm as u32 } else { self.pixel_format }
+    }
+
+    pub(crate) fn pipeline_key(&self, pixel_format: u32) -> ColorRtKey {
+        ColorRtKey {
+            slot: self.slot,
+            pixel_format,
+            // Blend state is independent per attachment. The legacy colour0
+            // fallback is resolved by fill_render_pso_key, never inherited by
+            // an unblended secondary (including a memoryless coverage target).
+            blend: self.blend,
+            write_mask: self.write_mask,
+        }
+    }
+
     pub(super) fn attach(&self, pass: &RenderPassDescriptorRef, target: &TextureRef) {
         if let Some(attachment) = pass.color_attachments().object_at(u64::from(self.slot)) {
             attachment.set_texture(Some(target));
@@ -2017,10 +2157,7 @@ pub fn render_core_mrt(
                 .field("slot", c.slot)
                 .field("limit", REIMS_VGPU_METAL_MAX_COLOR_RTS);
         }
-        let mut fmt = c.pixel_format;
-        if fmt == 0 {
-            fmt = MTLPixelFormat::RGBA8Unorm as u32;
-        }
+        let fmt = c.native_pixel_format();
         let Some(bpp) = mtl_pixel_format_bpp(fmt) else {
             set_err(err, format!("unsupported render color pixel format {fmt}"));
             return Status::args("metal_render_color_format_unsupported")
@@ -2130,10 +2267,16 @@ pub fn render_core_mrt(
         Err(st) => return st,
     };
 
-    let (vertex_descriptor, attr_slots) = match make_vertex_descriptor(device, attrs, err) {
+    let vertex_descriptor = match make_vertex_descriptor(attrs, err) {
         Ok(v) => v,
         Err(st) => return st,
     };
+    let mut attr_slots = Vec::new();
+    for attr in attrs.iter().filter(|attr| attr.format != 0 && attr.stride != 0) {
+        if let Err(st) = find_or_add_attr_slot(device, &mut attr_slots, attr, err) {
+            return st;
+        }
+    }
 
     let depth_actions =
         match validate_depth_attachment(depth_attachment.as_deref(), width, height, err) {
@@ -2149,18 +2292,7 @@ pub fn render_core_mrt(
     let color_rt_keys: Vec<ColorRtKey> = colors
         .iter()
         .zip(color_meta.iter())
-        .map(|(c, &(slot, fmt, _, _))| ColorRtKey {
-            slot,
-            pixel_format: fmt,
-            blend: c.blend.or_else(|| {
-                if slot == 0 {
-                    blend.copied()
-                } else {
-                    blend.filter(|b| b.enable != 0).copied()
-                }
-            }),
-            write_mask: c.write_mask,
-        })
+        .map(|(c, &(_, fmt, _, _))| c.pipeline_key(fmt))
         .collect();
     let pso_key = fill_render_pso_key(
         attrs,
@@ -2182,7 +2314,7 @@ pub fn render_core_mrt(
         vert: BlobKey::new(vert_mtlb),
         frag: BlobKey::new(frag_mtlb),
     };
-    let (pso, vert_sampler_mask, frag_sampler_mask) = match get_render_pipeline_state(
+    let (pso, vert_sampler_mask, frag_sampler_mask, texture_usages) = match get_render_pipeline_state(
         device,
         &vertex,
         &fragment,
@@ -2193,6 +2325,15 @@ pub fn render_core_mrt(
         Ok(v) => v,
         Err(st) => return st,
     };
+    for (images, usages, vertex) in [
+        (vertex_images, texture_usages.vertex.as_slice(), true),
+        (images, texture_usages.fragment.as_slice(), false),
+    ] {
+        let status = validate_render_texture_bindings(images, usages, vertex);
+        if !status.is_ok() {
+            return status;
+        }
+    }
     drop(span_pso);
 
     let mut retained_tex: Vec<Texture> = Vec::new();

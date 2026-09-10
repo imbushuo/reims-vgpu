@@ -96,10 +96,11 @@ impl MetalRenderPass {
             if color.sample_count != 1 || color.multisample_source_ref != 0 {
                 return Err("draw_mtl_memoryless_multisample");
             }
-            if color.width == 0 || color.height == 0
-                || reims_vgpu_protocol::pixel_format::render_target_bpp(color.format).is_none()
-            {
+            if color.width == 0 || color.height == 0 {
                 return Err("draw_mtl_memoryless_pass_geometry");
+            }
+            if reims_vgpu_protocol::memoryless::color_target_bpp(color.format).is_none() {
+                return Err("draw_mtl_memoryless_pass_format");
             }
             if color.mapping_id != 0 || color.target_gva != 0
                 || color.target_seed_rgba.is_some()

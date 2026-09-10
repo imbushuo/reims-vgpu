@@ -32,6 +32,7 @@ pub struct RenderPsoEntry {
     pub pso: RenderPipelineState,
     pub frag_sampler_mask: u32,
     pub vert_sampler_mask: u32,
+    pub textures: std::sync::Arc<super::abi::RenderTextureUsages>,
 }
 
 /// What decides `MTLComputePipelineState` identity: the kernel blob, plus the
@@ -328,11 +329,11 @@ pub fn compute_pso_insert(
     })
 }
 
-pub fn render_pso_lookup(key: &RenderPsoLookup<'_>) -> Option<(RenderPipelineState, u32, u32)> {
+pub fn render_pso_lookup(key: &RenderPsoLookup<'_>) -> Option<(RenderPipelineState, u32, u32, std::sync::Arc<super::abi::RenderTextureUsages>)> {
     with_caches(|c| {
         c.render_pso
             .find(key)
-            .map(|e| (e.pso.clone(), e.vert_sampler_mask, e.frag_sampler_mask))
+            .map(|e| (e.pso.clone(), e.vert_sampler_mask, e.frag_sampler_mask, e.textures.clone()))
     })
 }
 
@@ -341,18 +342,21 @@ pub fn render_pso_insert(
     pso: RenderPipelineState,
     vert_mask: u32,
     frag_mask: u32,
-) -> (RenderPipelineState, u32, u32) {
+    textures: std::sync::Arc<super::abi::RenderTextureUsages>,
+) -> (RenderPipelineState, u32, u32, std::sync::Arc<super::abi::RenderTextureUsages>) {
     with_caches(|c| {
         let entry = c.render_pso.insert_unique(RenderPsoEntry {
             id: RenderPsoIdentity::of(key),
             pso,
             frag_sampler_mask: frag_mask,
             vert_sampler_mask: vert_mask,
+            textures,
         });
         (
             entry.pso.clone(),
             entry.vert_sampler_mask,
             entry.frag_sampler_mask,
+            entry.textures.clone(),
         )
     })
 }

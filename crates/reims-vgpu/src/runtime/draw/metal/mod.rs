@@ -28,6 +28,7 @@ pub use icb::*;
 mod depth_stencil;
 use depth_stencil::{seed_host_depth_stencil, DepthStencilAspect, HostAttachment};
 mod sampled;
+mod storage;
 
 /// This rail's retention decision for one colour attachment, made before the
 /// seed is built and spent by the encode and then by the Store.
@@ -508,76 +509,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         frag_bufs.push(ab);
     }
 
-    // Sampled textures: mapper-ref-texture mapping pages, then normal-texture linear GVA.
-    struct TexItem {
-        index: u32,
-        upload: sampled::SampledUpload,
-    }
-    // Archive apple-pv-gpu-exec: a bound texture that does not resolve gates the
-    // draw (never samples black/garbage). Same for vertex-stage textures.
     chain_phase::enter(chain_phase::Phase::Sampled);
-    // `sampled_us` is this rail's largest bar and, unlike the Vulkan rail's, has
-    // never been divided — `runtime::sampled_phase` splits the other rail's.
-    // Two spans and two magnitudes, because a bar this size has two candidate
-    // shapes and they have opposite fixes: many small binds (per-bind overhead)
-    // and few large ones (byte movement).
-    let mut vtx_tex_items: Vec<TexItem> = Vec::new();
-    let mut frag_tex_items: Vec<TexItem> = Vec::new();
-    let span_sampled = chain_phase::CostSpan::new("metal_sampled_load_us");
-    for t in req.vertex_textures.iter() {
-        if t.texture_ref == 0 {
-            continue;
-        }
-        let Some(upload) = sampled::load(state, host, req.task_id, t.texture_ref) else {
-            crate::observe::fail(format!(
-                "metal_draw gate: vertex texture miss ref={} {}",
-                t.texture_ref,
-                sample_miss_detail(state, host, req.task_id, t.texture_ref)
-            ));
-            return (
-                EncodeStatus::MetalFailed("draw_mtl_vertex_texture_miss"),
-                None,
-            );
-        };
-        crate::runtime::drain::note_store_route("metal_sampled_binds");
-        crate::runtime::drain::note_store_route_n("metal_sampled_bytes", upload.byte_len());
-        vtx_tex_items.push(TexItem {
-            index: t.index,
-            upload,
-        });
-    }
-    for t in req.fragment_textures.iter() {
-        if t.texture_ref == 0 {
-            continue;
-        }
-        let Some(upload) = sampled::load(state, host, req.task_id, t.texture_ref) else {
-            crate::observe::fail(format!(
-                "metal_draw gate: fragment texture miss ref={} {}",
-                t.texture_ref,
-                sample_miss_detail(state, host, req.task_id, t.texture_ref)
-            ));
-            return (
-                EncodeStatus::MetalFailed("draw_mtl_fragment_texture_miss"),
-                None,
-            );
-        };
-        crate::runtime::drain::note_store_route("metal_sampled_binds");
-        crate::runtime::drain::note_store_route_n("metal_sampled_bytes", upload.byte_len());
-        frag_tex_items.push(TexItem {
-            index: t.index,
-            upload,
-        });
-    }
-    drop(span_sampled);
-    let vtx_imgs: Vec<ReimsVgpuSampledImage> = vtx_tex_items
-        .iter()
-        .map(|it| it.upload.image(it.index))
-        .collect();
-    let frag_imgs: Vec<ReimsVgpuSampledImage> = frag_tex_items
-        .iter()
-        .map(|it| it.upload.image(it.index))
-        .collect();
-
     // Samplers: serializer-object subtype 0x03 when present. A nonzero ref is an explicit
     // guest bind; if it cannot be resolved, keep the correct fallback but make
     // the degradation visible with the exact resolver reason.
@@ -1055,6 +987,69 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         });
     }
 
+    use crate::backend::metal::render::{reflect_render_textures_mtlb, RenderPipelineLayout};
+    let color_keys: Vec<_> = color_rts.iter()
+        .map(|color| color.pipeline_key(color.native_pixel_format())).collect();
+    let texture_usages = match reflect_render_textures_mtlb(&vert, &frag, RenderPipelineLayout {
+        attrs: &attrs,
+        blend: blend_opt,
+        colors: &color_keys,
+        depth_format: depth_attach_api.as_ref().map_or(0, |a| a.pixel_format),
+        stencil_format: stencil_attach_api.as_ref().map_or(0, |a| a.pixel_format),
+    }) {
+        Ok(usages) => usages,
+        Err(reason) => return (EncodeStatus::RailRefused(reason), None),
+    };
+    let mut writable = storage::StorageTextures::default();
+    for (usages, binds) in [
+        (&texture_usages.vertex, &req.vertex_textures),
+        (&texture_usages.fragment, &req.fragment_textures),
+    ] {
+        for usage in usages.iter().filter(|usage| usage.access.writes()) {
+            let Some(index) = usage.binding.checked_sub(
+                crate::backend::metal::abi::REIMS_VGPU_BINDING_TEXTURE_BASE,
+            ) else {
+                return (EncodeStatus::BadArgs("draw_mtl_storage_binding"), None);
+            };
+            let Some(bind) = binds.iter().find(|bind| bind.index == index && bind.texture_ref != 0)
+                else { return (EncodeStatus::BadArgs("draw_mtl_storage_unbound"), None) };
+            if let Err(reason) = writable.add(state, host, req, bind.texture_ref, index) {
+                return (reason, None);
+            }
+        }
+    }
+
+    chain_phase::enter(chain_phase::Phase::Sampled);
+    let span_sampled = chain_phase::CostSpan::new("metal_sampled_load_us");
+    let mut vtx_tex_items = Vec::new();
+    let mut frag_tex_items = Vec::new();
+    let mut vtx_imgs: Vec<ReimsVgpuSampledImage> = Vec::new();
+    let mut frag_imgs: Vec<ReimsVgpuSampledImage> = Vec::new();
+    for (binds, uploads, images, miss_reason) in [
+        (&req.vertex_textures, &mut vtx_tex_items, &mut vtx_imgs, "draw_mtl_vertex_texture_miss"),
+        (&req.fragment_textures, &mut frag_tex_items, &mut frag_imgs, "draw_mtl_fragment_texture_miss"),
+    ] {
+        for bind in binds.iter().filter(|bind| bind.texture_ref != 0) {
+            // Any read alias shares the native writable allocation, even across stages.
+            if let Some(image) = writable.image(bind.texture_ref, bind.index) {
+                images.push(image);
+                continue;
+            }
+            let Some(upload) = sampled::load(state, host, req.task_id, bind.texture_ref) else {
+                crate::observe::fail(format!(
+                    "metal_draw gate: reason={miss_reason} ref={} {}",
+                    bind.texture_ref, sample_miss_detail(state, host, req.task_id, bind.texture_ref),
+                ));
+                return (EncodeStatus::MetalFailed(miss_reason), None);
+            };
+            crate::runtime::drain::note_store_route("metal_sampled_binds");
+            crate::runtime::drain::note_store_route_n("metal_sampled_bytes", upload.byte_len());
+            images.push(upload.image(bind.index));
+            uploads.push(upload);
+        }
+    }
+    drop(span_sampled);
+
     let mut err_buf = [0i8; 256];
     let err: ErrOut<'_> = (err_buf.as_mut_ptr(), err_buf.len());
     // The guest's offset stays here: the backend answers one draw at a time and
@@ -1121,6 +1116,9 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     );
     if !st.is_ok() {
         return (EncodeStatus::RailRefused(st), None);
+    }
+    if let Err(reason) = writable.publish(state, host, req.task_id) {
+        return (reason, None);
     }
 
     // Convert each color RT RGBA8 → guest format and writeback (mapper-ref-texture mapping

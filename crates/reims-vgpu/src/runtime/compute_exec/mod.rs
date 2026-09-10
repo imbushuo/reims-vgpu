@@ -3041,7 +3041,7 @@ fn write_linear_texture_bulk<M: HostMemory + HostOps>(
     true
 }
 
-fn writeback_texture<R: RailStage, M: HostMemory + HostOps>(
+pub(crate) fn writeback_texture<R: RailStage, M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,

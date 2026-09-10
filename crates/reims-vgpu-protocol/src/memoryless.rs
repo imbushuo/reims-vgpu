@@ -22,6 +22,20 @@ pub enum ColorStorage {
     Memoryless,
 }
 
+/// Supported native colour attachment formats for pass-local memoryless storage.
+///
+/// Unlike guest-backed render targets, these never pass through the CPU Store
+/// converter. R32Float is a native floating-point colour attachment, including
+/// clear, blending and framebuffer fetch; it does not imply support for
+/// guest-backed R32Float publication or filtered sampling.
+pub fn color_target_bpp(format: u16) -> Option<u32> {
+    if format == crate::pixel_format::MTL_FORMAT_R32_FLOAT {
+        Some(crate::pixel_format::R32F_BPP)
+    } else {
+        crate::pixel_format::render_target_bpp(format)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemorylessTexture {
     pub object_ref: u32,
@@ -116,6 +130,22 @@ mod tests {
         }));
         bytes[12] |= 0x80;
         assert!(decode(&bytes).is_ok(), "unwritten ring bit is not a flag");
+    }
+
+    #[test]
+    fn memoryless_r32float_admission_does_not_expand_guest_store_formats() {
+        use crate::pixel_format::{render_target_bpp, MTL_FORMAT_R32_FLOAT};
+        for format in 0..=u16::MAX {
+            assert_eq!(color_target_bpp(format), if format == MTL_FORMAT_R32_FLOAT {
+                Some(4)
+            } else {
+                render_target_bpp(format)
+            });
+        }
+        assert_eq!(render_target_bpp(MTL_FORMAT_R32_FLOAT), None);
+        let mut bytes = descriptor();
+        bytes[14..16].copy_from_slice(&MTL_FORMAT_R32_FLOAT.to_le_bytes());
+        assert_eq!(decode(&bytes).unwrap().pixel_format, MTL_FORMAT_R32_FLOAT);
     }
 
     #[test]

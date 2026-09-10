@@ -336,6 +336,41 @@ fn bind_compute_buffers(
     Status::OK
 }
 
+pub(crate) fn upload_storage_texture(
+    device: &Device,
+    format: crate::protocol::pixel_format::StorageImageSelector,
+    width: u32,
+    height: u32,
+    bytes: &[u8],
+    err: ErrOut<'_>,
+) -> Result<Texture, Status> {
+    let (pixel_format, bpp) = storage_image_format(format);
+    let expected = tight_image_bytes(width, height, bpp)
+        .ok_or_else(|| Status::args("metal_storage_upload_geometry_invalid")
+            .field("width", width).field("height", height).field("bpp", bpp))?;
+    if bytes.len() < expected {
+        return Err(Status::args("metal_storage_upload_data_too_short")
+            .field("len", bytes.len()).field("expected", expected));
+    }
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(pixel_format);
+    descriptor.set_width(width as u64);
+    descriptor.set_height(height as u64);
+    descriptor.set_storage_mode(MTLStorageMode::Shared);
+    descriptor.set_usage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
+    let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor) else {
+        set_err(err, "failed to allocate storage image texture");
+        return Err(Status::execute("metal_compute_storage_texture_alloc_failed")
+            .field("width", width).field("height", height));
+    };
+    texture.replace_region(
+        MTLRegion::new_2d(0, 0, width as u64, height as u64),
+        0, bytes.as_ptr().cast(), (width as u64) * (bpp as u64),
+    );
+    Ok(texture)
+}
+
 pub(crate) fn bind_storage_images(
     device: &Device,
     encoder: &ComputeCommandEncoderRef,
@@ -356,7 +391,7 @@ pub(crate) fn bind_storage_images(
             return Status::args("metal_compute_storage_binding_invalid")
                 .field("binding", image.binding);
         };
-        let (pixel_format, bpp) = storage_image_format(image.format);
+        let (_, bpp) = storage_image_format(image.format);
         let Some(expected_len) = tight_image_bytes(image.width, image.height, bpp) else {
             set_err(
                 err,
@@ -396,28 +431,13 @@ pub(crate) fn bind_storage_images(
         }
         seen[texture_index] = true;
 
-        let descriptor = TextureDescriptor::new();
-        descriptor.set_texture_type(MTLTextureType::D2);
-        descriptor.set_pixel_format(pixel_format);
-        descriptor.set_width(image.width as u64);
-        descriptor.set_height(image.height as u64);
-        descriptor.set_storage_mode(MTLStorageMode::Shared);
-        descriptor.set_usage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
-        let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor)
-        else {
-            set_err(err, "failed to allocate storage image texture");
-            return Status::execute("metal_compute_storage_texture_alloc_failed")
-                .field("binding", image.binding)
-                .field("width", image.width)
-                .field("height", image.height);
+        let bytes = unsafe { std::slice::from_raw_parts(image.data, expected_len) };
+        let texture = match upload_storage_texture(
+            device, image.format, image.width, image.height, bytes, err,
+        ) {
+            Ok(texture) => texture,
+            Err(status) => return status.field("binding", image.binding),
         };
-        let region = MTLRegion::new_2d(0, 0, image.width as u64, image.height as u64);
-        texture.replace_region(
-            region,
-            0,
-            image.data as *const _,
-            (image.width as u64) * (bpp as u64),
-        );
         encoder.set_texture(texture_index as u64, Some(&texture));
         mtl_images.push(texture);
     }

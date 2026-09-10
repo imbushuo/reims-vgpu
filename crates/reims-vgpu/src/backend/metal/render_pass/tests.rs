@@ -2,6 +2,8 @@ use super::*;
 use crate::backend::metal::render::{ColorRt, ColorTarget};
 use metal::*;
 
+mod r32float;
+
 fn weak_texture(texture: &Texture) -> objc::rc::WeakPtr {
     use foreign_types::ForeignType;
     // Balance the temporary retain; the returned weak reference owns no texture.

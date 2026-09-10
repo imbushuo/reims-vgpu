@@ -1071,6 +1071,48 @@ pub fn render_reflection_sampler_mask(
     }
 }
 
+/// Active direct texture bindings for one render stage. A missing reflection
+/// cannot establish read-only access and is distinct from an empty stage.
+pub fn render_reflection_texture_bindings(
+    reflection: *mut Object,
+    vertex: bool,
+) -> Option<Vec<BindingInfo>> {
+    if reflection.is_null() {
+        return None;
+    }
+    unsafe {
+        let bindings: *mut Object = if vertex {
+            msg_send![reflection, vertexBindings]
+        } else {
+            msg_send![reflection, fragmentBindings]
+        };
+        let mut result = Vec::new();
+        if bindings.is_null() {
+            return Some(result);
+        }
+        let count: NSUInteger = msg_send![bindings, count];
+        for i in 0..count {
+            let binding: *mut Object = msg_send![bindings, objectAtIndex: i];
+            if binding.is_null() {
+                return None;
+            }
+            let used: BOOL = msg_send![binding, isUsed];
+            let type_: NSUInteger = msg_send![binding, type];
+            if used == NO || type_ != BINDING_TYPE_TEXTURE {
+                continue;
+            }
+            result.push(BindingInfo {
+                used: true,
+                type_,
+                access: msg_send![binding, access],
+                index: msg_send![binding, index],
+                array_length: msg_send![binding, arrayLength],
+            });
+        }
+        Some(result)
+    }
+}
+
 /// Metal's own pipeline reflection named a used sampler at a slot the sampler
 /// argument table does not have.
 #[derive(Clone, Debug, Eq, PartialEq)]

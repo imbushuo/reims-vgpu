@@ -71,15 +71,32 @@ pub(super) fn load<M: HostMemory + HostOps>(
             return None;
         }
     }
-    if buffer_texture_descriptor(state, host, task_id, texture_ref, None).is_some() {
+    let native_packed = objects::lookup_list_entry(state, host, task_id, texture_ref)
+        .is_some_and(|entry| match entry.object_type {
+            OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS => {
+                objects::read_descriptor(state, host, task_id, &entry)
+                    .and_then(|bytes| decode_texture_descriptor(&bytes).ok())
+                    .is_some_and(|texture| {
+                        texture.mipmap_level_count == 1
+                            && texture.depth == 1
+                            && texture.sample_count == Some(1)
+                    })
+            }
+            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW => {
+                buffer_texture_descriptor(state, host, task_id, texture_ref, None).is_some()
+            }
+            _ => false,
+        });
+    if native_packed {
         // Reuse the raw staging owner: it pays both texture/buffer writeback
         // debts and removes row padding without quantizing the guest format.
+        // Multi-level and view textures retain their existing loading path.
         let staged = match stage_texture_raw::<MetalStage, _>(
             state, host, task_id, texture_ref, 0, false,
         ) {
             Ok(staged) => staged,
             Err(reason) => {
-                crate::observe::Emit::refusal("draw_mtl_buffer_texture", &reason)
+                crate::observe::Emit::refusal("draw_mtl_packed_texture", &reason)
                     .expect("a staging error is a refusal")
                     .field("task", task_id)
                     .field("ref", texture_ref)
@@ -91,8 +108,8 @@ pub(super) fn load<M: HostMemory + HostOps>(
             pixel_format::tight_row_bytes(staged.width, staged.pixel_format)
         else {
             crate::observe::Emit::refusal(
-                "draw_mtl_buffer_texture",
-                &EncodeStatus::BadArgs("draw_mtl_buffer_texture_pitch"),
+                "draw_mtl_packed_texture",
+                &EncodeStatus::BadArgs("draw_mtl_packed_texture_pitch"),
             )
             .expect("BadArgs is a refusal")
             .field("ref", texture_ref)
@@ -161,6 +178,63 @@ mod tests {
             assert!(lifetime.upgrade().is_some());
             drop(binding);
             assert!(lifetime.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn linear_sampled_upload_preserves_float_precision_channels_and_padded_rows() {
+        for (format, bpp) in [
+            (pixel_format::MTL_FORMAT_R16_FLOAT, 2usize),
+            (pixel_format::MTL_FORMAT_RG8_UNORM, 2),
+            (pixel_format::MTL_FORMAT_RGBA16_FLOAT, 8),
+            (pixel_format::MTL_FORMAT_RGBA32_FLOAT, 16),
+        ] {
+            let mut host = FakeHost::new();
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+            assert!(state.set_object_list(1, 0, 32));
+            let width = 4;
+            let height = 2;
+            let tight = width * bpp;
+            let pitch = tight + 16;
+            let mut backing = vec![0xEE; pitch + tight];
+            let expected: Vec<u8> = (0..tight * height).map(|v| v as u8).collect();
+            for y in 0..height {
+                backing[y * pitch..y * pitch + tight]
+                    .copy_from_slice(&expected[y * tight..(y + 1) * tight]);
+            }
+            write_task_gva_arm64e(&mut host, &state.tasks[1], 5 << PAGE_SHIFT_ARM64E, &backing);
+            let mut descriptor = vec![0; TEXTURE_DESC_BASE_LEN];
+            st64(&mut descriptor[LINEAR_DESC_SIZE..], backing.len() as u64);
+            st32(&mut descriptor[LINEAR_DESC_HANDLE..], 5);
+            st16(&mut descriptor[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
+            st32(&mut descriptor[TEXTURE_DESC_USED_SIZE..], backing.len() as u32);
+            st32(&mut descriptor[TEXTURE_DESC_ROW_STRIDE..], pitch as u32);
+            st32(&mut descriptor[TEXTURE_DESC_WIDTH..], width as u32);
+            st32(&mut descriptor[TEXTURE_DESC_HEIGHT..], height as u32);
+            st32(&mut descriptor[TEXTURE_DESC_HEIGHT + 4..], 1);
+            st16(&mut descriptor[TEXTURE_DESC_PIXEL_FORMAT..], format);
+            st32(&mut descriptor[TEXTURE_DESC_TRAILER_WIDTH..], width as u32);
+            st32(&mut descriptor[TEXTURE_DESC_TRAILER_HEIGHT..], height as u32);
+            st16(&mut descriptor[TEXTURE_DESC_SAMPLE_COUNT..], 1);
+            write_task_gva_arm64e(&mut host, &state.tasks[1], 0x200, &descriptor);
+            let mut entry = [0; OBJECT_LIST_ENTRY_LEN];
+            st32(&mut entry, u32::from(OBJECT_TYPE_TEXTURE) | ((descriptor.len() as u32) << 8));
+            st64(&mut entry[4..], 0x200);
+            write_task_gva_arm64e(
+                &mut host, &state.tasks[1], list_object_entry_offset(7, 32).unwrap(), &entry,
+            );
+            let upload = load(&mut state, &mut host, 1, 7).expect("native linear texture");
+            let SampledUpload::Packed { bytes, .. } = &upload else {
+                panic!("linear textures are packed");
+            };
+            assert_eq!(*bytes, expected, "no channel expansion or float-to-UNORM conversion");
+            let ReimsVgpuSampledImage::Packed(image) = upload.image(0) else {
+                panic!("linear texture must keep its native format");
+            };
+            assert_eq!(image.pixel_format, u32::from(format));
+            assert_eq!(image.bytes_per_row, tight as u32);
+            assert_eq!(image.data_len, tight * height);
         }
     }
 
