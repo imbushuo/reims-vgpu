@@ -22,6 +22,7 @@ use crate::runtime::surface_currency::{surface_currency, CurrencyStandard, Surfa
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
 mod sampled;
+mod output;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
 ///
@@ -196,7 +197,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     let mut draw_rgba: Option<Vec<u8>> = None;
     // Physical order of `draw_rgba`. A mapper-ref-texture composite Store renders into a
     // BGRA `Surface` resident, so its readback is already in guest scanout
-    // order; the pooled and GVA targets stay RGBA. Carried instead of assumed —
+    // order; anonymous and GVA targets can also retain native BGRA. Carried instead of assumed —
     // which of those a record hit depends on whether an identity resolved, and
     // that is not a condition the Store block can re-derive.
     let mut draw_bgra = false;
@@ -455,8 +456,8 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
                     // synchronous route. A `Surface` resident reads back in that
                     // order already, so this is a no-op on the hot path and the
                     // ~152 ms/s whole-frame swizzle it replaces is gone. It still
-                    // has to be written, because a record whose identity did not
-                    // resolve rendered into a pooled RGBA target.
+                    // has to be written because the resolved native attachment,
+                    // including an anonymous one, decides the returned order.
                     let mut bgra = rgba;
                     {
                         let _span = crate::runtime::chain_phase::CostSpan::new("t11_convert_us");
@@ -602,44 +603,10 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
                 // above. `None` only when that walk could not name the span,
                 // which is the pre-existing behaviour for a target this device
                 // cannot resolve at all.
-                let gva_ok = write_gva_rgba8_within(
-                    state,
-                    host,
-                    req.task_id,
-                    c0.target_gva,
-                    c0.width,
-                    c0.height,
-                    c0.row_stride,
-                    c0.format,
-                    &rgba,
+                let gva_ok = output::publish_gva_draw_pixels(
+                    state, host, req.task_id, c0, &mut rgba, draw_bgra,
                     sync_store_pages.as_ref().map(|p| p.membership()),
-                )
-                .is_ok();
-                // Discrete-GPU rail: normal-texture encode into **texture_ref** + **GVA**
-                // host caches (not surface_id mid map — list ids collide with
-                // present mids;). Sample prefers GVA key then
-                // texture_ref with live descriptor geom.
-                if gva_ok {
-                    let producer_object_type =
-                        objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
-                            .map(|entry| entry.object_type)
-                            .unwrap_or(0);
-                    host_cache_store_gva_layer(
-                        state,
-                        host,
-                        req.task_id,
-                        c0.texture_ref,
-                        producer_object_type,
-                        c0.target_gva,
-                        c0.width,
-                        c0.height,
-                        &rgba,
-                        // Inside `if gva_ok`: this arm only runs when
-                        // `write_gva_rgba8_within` landed the same bytes in the
-                        // guest's pages, so they are re-derivable from there.
-                        true,
-                    );
-                }
+                );
                 let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&rgba);
                 // A Store that lands is expected control flow and belongs on
                 // the census channel, not the failure one — "non-OFF lines are

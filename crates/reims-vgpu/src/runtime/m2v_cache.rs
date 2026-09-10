@@ -30,6 +30,21 @@ type M2vResult<T> = Result<T, M2vCacheDecline>;
 #[path = "m2v_cache_rounding_gpu.rs"]
 mod rounding_gpu_tests;
 
+/// The Vulkan rail's explicit emulated source-device contract for unqualified AIR writes.
+///
+/// This currently selects an RTZ source profile; it is not inferred from host Metal, MoltenVK,
+/// the physical GPU, or the guest OS. Apple M2 native measurements are reference evidence for
+/// this profile only, not qualification of other source devices or OS/compiler combinations.
+/// Supporting another native policy requires an explicit source-profile choice and independent
+/// calibration. The chosen policy participates in executable specialization/cache identity.
+///
+/// Only binary16 storage destinations narrow here. Explicit AIR `.rtz`/`.rte` retain their own
+/// per-write modes, and this constant does not override them.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) const NATIVE_TEXTURE_WRITE_ROUNDING:
+    metal2vulkan::texture_write_rounding::TextureWriteRoundingMode =
+        metal2vulkan::texture_write_rounding::TextureWriteRoundingMode::TowardZero;
+
 /// AIR translation is format independent. Runtime compute variants own the complete image-write
 /// contract, including the rounding mode and actual storage views, without translating AIR again
 /// on the synchronous execution path.

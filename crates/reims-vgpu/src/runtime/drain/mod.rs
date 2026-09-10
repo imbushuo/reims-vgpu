@@ -352,7 +352,7 @@ fn apply_delete_object<H: HostMemory + HostOps>(
     //
     // Asked before the retirement acts, so the reading is about the ref the
     // guest sent and not about what dropping it did.
-    let ref_space = is_retained_kind(op.opcode()).then(|| {
+    if is_retained_kind(op.opcode()) {
         note_delete_object_ref_space(
             state,
             host,
@@ -360,8 +360,8 @@ fn apply_delete_object<H: HostMemory + HostOps>(
             object_ref,
             op.opcode(),
             RefSpacePopulation::Retained,
-        )
-    });
+        );
+    }
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE {
         let retired = state.task_sampler_states.delete(task_id, object_ref);
         note_store_route(if retired {
@@ -410,58 +410,13 @@ fn apply_delete_object<H: HostMemory + HostOps>(
         _ => None,
     };
     if let Some(object) = retained {
-        // The ordering plane's half, for the kind it holds a lifetime for. A
-        // render pipeline is declared into `SessionModel::pipelines` when the
-        // guest creates it, and this is the guest saying it is over — without
-        // it the table only grows, and a transaction parked on a compilation
-        // the guest has just cancelled would wait for a step that never comes.
-        if object == RetainedObject::RenderPipelineState {
-            // **Only when the slot the ref names still holds a render pipeline.**
-            // The census two blocks up asks exactly this and it is not
-            // rhetorical: a driven macos-26 boot answered `TypeDiffers` for 34
-            // of the 36 destroys that reached this line. A destroy whose ref
-            // resolves to an object of another kind is a ref in the
-            // serializer's own per-kind space — the census's own conclusion —
-            // and `name_resource` then hands back the name of whatever
-            // *shares the integer*, which this retires.
-            //
-            // A pipeline table entry is a tombstone once retired: `declare`
-            // refuses an id it already holds and `peek` answers
-            // `AbsentBecause::Retired` forever, so one wrong retirement refuses
-            // every later packet that binds the real pipeline. That is what it
-            // cost — **914 exec packets refused `pipeline_absent_retired` on
-            // macos-26 against zero on macos-15**, which is the boot where the
-            // guest deletes four.
-            //
-            // `NoListEntry` retires too, and deliberately: the guest clears its
-            // own object-list slot before sending the destroy, so an absent
-            // entry is the ordinary case and `name_resource` answers it from
-            // the name the slot already had. It is only a *disagreeing* entry
-            // that says the integer belongs to something else.
-            if ref_space == Some(RefSpaceAnswer::TypeDiffers) {
-                note_store_route("pipeline_retire_declined_other_ref_space");
-            } else if let Some(name) =
-                crate::runtime::objects::name_resource(state, host, task_id, object_ref)
-            {
-                let ended = state.retire_pipeline(name);
-                note_store_route_n("pipeline_retire_released", ended.stranded.len() as u64);
-                // Whether the table had an entry to retire, which is not the
-                // same question as whether the guest sent a delete. A driven
-                // `macos-26` boot sent 170 and the table took 116: the other 54
-                // named render pipelines this device never drew with, so they
-                // were never declared. That is ordinary, and naming it is what
-                // makes the day it stops being ordinary visible — the two
-                // numbers were otherwise separated by a subtraction of the
-                // `pipeline_table` occupancy line from this counter.
-                note_store_route(if ended.took {
-                    "pipeline_retired"
-                } else {
-                    "pipeline_retire_absent"
-                });
-            } else {
-                note_store_route("pipeline_retire_unnamed");
-            }
-        }
+        // Retire only the API object's registry. The ordering plane's leases
+        // name object-list construction inputs, not this per-kind API ref.
+        // Even a matching list type is not an identity: serializer slots are
+        // mutable and can already describe the next pipeline. Tombstoning that
+        // name makes its next cold translation impossible to await, because a
+        // retired lease is not a compilation wait. Warm translations hid that
+        // error; a cold fragment then lost its draw after earlier draws ran.
         let outcome =
             crate::backend::selected().retire_task_object(state, task_id, object, object_ref);
         note_store_route(object.route(outcome));

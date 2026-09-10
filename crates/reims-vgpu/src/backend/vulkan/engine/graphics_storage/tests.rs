@@ -1,5 +1,7 @@
 use super::*;
 
+mod gpu;
+
 fn request() -> DrawRequest {
     DrawRequest {
         skip_readback: true,
@@ -43,4 +45,25 @@ fn graphics_storage_rejects_truncated_native_seed_and_duplicate_descriptors() {
     request.storage_textures[0].bindings[2].binding = 300;
     assert_eq!(validate(&request),
         Err(GraphicsStorageDecline::DuplicateBinding { binding: 300 }.into()));
+}
+
+#[test]
+fn graphics_storage_all_descriptor_aliases_reuse_one_native_view() {
+    use ash::vk::Handle;
+    let req = request();
+    let view = vk::ImageView::from_raw(77);
+    let mut descriptors = Vec::new();
+    texture_descriptors(&req.storage_textures[0], view, &mut descriptors);
+    assert_eq!(descriptors.len(), 3);
+    for (descriptor, binding) in descriptors.iter().zip(&req.storage_textures[0].bindings) {
+        match descriptor {
+            PushDescriptorBinding::Image { view: actual, layout, ty, binding: actual_binding, .. } => {
+                assert_eq!(*actual, view);
+                assert_eq!(*layout, vk::ImageLayout::GENERAL);
+                assert_eq!(*ty, binding.access.descriptor_type());
+                assert_eq!(*actual_binding, binding.binding);
+            }
+            _ => panic!("graphics texture alias must remain an image"),
+        }
+    }
 }

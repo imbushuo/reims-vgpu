@@ -6270,6 +6270,111 @@ fn a_pipeline_destroy_whose_ref_names_another_kind_retires_no_pipeline() {
     );
 }
 
+/// An API destroy must not tombstone the object-list name used by preflight.
+/// The next construction can reuse that serializer slot with a cold fragment.
+/// A retired lease bypasses the translation wait and loses the later draw.
+#[test]
+fn a_pipeline_destroy_preserves_cold_translation_waits_on_a_reused_serializer_slot() {
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::runtime::decode::resource::{OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_SERIALIZER_OBJECT};
+    use reims_vgpu_core::exec::ExecWork;
+    use reims_vgpu_core::identity::ChannelId;
+    use reims_vgpu_core::transaction::Payload;
+    use reims_vgpu_protocol::packets::Channel;
+    use reims_vgpu_wire::ops::destroy::{DELETE_TOTAL_LEN, OPCODE_DELETE_RENDER_PIPELINE_STATE};
+
+    const TASK: u32 = 2;
+    const REF: u32 = 3;
+
+    for listed in [false, true] {
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data_gpa = 4u64 << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x4000, 0);
+        host.map_range(data_gpa, 0x200, 0);
+        let mut directory = [0u8; 8];
+        st32(&mut directory[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut directory[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &directory).unwrap();
+        host.write_gpa(root_gpa, &4u32.to_le_bytes()).unwrap();
+
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        state.define_task(TASK, 0x1000, 2);
+        assert!(state.set_object_list(TASK, 0, 8));
+        if listed {
+            let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+            st32(
+                &mut entry,
+                u32::from(OBJECT_TYPE_SERIALIZER_OBJECT) | (4u32 << 8),
+            );
+            entry[4..].copy_from_slice(&0x80u64.to_le_bytes());
+            host.write_gpa(
+                data_gpa + u64::from(REF) * OBJECT_LIST_ENTRY_LEN as u64,
+                &entry,
+            )
+            .unwrap();
+        }
+        let name = state
+            .declare_object(TASK, REF, reims_vgpu_core::lifecycle::Storage::NoBytes)
+            .unwrap()
+            .id;
+        assert!(state.declare_pipeline(name));
+        ready_lease(&state, name, "pipeline_lease_ready_test");
+
+        let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], TASK);
+        st32(&mut payload[4..], OPCODE_DELETE_RENDER_PIPELINE_STATE);
+        st32(&mut payload[8..], DELETE_TOTAL_LEN);
+        st32(&mut payload[12..], REF);
+        process_child_packet(
+            &mut state,
+            &mut host,
+            4,
+            &Packet {
+                opcode: CHILD_OP_DELETE_OBJECT,
+                stamp_waits: Vec::new(),
+                total_size: PACKET_HEADER_LEN + payload.len() as u32,
+                completion_stamp: 0,
+                payload,
+                next_head: 0,
+            },
+        );
+        assert_eq!(state.object_name(TASK, REF), Some(name));
+
+        // The preflight's pending answer for the next shader must still be
+        // able to hold the whole submission, before any clear/copy/draw runs.
+        withdraw_lease(&state, name);
+        let packet = reims_vgpu_core::session::Packet {
+            channel: Channel::Child,
+            domain: ChannelId::ROOT,
+            session: state.session_generation(),
+            opcode: CHILD_OP_EXEC_INDIRECT2,
+            stamp_waits: Vec::new(),
+            completion: None,
+            payload: Payload::Exec(ExecWork {
+                pipeline_leases: vec![name],
+                ..ExecWork::default()
+            }),
+        };
+        let cold = state.admit_packet(&packet).unwrap();
+        assert!(!cold.admitted.ready, "listed={listed}: cold work must wait");
+        assert!(state.take_ready().is_empty());
+        ready_lease(&state, name, "pipeline_lease_ready_test");
+        let ingress = cold.admitted.transaction.identity.ingress;
+        assert_eq!(state.take_ready(), vec![ingress]);
+        assert!(state.take_ready().is_empty(), "release is exactly once");
+        state.complete_transaction(cold.epoch, ingress).unwrap();
+
+        let warm = state.admit_packet(&packet).unwrap();
+        assert!(warm.admitted.ready, "warm work needs no translation wait");
+        let ingress = warm.admitted.transaction.identity.ingress;
+        assert_eq!(state.take_ready(), vec![ingress]);
+        state.complete_transaction(warm.epoch, ingress).unwrap();
+    }
+}
+
 /// `CmdDeleteObject` must not retire an object-table entry, however exactly its
 /// record's ref matches one.
 ///

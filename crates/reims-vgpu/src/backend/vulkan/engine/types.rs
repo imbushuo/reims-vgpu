@@ -880,8 +880,8 @@ pub struct DrawOutput {
     /// order the attachment *would* have read back in.
     ///
     /// Reported rather than re-derived. The order follows the resolved
-    /// attachment — [`TargetIdentity::is_bgra`] for a resident target, RGBA for
-    /// the pooled path — and a caller that recomputes the predicate is a caller
+    /// attachment, including native-format anonymous targets, and a caller
+    /// that recomputes the predicate from an optional residency key is a caller
     /// that can disagree with the image the readback actually came out of. This
     /// is the same rule the typed-decline work applies to a `reason=`: the side
     /// that performed the operation says what it did.

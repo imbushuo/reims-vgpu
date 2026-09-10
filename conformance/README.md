@@ -186,6 +186,10 @@ native-format image, including sampled aliases. Shader writes are published afte
 each completed draw, before deferred attachment Store. Unsupported shapes and
 attachment aliases refuse explicitly. Raster-order textures additionally require
 the host's `VK_EXT_fragment_shader_interlock` pixel-interlock feature.
+This does not admit imageblocks: the existing Vulkan reflection preflight rejects
+kernel imageblock tiles (including private scratch), implicit attachment planes,
+and custom fragment imageblocks before texture staging or rounding specialization.
+Those image-write producers do not inherit the ordinary AIR texture-write policy.
 Framebuffer-fetch ordering uses rasterization-order attachment access when
 available. Otherwise Vulkan serializes single-sample primitives with explicit
 framebuffer-local barriers, retaining native blending and depth/stencil tests.
@@ -199,22 +203,59 @@ different shader constants. Each must finish a cold compute pipeline and render
 pipeline; a previous task's equal-numbered object references must not satisfy
 its translation waits or retire its pipelines.
 
+`--corner-encoder-readiness-only` runs 24 cases: a 12-case corner restore sequence,
+then the same sequence with warm shader translations. It crosses BGRA8/RGBA16Float,
+shared/separate command buffers, and no snapshot/blit snapshot/fragment snapshot.
+Fresh fragment function names on each invocation preserve cold coverage without
+changing shader operations or result labels. Pipeline objects are recreated between
+cases to exercise deletion and serializer-slot reuse. The full suite runs this family
+before its linear-texture alignment cases. Qualify the same binary natively and on
+each guest rail; a warm pass alone cannot validate cold translation readiness.
+
 ## Running it
 
-`--texture-write-rounding-only` runs a 72-case authored compute conversion matrix. It crosses
+`--texture-write-rounding-only` runs a 75-case authored compute conversion matrix. It crosses
 native/RTZ/RTE compiler modes with every descriptor mode, repeats a descriptor to check cache reuse,
 and changes R16Float/RG16Float/RGBA16Float/RGBA32Float and
 normalized color views. The cases cover halfway values, signed zero, subnormal boundaries,
 overflow, NaN/Inf classes, and repeated cache reuse. Normalized-format results are compared with
 the same device's default conversion because the rounding property applies only to floating-point
-pixel formats. The independent descriptor-only and mismatched cases retain the native-calibrated
-precedence: on the Apple M2 oracle, the pipeline property does not override a source-compiled
-library's AIR write mode, and unqualified native writes use RTZ. Libraries compiled in different
-modes do not claim identical AIR bytes; variants within a compiler mode use the same function.
-The Vulkan compatibility profile declares that calibrated source-native RTZ policy explicitly;
-it is not inferred from the Vulkan driver's default. Run the binary
+pixel formats. The independent descriptor-only and mismatched cases check the explicit emulated
+source-device contract: unqualified writes use the selected RTZ profile, and explicit AIR
+`.rte`/`.rtz` modes are preserved. Libraries compiled in different modes do not claim identical
+AIR bytes; variants within a compiler mode use the same function.
+Three additional cold-first controls change the shader's write coordinates and request a
+conflicting descriptor first, independently checking precedence without warm PSO reuse.
+Apple M2 on macOS 26.6.2, Metal compiler 32023.886, passed all 75 cases, including the three
+cold-first controls. A separate authored float/half oracle completed 198 dispatches with reversed
+descriptor orders and independent write coordinates, matching the saved native/RTZ/RTE references.
+This qualifies the tested source profile and precedence controls, not another native device,
+OS/compiler combination, or untested PSO configuration.
+The Vulkan rail explicitly implements this source profile for both compute and graphics; it
+does not infer it from host Metal, MoltenVK, the physical GPU, or guest OS version. Another source
+profile needs independent qualification and explicit selection in executable/cache identity.
+Do not treat this suite's RTZ expectation as a universal native-Metal rule. Run the binary
 natively first, then unchanged on the selected guest rail; compiling
 these cases alone is not GPU parity evidence.
+The direct Vulkan owner regression also passed 18 compute dispatches on Apple M2 with pinned
+MoltenVK 1.4.2 and Khronos validation, covering native/RTZ/RTE AIR × all descriptor modes ×
+RGBA16Float/RGBA32Float. That validates the specialization's GPU execution, not guest execution.
+
+Imageblock conversion is not newly admitted or reinterpreted by this work.
+`spirv_bind::first_unsupported_vulkan_interface` already refuses `kernel_imageblock`,
+`implicit_imageblock_attachments`, and `fragment_imageblock` before compute rounding or
+graphics storage staging; its gate body is unchanged from the baseline preceding `5d63ffec`.
+The authored CPU regression
+`graphics_storage_other_image_write_producers_keep_existing_interface_refusals` checks all
+three producers, verifies they actually emit image writes, and verifies m2v `Default` leaves
+their existing conversion unchanged. This admission proof does **not** cover a private-cell
+slice with no reflected imageblock interface. That separately admitted path is covered by
+`private_cell_imageblock_slice_without_interface_keeps_existing_conversion`: its explicit
+executable producer wrapper preserves the pre-existing store conversion for half/float inputs
+under every descriptor mode, rather than applying AIR texture rounding to it. The translator
+also checks its pass-through arithmetic for every native policy and retains strict rejection
+of genuinely unmarked half writes. Ordinary color outputs, including memoryless render targets,
+do not use this AIR texture-write conversion path.
 
 Native, on the oracle — this also cross-builds the x86_64 fallback:
 

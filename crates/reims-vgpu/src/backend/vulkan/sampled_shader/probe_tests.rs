@@ -1,7 +1,6 @@
-//! Optional CPU-only reproduction against a locally retained AIR artifact.
+//! Authored sampler regressions and an optional CPU-only retained-AIR probe.
 
-#[test]
-fn synthesized_read_sampler_survives_reflection_and_final_compute_variants() {
+fn synthesized_sampler_shader() -> crate::runtime::m2v_cache::CachedShader {
     let source = r#"
 target triple = "spirv-unknown-vulkan1.2"
 define void @read_pair(ptr addrspace(1) %texture, ptr addrspace(2) %sampler, ptr addrspace(1) %out, ptr addrspace(1) %destination) {
@@ -31,13 +30,19 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
     let scratch = std::path::PathBuf::from(format!("target/synthesized-sampler-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
     let translated = metal2vulkan::translate_sanitized_native_reflected(
-        source, metal2vulkan::passes::Stage::Kernel, &scratch, Default::default(),
+        source, metal2vulkan::passes::Stage::Kernel, &scratch,
+        metal2vulkan::passes::TransformOptions { kernel_local_size: [1, 1, 1], ..Default::default() },
     );
     std::fs::remove_dir_all(&scratch).unwrap();
     let (bytes, reflection) = translated.unwrap();
+    crate::runtime::m2v_cache::CachedShader::new(bytes, std::sync::Arc::new(reflection))
+}
+
+#[test]
+fn synthesized_read_sampler_survives_reflection_and_final_compute_variants() {
     use crate::runtime::{m2v_cache::*, spirv_bind::*};
-    let destination = reflected_texture_descriptor(&reflection, 1).unwrap().binding;
-    let shader = CachedShader::new(bytes, std::sync::Arc::new(reflection));
+    let shader = synthesized_sampler_shader();
+    let destination = reflected_texture_descriptor(&shader.reflection, 1).unwrap().binding;
     let variant = shader.variant(false, false);
     assert_eq!(variant.samplers.iter().map(|s| s.binding).collect::<Vec<_>>(), [160, 161]);
     assert!(variant.samplers[0].guest_supplied());
@@ -49,10 +54,11 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
     ] {
         let words = shader.compute_texture_variant(ComputeTextureOptions {
             rounding_mode: mode,
-            native_rounding_mode: metal2vulkan::texture_write_rounding::TextureWriteRoundingMode::TowardZero,
+            native_rounding_mode: NATIVE_TEXTURE_WRITE_ROUNDING,
             image_formats: vec![(destination, ImageFormat::Rgba16Float)], rounding_targets: vec![],
         }).unwrap();
-        assert!(words.len() > shader.words.len(), "half-write rounding actually specializes this module");
+        assert_ne!(words.as_ref(), shader.words.as_ref(),
+            "half-write format and rounding constants actually specialize this module");
         assert!(descriptor_static_use(&words, 161).is_violation());
         let mut samplers: Vec<_> = variant.samplers.iter().map(|s|
             crate::backend::vulkan::engine::SamplerResource::normalized_default(s.binding)).collect();
@@ -68,6 +74,50 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
     let relocated = reflected_sampler_descriptors(&shader.reflection, true);
     assert_eq!(relocated[1].binding, 161 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET);
     assert_eq!(relocated[1].source, ReflectedSamplerSource::SynthesizedRead);
+}
+
+#[test]
+#[ignore = "requires an exclusive Vulkan GPU slot"]
+fn vulkan_gpu_synthesized_read_sampler_and_half_write_variant() {
+    use crate::backend::vulkan::engine::*;
+    use crate::runtime::{m2v_cache::*, spirv_bind::*};
+    use crate::model::{DeviceId, DeviceState, PAGE_SHIFT_ARM64E};
+    let shader = synthesized_sampler_shader();
+    let variant = shader.variant(false, false);
+    let destination = reflected_texture_descriptor(&shader.reflection, 1).unwrap().binding;
+    let words = shader.compute_texture_variant(ComputeTextureOptions {
+        rounding_mode: crate::protocol::compute::TextureWriteRoundingMode::Default,
+        native_rounding_mode: NATIVE_TEXTURE_WRITE_ROUNDING,
+        image_formats: vec![(destination, ImageFormat::Rgba16Float)], rounding_targets: vec![],
+    }).unwrap();
+    let mut samplers: Vec<_> = variant.samplers.iter()
+        .map(|s| SamplerResource::normalized_default(s.binding)).collect();
+    assert_eq!(samplers.iter().map(|s| s.binding).collect::<Vec<_>>(), [160, 161]);
+    samplers[0].unnormalized_coordinates = true;
+    let texel: Vec<u8> = [0.25f32, 0.5, 0.75, 1.0].into_iter().flat_map(f32::to_le_bytes).collect();
+    let req = ComputeRequest {
+        spirv: super::specialize(&words, &[], &samplers).unwrap(),
+        entry: "main".into(), dispatch: ComputeDispatch::Workgroups([1, 1, 1]),
+        storage_buffers: vec![ComputeBufferResource { binding: 0, bytes: vec![0xff; 16], writable: true }],
+        sampled_images: vec![ComputeSampledImageResource {
+            binding: 32, array_element: 0, descriptor_count: 1, format: StorageImageFormat::Rgba32Float,
+            width: 2, height: 2, mip_levels: 1, source: ComputeSampledSource::Bytes(texel.repeat(4)),
+        }],
+        samplers,
+        storage_images: vec![ComputeStorageImageResource {
+            binding: destination, array_element: 0, descriptor_count: 1,
+            format: StorageImageFormat::Rgba16Float, width: 1, height: 1, bytes: vec![0; 8],
+            destination: Default::default(), residency: None, seed_skipped: false,
+        }],
+    };
+    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let output = execute_compute_request(&state, &req).unwrap();
+    let expected: Vec<u8> = [0.5f32, 1.0, 1.5, 2.0].into_iter().flat_map(f32::to_le_bytes).collect();
+    assert_eq!(output.buffers[0].bytes, expected);
+    let expected_half: Vec<u8> = [0x3800u16, 0x3c00, 0x3e00, 0x4000]
+        .into_iter().flat_map(u16::to_le_bytes).collect();
+    assert_eq!(output.images[0].bytes().unwrap(), expected_half);
+    eprintln!("synthesized sampler161 PASS with pixel offset and native half-write variant");
 }
 
 #[test]

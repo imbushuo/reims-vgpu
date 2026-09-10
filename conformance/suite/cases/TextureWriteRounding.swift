@@ -28,8 +28,9 @@ private func roundedHalfBits(_ value: Float, towardZero: Bool) -> UInt16 {
 }
 
 /// Alternating modes and storage formats catches executable specialization aliasing. Select the
-/// documented compiler mode as well: the native oracle retains that mode when only the private
-/// pipeline property changes. Normalized formats are outside MSL §1.6.7's rounding control.
+/// documented compiler mode as well, with independent mismatched/cold descriptor controls.
+/// Native expectations qualify the selected emulated RTZ source profile, not every Metal GPU.
+/// Normalized formats are outside MSL §1.6.7's rounding control.
 func textureWriteRoundingCases() {
     do {
         let descriptor = MTLComputePipelineDescriptor()
@@ -124,61 +125,13 @@ func textureWriteRoundingCases() {
                                 }
                             } else {
                                 let bits = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
-                                // Native AIR uses RTZ on this calibrated Metal compatibility
-                                // profile. Explicit AIR modes survive mismatched descriptors.
+                                // This emulated source profile selects RTZ for unqualified AIR;
+                                // explicit AIR modes retain their own contract.
                                 let expected = roundedHalfBits(value, towardZero: compilerMode != 2)
                                 let isNaN = bits & 0x7c00 == 0x7c00 && bits & 0x03ff != 0
                                 if value.isNaN ? !isNaN : bits != expected {
                                     wrong += 1
                                 }
-                            }
-                            // A fresh, observable coordinate offset makes each AIR program different. These cases
-                            // distinguish per-write semantics from a native PSO cache accidentally retaining the
-                            // first descriptor mode compiled for one function.
-                            for (compilerMode, mode, offset) in [("native", 2, 509), ("rte", 1, 521), ("rtz", 2, 523)] {
-                                let options = MTLCompileOptions()
-                                if #available(macOS 15.0, *) { options.mathMode = .safe }
-                                else { options.fastMathEnabled = false }
-                                options.setValue("-ftexture-write-rounding-mode=\(compilerMode)", forKey: "additionalCompilerArguments")
-                                let shaders = try dev.makeLibrary(source: textureRoundingSource(offset: offset), options: options)
-                                let descriptor = MTLComputePipelineDescriptor()
-                                descriptor.computeFunction = shaders.makeFunction(name: "rounding_write")
-                                descriptor.setValue(NSNumber(value: mode), forKey: "textureWriteRoundingMode")
-                                let pipeline = try dev.makeComputePipelineState(descriptor: descriptor, options: [], reflection: nil)
-                                let td = MTLTextureDescriptor.texture2DDescriptor(
-                                    pixelFormat: .rgba16Float, width: values.count + offset, height: 1, mipmapped: false)
-                                td.storageMode = .shared
-                                td.usage = [.shaderRead, .shaderWrite]
-                                let texture = dev.makeTexture(descriptor: td)!
-                                let command = queue.makeCommandBuffer()!
-                                let encoder = command.makeComputeCommandEncoder()!
-                                encoder.setComputePipelineState(pipeline)
-                                encoder.setBuffer(input, offset: 0, index: 0)
-                                encoder.setTexture(texture, index: 0)
-                                encoder.dispatchThreads(MTLSize(width: values.count, height: 1, depth: 1),
-                                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
-                                encoder.endEncoding()
-                                command.commit()
-                                command.waitUntilCompleted()
-                                let label = "compute_texture_rounding_cold_\(compilerMode)_mode\(mode)"
-                                guard command.status == .completed else {
-                                    report(label, false, "command failed \(String(describing: command.error))")
-                                    continue
-                                }
-                                var bytes = [UInt8](repeating: 0, count: values.count * 8)
-                                texture.getBytes(&bytes, bytesPerRow: bytes.count,
-                                    from: MTLRegionMake2D(offset, 0, values.count, 1), mipmapLevel: 0)
-                                var wrong = 0
-                                for (i, value) in values.enumerated() {
-                                    for channel in 0..<4 {
-                                        let at = i * 8 + channel * 2
-                                        let bits = UInt16(bytes[at]) | (UInt16(bytes[at + 1]) << 8)
-                                        let isNaN = bits & 0x7c00 == 0x7c00 && bits & 0x03ff != 0
-                                        let expected = roundedHalfBits(value, towardZero: compilerMode != "rte")
-                                        if value.isNaN ? !isNaN : bits != expected { wrong += 1 }
-                                    }
-                                }
-                                report(label, wrong == 0, "wrong=\(wrong) first_descriptor=\(mode) coordinate_offset=\(offset)")
                             }
                         }
                     }
@@ -186,6 +139,53 @@ func textureWriteRoundingCases() {
                 report(label, wrong == 0, "wrong=\(wrong) pixels=\(values.count)")
               }
             }
+        }
+        // Changed write coordinates give each cold-first control independent AIR, excluding
+        // accidental reuse of the warm function's first descriptor mode.
+        for (compilerMode, mode, offset) in [("native", 2, 509), ("rte", 1, 521), ("rtz", 2, 523)] {
+            let options = MTLCompileOptions()
+            if #available(macOS 15.0, *) { options.mathMode = .safe }
+            else { options.fastMathEnabled = false }
+            options.setValue("-ftexture-write-rounding-mode=\(compilerMode)", forKey: "additionalCompilerArguments")
+            let shaders = try dev.makeLibrary(source: textureRoundingSource(offset: offset), options: options)
+            let descriptor = MTLComputePipelineDescriptor()
+            descriptor.computeFunction = shaders.makeFunction(name: "rounding_write")
+            descriptor.setValue(NSNumber(value: mode), forKey: "textureWriteRoundingMode")
+            let pipeline = try dev.makeComputePipelineState(descriptor: descriptor, options: [], reflection: nil)
+            let td = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba16Float, width: values.count + offset, height: 1, mipmapped: false)
+            td.storageMode = .shared
+            td.usage = [.shaderRead, .shaderWrite]
+            let texture = dev.makeTexture(descriptor: td)!
+            let command = queue.makeCommandBuffer()!
+            let encoder = command.makeComputeCommandEncoder()!
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(input, offset: 0, index: 0)
+            encoder.setTexture(texture, index: 0)
+            encoder.dispatchThreads(MTLSize(width: values.count, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            encoder.endEncoding()
+            command.commit()
+            command.waitUntilCompleted()
+            let label = "compute_texture_rounding_cold_\(compilerMode)_mode\(mode)"
+            guard command.status == .completed else {
+                report(label, false, "command failed \(String(describing: command.error))")
+                continue
+            }
+            var bytes = [UInt8](repeating: 0, count: values.count * 8)
+            texture.getBytes(&bytes, bytesPerRow: bytes.count,
+                from: MTLRegionMake2D(offset, 0, values.count, 1), mipmapLevel: 0)
+            var wrong = 0
+            for (i, value) in values.enumerated() {
+                for channel in 0..<4 {
+                    let at = i * 8 + channel * 2
+                    let bits = UInt16(bytes[at]) | (UInt16(bytes[at + 1]) << 8)
+                    let isNaN = bits & 0x7c00 == 0x7c00 && bits & 0x03ff != 0
+                    let expected = roundedHalfBits(value, towardZero: compilerMode != "rte")
+                    if value.isNaN ? !isNaN : bits != expected { wrong += 1 }
+                }
+            }
+            report(label, wrong == 0, "wrong=\(wrong) first_descriptor=\(mode) coordinate_offset=\(offset)")
         }
     } catch {
         report("compute_texture_write_rounding_setup", false, "\(error)")

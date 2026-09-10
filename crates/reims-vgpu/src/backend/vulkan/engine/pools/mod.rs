@@ -611,7 +611,8 @@ pub(crate) struct ResourcePools {
     /// entry can bind it; only the entries recording or in flight at that
     /// instant can still reference it. Clearing a slot's bit as it retires
     /// therefore frees the handle on the last fence that could be reading it,
-    /// not on the whole ring going idle.
+    /// not on the whole ring going idle. Host-window dependencies are captured
+    /// as individual completion promises, likewise unaffected by newer work.
     graveyard: Vec<GraveyardEntry>,
     /// Resident-target recycle pool: images displaced from the identity registry
     /// (generation bump / geometry change / LRU), held by (geometry, format) for

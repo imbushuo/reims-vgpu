@@ -2442,10 +2442,12 @@ fn draw_has_no_invocations(req: &DrawRequest) -> bool {
     element_count == 0 || req.instance_count == Some(0)
 }
 
+fn attachment_is_bgra(format: vk::Format) -> bool {
+    matches!(format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB)
+}
+
 fn seed_requires_rb_swap(order: SeedOrder, attachment_format: vk::Format) -> bool {
-    let attachment_bgra = matches!(attachment_format,
-        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB);
-    matches!(order, SeedOrder::Bgra8) != attachment_bgra
+    matches!(order, SeedOrder::Bgra8) != attachment_is_bgra(attachment_format)
 }
 
 fn seed_formats_match(source: vk::Format, destination: vk::Format) -> bool {
@@ -2736,28 +2738,13 @@ pub(crate) unsafe fn execute_draw_inner(
     // submit entirely. Every other draw claims a slot via begin_entry, which
     // flushes any open batch first (queue order = record order).
     let is_mrt = !req.secondary_targets.is_empty();
-    // The resolved attachment decides its own channel order, and the identity is
-    // the only thing that decides it: see [`TargetIdentity::is_bgra`]. A pooled
-    // draw with no identity has no destination to match and stays RGBA.
-    //
-    // Derived here rather than at each runtime call site so that all the draws
-    // sharing one identity in a frame agree by construction. `registry_ensure`
-    // destroys and recreates the image on an order mismatch, so a per-path
-    // predicate that one path spells differently is a full reallocation per
-    // composite, not a wrong colour.
-    //
-    // A `DrawRequest::output_bgra` used to sit beside this as an explicit
-    // opt-in, OR-ed in here. It is gone rather than unused: once every
-    // namespace with a byte-for-byte destination answers from its own key, the
-    // only thing an opt-in could express is an order that *disagrees* with the
-    // key — which is the per-frame reallocation the paragraph above describes,
-    // spelled as a feature. No runtime caller ever set it, and the six parity
-    // tests that did were all already rendering into a `Surface` identity.
-    let output_bgra = req.target_identity.as_ref().is_some_and(|id| id.is_bgra());
     // Slot 0's view supplies the attachment format. The identity names the
     // allocation behind it; treating those as the same question loses Metal's
     // compatible-format texture views (most visibly UNORM versus sRGB).
     let color0_format = req.primary_format();
+    // Anonymous targets also retain their declared native format. Their raw
+    // readback must be labelled from that image, not an absent residency key.
+    let output_bgra = attachment_is_bgra(color0_format);
     // A guest-sourced sampled bind used to force the immediate-submit path.
     // Its read of guest RAM happens when the CB *executes*, and this device
     // acked the packet as soon as it was consumed, so deferred submit stretched
@@ -3049,16 +3036,12 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     // Resolve load action: resident > guest/host seed > Clear black.
     let mut load_uses_gpu_content = req.load_from_target;
-    // output_bgra (computed with the batch decision above): BGRA output only
-    // on the resident path (pooled targets stay RGBA); the whole
-    // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
-    // copy lands guest scanout order with no CPU swizzle.
     // The seed is borrowed from `req`, never copied to the heap. It is a whole
     // frame, and `engine_delta` measures ~430 MB/s of seed uploads under a
     // browser workload — so a `Vec` here is ~430 MB/s of memcpy plus ~240
     // multi-MiB allocations a second on the drain worker that `drain_duty`
     // shows pinned at duty 0.9+. The only thing that copy bought was a buffer
-    // the `output_bgra` arm could swizzle in place; that swizzle now happens
+    // the native-format arm could swizzle in place; that swizzle now happens
     // during the single copy into the mapped staging span, so the pixels are
     // touched once either way.
     let seed_bytes: Option<&[u8]> = if load_uses_gpu_content {
@@ -4379,6 +4362,10 @@ pub(crate) unsafe fn execute_draw_inner(
         // An allocated set is fresh out of the pool and carries nothing, so
         // there is no unchanged case to elide: it is written every draw.
         with_descriptor_writes(pools.push_descriptor_scratch_ref(), dset, |writes| {
+            #[cfg(test)]
+            super::graphics_storage::assert_final_descriptor_writes(
+                req, &graphics_storage, writes, "allocated",
+            );
             ctx.device.update_descriptor_sets(writes, &[]);
         });
         counters
@@ -5424,6 +5411,10 @@ pub(crate) unsafe fn execute_draw_inner(
                 pools.push_descriptor_echo(),
                 vk::DescriptorSet::null(),
                 |writes| {
+                    #[cfg(test)]
+                    super::graphics_storage::assert_final_descriptor_writes(
+                        req, &graphics_storage, writes, "push",
+                    );
                     push_entry.cmd_push_descriptor_set(
                         cb,
                         vk::PipelineBindPoint::GRAPHICS,
@@ -6654,6 +6645,32 @@ mod tests {
         for format in [vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB] {
             assert!(!seed_requires_rb_swap(SeedOrder::Rgba8, format));
             assert!(seed_requires_rb_swap(SeedOrder::Bgra8, format));
+        }
+    }
+
+    #[test]
+    fn anonymous_target_readback_reports_its_actual_native_byte_order() {
+        for (pixel_format, bgra) in [
+            (crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM, false),
+            (crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM, true),
+            (crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB, true),
+        ] {
+            let req = DrawRequest {
+                color_attachment: Some(crate::backend::vulkan::translate::pixel::color_attachment(
+                    pixel_format,
+                ).unwrap().0.with_clear([0.0; 4])),
+                ..Default::default()
+            };
+            assert!(req.target_identity.is_none());
+            let format = req.primary_format();
+            let bytes = vec![0x10, 0x30, 0x90, 0xff];
+            let (actual, texel) = super::super::narrow_readback_to_rgba8(
+                bytes.clone(),
+                crate::backend::vulkan::translate::pixel::texel_layout_of(format).unwrap(),
+                format, 1, attachment_is_bgra(format),
+            ).unwrap();
+            assert_eq!(actual, bytes);
+            assert_eq!(texel, super::super::ReadbackTexel::eight_bit(bgra));
         }
     }
 

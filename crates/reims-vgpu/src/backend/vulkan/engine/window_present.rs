@@ -37,7 +37,7 @@ use crate::backend::vulkan::translate;
 /// can retire every present without ever becoming idle. Each graveyard entry
 /// waits only on the frame completions that existed when it was disposed.
 ///
-/// A `static` rather than a field on either side, because it is a fact about the
+/// Tracked process-locally rather than as a field on either side: it is a fact about the
 /// process: `backend::select` latches one rail, the engine owns one
 /// `VkInstance`/`VkDevice`, and `window_presenter` hangs off that same owner as
 /// one host window. It is deliberately *not* on `ResourcePools`: the registry is
@@ -56,15 +56,20 @@ pub(crate) fn window_presents_in_flight() -> bool {
 /// Claim the window's graveyard slot for one submitted present.
 ///
 /// Called only where `PresentFrame::submitted` is set, and paired with
-/// [`WindowPresenter::end_present_in_flight`] at every place it is cleared.
-fn begin_present_in_flight() -> retirement::WindowWork {
-    retirement::begin()
+/// [`end_present_in_flight`] at every place it is cleared.
+fn begin_present_in_flight(fence: vk::Fence) -> retirement::WindowWork {
+    retirement::begin(fence)
+}
+
+/// Caller holds ENGINE, as do every reset and destruction of these fences.
+pub(crate) unsafe fn poll_completed_retirements(ctx: &DeviceContext) -> Result<usize, vk::Result> {
+    unsafe { retirement::poll(&ctx.device) }
 }
 
 /// Hold the window's graveyard slot for the body of a test, and give it back on
 /// drop.
 ///
-/// A guard rather than a bare pair of calls, because the counter is a `static`
+/// A guard rather than a bare pair of calls, because the tracker is process-local
 /// and the suite is serial: a test that asserted its way to a panic between a
 /// claim and its release would leave every later test believing a present is
 /// outstanding, and the failure would land on an innocent test.
@@ -74,7 +79,7 @@ pub(crate) struct PresentInFlightForTest(retirement::WindowWork);
 #[cfg(test)]
 impl PresentInFlightForTest {
     pub(crate) fn claim() -> Self {
-        Self(begin_present_in_flight())
+        Self(begin_present_in_flight(vk::Fence::null()))
     }
 }
 
@@ -85,23 +90,10 @@ impl Drop for PresentInFlightForTest {
     }
 }
 
-/// Clear `frame`'s `submitted` latch and give back the graveyard slot it
-/// claimed.
-///
-/// The two are one action and are never written apart. The latch says this
-/// entry's blit is outstanding; the slot is what `dispose` consults before
-/// destroying anything that blit may still be reading. Clearing the latch alone
-/// would open the graveyard while the blit runs — the defect the slot exists to
-/// close — and clearing the slot alone would hold it shut forever.
-///
-/// A free function over one frame rather than a method, because two of the four
-/// sites clear latches while iterating `&mut self.frames` and could not call a
-/// `&mut self` method; splitting the rule across a method and two hand-written
-/// copies is how the pair would come apart.
-///
-/// `mem::replace` and not an unconditional decrement: `recreate_swapchain` and
-/// `destroy` both clear latches that may already be clear, so the decrement has
-/// to be per claim rather than per call or it underflows.
+/// Release the frame's claim after its fence completes or the queue quiesces.
+/// Maintenance may already have observed that fence and completed its promise;
+/// taking the claim also makes this presenter entry reusable. Completion stays
+/// idempotent across polling, swapchain recreation, and device teardown.
 fn end_present_in_flight(frame: &mut PresentFrame) {
     if let Some(work) = frame.submitted.take() {
         work.complete();
@@ -848,11 +840,9 @@ impl WindowPresenter {
     /// Release every entry whose blit has finished, and say whether the entry
     /// the next present would use is free.
     ///
-    /// Sweeping all of them rather than only the next one matters for the
-    /// graveyard: an entry that completed is still holding `WINDOW_PRESENT_SLOT`
-    /// shut, and with several in flight the round-robin might not revisit it for
-    /// another two presents. The return value is still about one entry, because
-    /// that is the only one the caller is about to record into.
+    /// Sweep all entries so their completion snapshots advance even between
+    /// maintenance ticks. The return value is still about the one entry the
+    /// caller is about to record into.
     unsafe fn retire(&mut self, ctx: &DeviceContext) -> Result<bool, DrawError> {
         for ix in 0..self.frames.len() {
             if self.frames[ix].submitted.is_none() {
@@ -1398,7 +1388,7 @@ impl WindowPresenter {
         let submission = submit_result?;
         // Claimed before the latch, so the slot is never observed clear while
         // the latch says an entry is outstanding.
-        self.frames[frame_ix].submitted = Some(begin_present_in_flight());
+        self.frames[frame_ix].submitted = Some(begin_present_in_flight(frame_in_flight));
         // Only a successful submit advances the ring; a `Busy` return above
         // leaves the slot for the next attempt.
         self.frame_ix = (frame_ix + 1) % self.frames.len();
@@ -1762,11 +1752,9 @@ impl WindowPresenter {
     /// Give every entry's graveyard claim back after the caller has waited the
     /// queue idle.
     ///
-    /// It released pins as well until the presenter stopped taking any. What is
-    /// left is the claim on `WINDOW_PRESENT_SLOT`, which is the whole reason a
-    /// guest reset must call this: the bit is a `static` the graveyard consults,
-    /// so an entry that never retires would hold it shut for the rest of the
-    /// process.
+    /// A guest reset must complete these promises before their native fences
+    /// disappear. Existing graveyard snapshots remain valid, and maintenance
+    /// can never poll a destroyed fence.
     pub(crate) fn release_claims_after_idle(&mut self) {
         for frame in &mut self.frames {
             end_present_in_flight(frame);
@@ -1788,7 +1776,7 @@ impl WindowPresenter {
             // `queue_wait_idle` above is what makes this sound: every entry's
             // blit has completed, so giving the slot back here cannot open the
             // graveyard under live work. Per entry that actually held a claim,
-            // for the reason `end_present_in_flight` uses `mem::replace` —
+            // for the reason `end_present_in_flight` uses `Option::take` —
             // `destroy` may run twice and a second pass has no frames left.
             end_present_in_flight(&mut frame);
             ctx.device.destroy_fence(frame.in_flight, None);

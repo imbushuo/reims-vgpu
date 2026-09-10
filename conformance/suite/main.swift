@@ -52,6 +52,11 @@ if CommandLine.arguments.contains("--texture-write-rounding-only") {
     finish()
 }
 
+if CommandLine.arguments.contains("--corner-encoder-readiness-only") {
+    cornerEncoderReadinessCases()
+    finish()
+}
+
 if CommandLine.arguments.contains("--indexed-draw-only") {
     _ = library
     report("shader_compile", true, "runtime library built")
@@ -76,6 +81,7 @@ indexedDrawCases()
 
 depthTaskIsolationCase()
 pipelineTaskIsolationCases()
+cornerEncoderReadinessCases()
 
 for f in formats {
     linearAliasCase(f, 64, 16, pitch: .tight, sampler: false)

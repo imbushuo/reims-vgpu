@@ -628,7 +628,16 @@ impl ResourcePools {
         // presents remain outstanding and no engine fence retires this tick.
         // The presenter still never reaches into the resource registry.
         #[cfg(feature = "host-window")]
-        unsafe { self.release_graveyard(&ctx.device, 0) };
+        unsafe {
+            let retired = super::super::window_present::poll_completed_retirements(ctx)
+                .map_err(|error| Self::wait_error(
+                    counters, error, DeviceLostOp::PoolsFenceStatusMaintenance,
+                ))?;
+            if retired != 0 {
+                crate::runtime::drain::note_store_route_n("window_work_retired_maintenance", retired as u64);
+            }
+            self.release_graveyard(&ctx.device, 0);
+        }
         unsafe {
             self.retire_signaled_slots(ctx, counters, DeviceLostOp::PoolsFenceStatusMaintenance)
         }
@@ -937,8 +946,9 @@ impl ResourcePools {
         mask
     }
 
-    /// Destroy `handle` now if nothing can be reading it, else park it in the
-    /// graveyard until each slot open at this instant has retired.
+    /// Destroy `handle` now if nothing can be reading it, else capture the ring
+    /// slots and individual window completions that can still reference it.
+    /// Subsequent window work cannot add dependencies to this disposal.
     pub(crate) unsafe fn dispose(&mut self, device: &ash::Device, handle: DeferredHandle) {
         let entry = GraveyardEntry::new(self.open_slot_mask(), handle);
         if entry.waiting == 0 {
@@ -6770,6 +6780,27 @@ mod recycle_tests {
             dsets: Vec::new(),
         });
         assert_eq!(pools.open_slot_mask(), 1 << 3, "the batch's own slot");
+        pools.graveyard.push(GraveyardEntry::new(
+            pools.open_slot_mask(),
+            DeferredHandle::PassLocalImage {
+                image: vk::Image::null(), view: vk::ImageView::null(),
+                memory: vk::DeviceMemory::null(), attachment_bytes: 16 * 16 * 4,
+            },
+        ));
+        assert!(pools.take_released_graveyard(0).is_empty(),
+            "ending a native pass cannot destroy images its unsubmitted batch still references");
+        let batch = pools.open_batch.take().unwrap();
+        pools.slots[3] = pending_slot();
+        pools.cur = 0;
+        pools.open_batch = Some(batch);
+        assert!(pools.take_released_graveyard(0).is_empty(),
+            "submitting the old batch is not its fence completing");
+        assert!(pools.take_released_graveyard(1 << 0).is_empty(),
+            "a later recording batch cannot release the old batch's resources");
+        pools.slots[3].pending = None;
+        assert_eq!(pools.take_released_graveyard(1 << 3).len(), 1);
+        assert!(pools.open_batch.is_some(),
+            "old native images retire without waiting for a newer batch to finish");
     }
 
     /// The target decides a join only on the narrowed arm, and each of the three
@@ -7003,6 +7034,9 @@ mod recycle_tests {
                 image: vk::Image::null(), view: vk::ImageView::null(),
                 memory: vk::DeviceMemory::null(), attachment_bytes: 1920 * 1080 * 8,
             }));
+            pools.graveyard.push(GraveyardEntry::new(
+                pools.open_slot_mask(), DeferredHandle::Framebuffer(vk::Framebuffer::null()),
+            ));
             let index = step % RING_DEPTH;
             pools.slots[index].pending = None;
             released += pools.take_released_graveyard(1 << index).len();
@@ -7013,12 +7047,12 @@ mod recycle_tests {
             windows.pop_front();
             released += pools.take_released_graveyard(0).len();
             assert!(window_present::window_presents_in_flight());
-            assert!(pools.graveyard.len() <= RING_DEPTH.max(3),
+            assert!(pools.graveyard.len() <= RING_DEPTH.max(3) * 2,
                 "old native allocations wait for new, unrelated window work at step {step}");
         }
         drop(windows);
         released += pools.take_released_graveyard(!0).len();
-        assert_eq!(released, 64);
+        assert_eq!(released, 64 * 2);
         assert_eq!(pools.pass_local_retiring_levels(), NonPinnedTotals::default());
     }
 }

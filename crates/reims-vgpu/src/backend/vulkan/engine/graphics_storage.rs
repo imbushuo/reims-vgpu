@@ -53,6 +53,7 @@ pub enum GraphicsStorageDecline {
     Reflection { index: u32 },
     Format { texture_ref: u32 },
     Specialization,
+    WriteRounding { stage: vk::ShaderStageFlags, detail: String },
     Staging(Box<crate::runtime::compute_exec::ComputeStatus>),
     Publication(Box<crate::runtime::compute_exec::ComputeStatus>),
     Output,
@@ -79,6 +80,7 @@ impl crate::observe::Decline for GraphicsStorageDecline {
             Self::Reflection { .. } => "draw_vk_storage_reflection",
             Self::Format { .. } => "draw_vk_storage_texture_format",
             Self::Specialization => "draw_vk_storage_specialization",
+            Self::WriteRounding { .. } => "draw_vk_storage_write_rounding",
             Self::Staging(_) => "draw_vk_storage_staging",
             Self::Publication(_) => "draw_vk_storage_publication",
             Self::Output => "draw_vk_storage_output",
@@ -212,12 +214,48 @@ pub(super) fn descriptors(
     out: &mut Vec<PushDescriptorBinding>,
 ) {
     for (texture, prepared) in req.storage_textures.iter().zip(prepared) {
+        texture_descriptors(texture, prepared.image.view, out);
+    }
+}
+
+fn texture_descriptors(
+    texture: &GraphicsStorageTexture,
+    view: vk::ImageView,
+    out: &mut Vec<PushDescriptorBinding>,
+) {
+    for binding in &texture.bindings {
+        out.push(PushDescriptorBinding::Image {
+            binding: binding.binding, array_element: 0,
+            ty: binding.access.descriptor_type(), sampler: vk::Sampler::null(),
+            view, layout: vk::ImageLayout::GENERAL,
+        });
+    }
+}
+
+#[cfg(test)]
+pub(super) fn assert_final_descriptor_writes(
+    req: &DrawRequest,
+    prepared: &[PreparedTexture],
+    writes: &[vk::WriteDescriptorSet<'_>],
+    site: &str,
+) {
+    for (texture, prepared) in req.storage_textures.iter().zip(prepared) {
         for binding in &texture.bindings {
-            out.push(PushDescriptorBinding::Image {
-                binding: binding.binding, array_element: 0,
-                ty: binding.access.descriptor_type(), sampler: vk::Sampler::null(),
-                view: prepared.image.view, layout: vk::ImageLayout::GENERAL,
-            });
+            let matches: Vec<_> = writes.iter().filter(|write| {
+                write.dst_binding == binding.binding && write.dst_array_element == 0
+            }).collect();
+            assert_eq!(matches.len(), 1, "final descriptor must not be missing or overwritten");
+            let write = matches[0];
+            assert_eq!(write.descriptor_type, binding.access.descriptor_type());
+            assert_eq!(write.descriptor_count, 1);
+            assert!(!write.p_image_info.is_null());
+            // Called inside with_descriptor_writes, while its native info
+            // arrays are alive, immediately before the Vulkan update/push call.
+            let info = unsafe { &*write.p_image_info };
+            assert_eq!(info.image_view, prepared.image.view);
+            assert_eq!(info.image_layout, vk::ImageLayout::GENERAL);
+            eprintln!("graphics-storage-final-descriptor site={site} binding={} type={:?} image={:?} view={:?}",
+                binding.binding, write.descriptor_type, prepared.image.image, info.image_view);
         }
     }
 }

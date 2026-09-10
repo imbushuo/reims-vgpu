@@ -6,6 +6,8 @@ use crate::runtime::gva_mem::{define_task_pages_arm64e, read_task_gva, write_tas
 use crate::runtime::host::FakeHost;
 use metal2vulkan::reflect::*;
 
+mod imageblock_admission;
+
 fn fixture(levels: u16) -> (DeviceState, FakeHost, DrawEncodeRequest, Vec<u8>) {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -177,6 +179,26 @@ fn graphics_storage_reflected_writes_are_not_dropped_when_unbound_or_unknown() {
 }
 
 #[test]
+fn graphics_storage_array_images_and_descriptor_arrays_refuse_before_staging() {
+    for descriptor_array in [false, true] {
+        let (mut state, mut host, mut req, _) = fixture(1);
+        req.fragment_textures = vec![
+            TextureBind { index: 0, texture_ref: 7, ..Default::default() },
+        ].into();
+        let vertex = reflection(ShaderStage::Vertex, &[]);
+        let mut fragment = reflection(ShaderStage::Fragment, &[(0, true)]);
+        if descriptor_array {
+            fragment.bindings[0].descriptor.as_mut().unwrap().count = 2;
+        } else {
+            fragment.bindings[0].texture_shape.as_mut().unwrap().arrayed = true;
+        }
+        assert!(matches!(StorageTextures::stage(
+            &mut state, &mut host, &req, &vertex, &fragment,
+        ), Err(DrawError::GraphicsStorage(Refused::Shape { texture_ref: 7 }))));
+    }
+}
+
+#[test]
 fn graphics_storage_incomplete_completion_cannot_publish_seed_as_output() {
     let (mut state, mut host, req, _) = fixture(1);
     let mut storage = StorageTextures::default();
@@ -185,4 +207,106 @@ fn graphics_storage_incomplete_completion_cannot_publish_seed_as_output() {
         Err(Refused::Output.into()));
     assert_eq!(storage.publish(&mut state, &mut host, req.task_id, vec![vec![0; 4]]),
         Err(Refused::Output.into()));
+}
+
+fn rounding_spec_values(words: &[u32]) -> BTreeMap<u32, u32> {
+    let mut decorations = BTreeMap::new();
+    let mut values = BTreeMap::new();
+    let mut offset = 5;
+    while offset < words.len() {
+        let count = (words[offset] >> 16) as usize;
+        assert!(count > 0 && offset + count <= words.len());
+        let inst = &words[offset..offset + count];
+        match (inst[0] & 0xffff, inst.len()) {
+            (71, 4) if inst[2] == 1 => { decorations.insert(inst[1], inst[3]); }
+            (50, 4) => { values.insert(inst[2], inst[3]); }
+            _ => {}
+        }
+        offset += count;
+    }
+    decorations.into_iter().filter_map(|(id, spec)| values.get(&id).map(|v| (spec, *v))).collect()
+}
+
+#[test]
+fn graphics_storage_rounding_follows_final_native_formats_and_relocated_stage_bindings() {
+    use crate::backend::vulkan::engine::StorageImageFormat as F;
+    use metal2vulkan::texture_write_rounding::{
+        NATIVE_TEXTURE_WRITE_ROUNDING_SPEC_ID, TEXTURE_WRITE_FORMAT_SPEC_ID_BASE,
+    };
+    let scratch = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../../target/graphics-test-artifacts/rounding-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    for vertex in [true, false] {
+        let (air_stage, return_type, return_value, outputs, stage) = if vertex {
+            ("vertex", "<4 x float>", "ret <4 x float> <float 0.0, float 0.0, float 0.0, float 1.0>",
+             "!1 = !{!4}\n!4 = !{!\"air.position\", !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", !\"position\"}",
+             ash::vk::ShaderStageFlags::VERTEX)
+        } else {
+            ("fragment", "void", "ret void", "!1 = !{}", ash::vk::ShaderStageFlags::FRAGMENT)
+        };
+        for suffix in ["", ".rte", ".rtz"] {
+            let source = format!(r#"
+target triple = "spirv-unknown-vulkan1.2"
+define {return_type} @write_image(ptr addrspace(1) %image) {{
+entry:
+  call void @air.write_texture_2d{suffix}.v4f32(ptr addrspace(1) %image, <2 x i32> zeroinitializer, <4 x float> <float f0x3f803000, float f0x3f803000, float f0x3f803000, float f0x3f803000>, i32 0, i32 2)
+  {return_value}
+}}
+declare void @air.write_texture_2d{suffix}.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
+!air.{air_stage} = !{{!0}}
+!0 = !{{ptr @write_image, !1, !2}}
+{outputs}
+!2 = !{{!3}}
+!3 = !{{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"image"}}
+"#);
+            let bytes = metal2vulkan::translate_sanitized_native(&source,
+                if vertex { metal2vulkan::passes::Stage::Vertex } else { metal2vulkan::passes::Stage::Fragment },
+                &scratch,
+            ).unwrap();
+            let mut original: Vec<u32> = bytes.chunks_exact(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+            let mut binding = DEFAULT_DESCRIPTOR_LAYOUT.storage_textures.start;
+            if !vertex {
+                assert_eq!(spirv_bind::offset_fragment_storage_bindings(&mut original), 1);
+                binding += spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET;
+            }
+            for (format, image_format, precision) in [
+                (F::Rgba16Float, spirv_bind::ImageFormat::Rgba16Float, 16),
+                (F::Rgba32Float, spirv_bind::ImageFormat::Rgba32Float, 0),
+                (F::Bgra8Unorm, spirv_bind::ImageFormat::Unknown, 0),
+            ] {
+                let resources = [GraphicsStorageTexture {
+                    format, width: 1, height: 1, bytes: vec![0; format.bytes_per_texel()],
+                    bindings: vec![GraphicsTextureBinding {
+                        binding, access: GraphicsTextureAccess::Storage, stage,
+                    }],
+                }];
+                let mut words = std::sync::Arc::new(original.clone());
+                spirv_bind::specialize_image_formats(
+                    std::sync::Arc::make_mut(&mut words), &[(binding, image_format)],
+                ).unwrap();
+                specialize_write_rounding(&resources, &mut words, stage).unwrap();
+                let values = rounding_spec_values(&words);
+                assert_eq!(values[&NATIVE_TEXTURE_WRITE_ROUNDING_SPEC_ID], 1);
+                assert_eq!(values[&TEXTURE_WRITE_FORMAT_SPEC_ID_BASE], precision,
+                    "stage={stage:?} source={suffix} format={format:?}");
+            }
+        }
+    }
+    std::fs::remove_dir_all(scratch).unwrap();
+}
+
+#[test]
+fn graphics_storage_rounding_specialization_failure_is_typed() {
+    let stage = ash::vk::ShaderStageFlags::FRAGMENT;
+    let resources = [GraphicsStorageTexture {
+        format: crate::backend::vulkan::engine::StorageImageFormat::Rgba16Float,
+        width: 1, height: 1, bytes: vec![0; 8],
+        bindings: vec![GraphicsTextureBinding {
+            binding: 1152, access: GraphicsTextureAccess::Storage, stage,
+        }],
+    }];
+    let mut words = std::sync::Arc::new(Vec::new());
+    assert!(matches!(specialize_write_rounding(&resources, &mut words, stage),
+        Err(Refused::WriteRounding { stage: failed, .. }) if failed == stage));
 }

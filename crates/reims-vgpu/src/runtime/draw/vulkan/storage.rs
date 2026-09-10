@@ -51,6 +51,37 @@ fn ordinary_single_level(
         })
 }
 
+// Reflected imageblock ABIs are refused before staging. Metadata-free private
+// slices can still be admitted: those producers must carry their own preserved
+// conversion contract, not inherit ordinary AIR texture-write policy.
+fn specialize_write_rounding(
+    resources: &[GraphicsStorageTexture],
+    words: &mut std::sync::Arc<Vec<u32>>,
+    stage: ash::vk::ShaderStageFlags,
+) -> Result<(), Refused> {
+    use metal2vulkan::texture_write_rounding::{
+        specialize_texture_write_rounding, TextureWriteFormat, TextureWriteTarget,
+    };
+    if !resources.iter().any(|texture| texture.bindings.iter().any(|binding| {
+        binding.stage == stage && binding.access == GraphicsTextureAccess::Storage
+    })) {
+        return Ok(());
+    }
+    // BGRA has no SPIR-V image-format token. Its runtime descriptor supplies the
+    // normalized target fact; every other admitted format is now in TypeImage.
+    let targets: Vec<_> = resources.iter()
+        .filter(|texture| texture.format == crate::backend::vulkan::engine::StorageImageFormat::Bgra8Unorm)
+        .flat_map(|texture| &texture.bindings)
+        .filter(|binding| binding.stage == stage && binding.access == GraphicsTextureAccess::Storage)
+        .map(|binding| TextureWriteTarget {
+            descriptor_set: 0, binding: binding.binding, format: TextureWriteFormat::Normalized,
+        }).collect();
+    *words = std::sync::Arc::new(specialize_texture_write_rounding(
+        words, crate::runtime::m2v_cache::NATIVE_TEXTURE_WRITE_ROUNDING, &targets,
+    ).map_err(|detail| Refused::WriteRounding { stage, detail })?);
+    Ok(())
+}
+
 impl StorageTextures {
     pub(super) fn is_empty(&self) -> bool {
         self.textures.is_empty()
@@ -201,6 +232,8 @@ impl StorageTextures {
                 bindings: texture.bindings.clone(),
             });
         }
+        specialize_write_rounding(&resources, vertex_words, ash::vk::ShaderStageFlags::VERTEX)?;
+        specialize_write_rounding(&resources, fragment_words, ash::vk::ShaderStageFlags::FRAGMENT)?;
         Ok(resources)
     }
 

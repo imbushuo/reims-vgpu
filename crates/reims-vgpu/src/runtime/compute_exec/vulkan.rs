@@ -1013,10 +1013,9 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     // float texture declaration, and changing a TypeImage token alone cannot implement rounding.
     let options = crate::runtime::m2v_cache::ComputeTextureOptions {
         rounding_mode: pipeline.texture_write_rounding_mode,
-        // This compatibility profile's source-native half write contract is RTZ, calibrated
-        // against the native Metal oracle. The private descriptor property does not override AIR
-        // write intrinsics; `.rte` remains RTE and an unqualified write remains source-native.
-        native_rounding_mode: metal2vulkan::texture_write_rounding::TextureWriteRoundingMode::TowardZero,
+        // Unqualified AIR uses the explicit emulated source profile, never the host's default.
+        // Explicit `.rte`/`.rtz` writes keep their own per-write modes.
+        native_rounding_mode: crate::runtime::m2v_cache::NATIVE_TEXTURE_WRITE_ROUNDING,
         image_formats: storage_formats.iter()
             .map(|(binding, _, _, specialized)| (*binding, *specialized)).collect(),
         rounding_targets: storage_formats.iter().filter_map(|(binding, guest, _, specialized)| {
