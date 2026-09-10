@@ -42,6 +42,9 @@ pub enum DrawReason {
     /// this device declining to risk the process on undefined behaviour inside
     /// a driver, and it costs the guest the whole dispatch.
     SpirvInvalid,
+    /// A 16-bit shader interface needs storageInputOutput16 enabled on this
+    /// device; shaderFloat16 and storageBuffer16BitAccess do not permit it.
+    ShaderInputOutput16Unsupported,
     /// A previous process died inside the driver call this request would make,
     /// with these exact modules, so this device will not make it again.
     ///
@@ -352,6 +355,7 @@ impl crate::observe::Decline for DrawReason {
     fn slug(&self) -> &'static str {
         match self {
             Self::SpirvInvalid => "spirv_module_invalid",
+            Self::ShaderInputOutput16Unsupported => "shader_input_output16_unsupported",
             Self::UsedBindingAbsentFromLayout { .. } => "draw_used_binding_absent_from_layout",
             Self::DriverCallQuarantined => "driver_call_quarantined",
             Self::ColorInputOrderingUnsupported(_) => "draw_color_input_ordering_unsupported",
@@ -692,6 +696,7 @@ mod tests {
     use super::*;
 
     const ALL: &[DrawReason] = &[
+        DrawReason::ShaderInputOutput16Unsupported,
         DrawReason::ResidentSampledNot2d { binding: 0 },
         DrawReason::GuestRunSampledNot2d { binding: 0 },
         DrawReason::SecondaryAttachmentCap {

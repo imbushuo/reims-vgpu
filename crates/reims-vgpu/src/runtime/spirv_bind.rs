@@ -459,6 +459,107 @@ fn instructions(words: &[u32]) -> Option<Vec<Instruction>> {
     Some(out)
 }
 
+/// The device feature and module declaration are separate admission requirements.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputOutput16Requirement {
+    NotRequired,
+    MissingCapability,
+    Declared,
+}
+
+/// Whether the module needs `storageInputOutput16`, independently of arithmetic
+/// or buffer-storage features. `None` means its interface cannot be resolved.
+///
+/// Follow Input/Output pointer pointees through composites, not names, locations,
+/// or just `OpCapability`: a producer can omit the capability while still
+/// emitting a half-width interface. Conversely, private and buffer half types
+/// do not require this feature. An explicit capability also requires admission,
+/// even when unused. This is not a replacement for SPIR-V validation.
+pub fn input_output16_requirement(words: &[u32]) -> Option<InputOutput16Requirement> {
+    let instrs = instructions(words)?;
+    if words[0] != 0x0723_0203 {
+        return None;
+    }
+    let mut types = std::collections::BTreeMap::new();
+    let mut pending = Vec::new();
+    let mut declared = false;
+    for instruction in &instrs {
+        let Instruction {
+            opcode,
+            word_count,
+            at,
+        } = *instruction;
+        match opcode {
+            OP_CAPABILITY if word_count == 2 => {
+                // SPIR-V Capability StorageInputOutput16.
+                declared |= words[at + 1] == 4436;
+            }
+            // Bool, Int, Float, Vector, Matrix, Array, RuntimeArray, Struct,
+            // Pointer. Retain their operand slices; no allocation by id bound.
+            20..=24 | 28..=30 | OP_TYPE_POINTER if word_count >= 2 => {
+                if types.insert(words[at + 1], instruction).is_some() {
+                    return None;
+                }
+                if opcode == OP_TYPE_POINTER
+                    && word_count == 4
+                    && matches!(words[at + 2], 1 | 3)
+                {
+                    pending.push(words[at + 3]);
+                }
+            }
+            _ => {}
+        }
+    }
+    // A variable's result type must actually be a pointer in its storage class.
+    // Checking both declarations prevents an inconsistent variable from hiding
+    // its interface behind a Private/StorageBuffer pointer (or the reverse).
+    for &Instruction {
+        opcode,
+        word_count,
+        at,
+    } in &instrs
+    {
+        if opcode != OP_VARIABLE {
+            continue;
+        }
+        if word_count < 4 {
+            return None;
+        }
+        if matches!(words[at + 3], 1 | 3) {
+            let pointer = types.get(&words[at + 1])?;
+            if pointer.opcode != OP_TYPE_POINTER
+                || pointer.word_count != 4
+                || words[pointer.at + 2] != words[at + 3]
+            {
+                return None;
+            }
+        }
+    }
+    let mut visited = std::collections::BTreeSet::new();
+    let mut required = declared;
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        let instruction = types.get(&id)?;
+        let operands = &words[instruction.at + 2..instruction.at + instruction.word_count];
+        match (instruction.opcode, operands) {
+            (20, []) => {}
+            (21, [width, _]) | (22, [width]) => required |= *width == 16,
+            (23 | 24 | 28, [element, _]) | (29, [element]) => pending.push(*element),
+            (30, members) => pending.extend_from_slice(members),
+            _ => return None,
+        }
+    }
+    Some(if declared {
+        InputOutput16Requirement::Declared
+    } else if required {
+        InputOutput16Requirement::MissingCapability
+    } else {
+        InputOutput16Requirement::NotRequired
+    })
+}
+
 /// The one descriptor variable declaring `wanted_binding` in `storage_class`,
 /// with the module's id bound.
 ///
@@ -3451,6 +3552,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn input_output16_follows_scalar_vector_and_nested_composites() {
+        for storage in [1, 3] {
+            for width in [16, 32] {
+                for scalar in [
+                    vec![(3 << 16) | 22, 1, width],
+                    vec![(4 << 16) | 21, 1, width, 1],
+                    vec![(4 << 16) | 21, 1, width, 0],
+                ] {
+                    for pointee in [1, 2, 3, 4, 5, 6, 8] {
+                        let mut words = test_support::module_with(&scalar);
+                        words.extend_from_slice(&[
+                            (4 << 16) | 23, 2, 1, 4, // vector
+                            (4 << 16) | 24, 3, 2, 4, // matrix
+                            (4 << 16) | 21, 7, 32, 0,
+                            (4 << 16) | 43, 7, 10, 2, // array length
+                            (4 << 16) | 28, 4, 2, 10, // array of vectors
+                            (3 << 16) | 29, 5, 4, // runtime array of arrays
+                            (4 << 16) | 30, 6, 7, 5, // mixed-width struct
+                            (4 << 16) | 30, 8, 7, 6, // nested struct
+                            (4 << 16) | 32, 9, storage, pointee,
+                            (4 << 16) | 59, 9, 12, storage,
+                        ]);
+                        assert_eq!(
+                            input_output16_requirement(&words),
+                            Some(if width == 16 {
+                                InputOutput16Requirement::MissingCapability
+                            } else {
+                                InputOutput16Requirement::NotRequired
+                            })
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn input_output16_ignores_private_and_buffer_half_types() {
+        for storage in [2, 6, 7, 9, 12] {
+            let words = test_support::stage_io_module(storage, 16);
+            assert_eq!(
+                input_output16_requirement(&words),
+                Some(InputOutput16Requirement::NotRequired)
+            );
+        }
+        let mut words = test_support::stage_io_module(3, 32);
+        // Unused half type and Float16/StorageBuffer16BitAccess capabilities
+        // are not stage-interface requirements.
+        words.extend_from_slice(&[
+            (3 << 16) | 22, 5, 16,
+            (2 << 16) | 17, 9,
+            (2 << 16) | 17, 4433,
+        ]);
+        assert_eq!(
+            input_output16_requirement(&words),
+            Some(InputOutput16Requirement::NotRequired)
+        );
+    }
+
+    #[test]
+    fn input_output16_also_honors_an_explicit_capability() {
+        let words = test_support::module_with(&[(2 << 16) | 17, 4436]);
+        assert_eq!(
+            input_output16_requirement(&words),
+            Some(InputOutput16Requirement::Declared)
+        );
+    }
+
+    #[test]
+    fn input_output16_checks_pointer_provenance_and_fails_closed() {
+        // Even without a variable, an Output pointer to half is not permitted
+        // without the feature.
+        let pointer_only = test_support::module_with(&[
+            (3 << 16) | 22, 1, 16,
+            (4 << 16) | 32, 2, 3, 1,
+        ]);
+        assert_eq!(
+            input_output16_requirement(&pointer_only),
+            Some(InputOutput16Requirement::MissingCapability)
+        );
+        // Input variable through a Private pointer.
+        let mismatch = test_support::module_with(&[
+            (3 << 16) | 22, 1, 16,
+            (4 << 16) | 32, 2, 6, 1,
+            (4 << 16) | 59, 2, 3, 1,
+        ]);
+        assert_eq!(input_output16_requirement(&mismatch), None);
+        let missing = test_support::module_with(&[(4 << 16) | 32, 1, 3, 63]);
+        assert_eq!(input_output16_requirement(&missing), None);
+        let mut truncated = test_support::stage_io_module(3, 16);
+        truncated.pop();
+        assert_eq!(input_output16_requirement(&truncated), None);
+        assert_eq!(input_output16_requirement(&[]), None);
+    }
+
+    #[test]
     fn injects_storage_write_without_format_capability_once() {
         // 5-word header, `OpCapability Shader`, then `OpMemoryModel` (opcode 14).
         let mut words = vec![
@@ -3507,6 +3704,17 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+
+    /// A vector variable, without StorageInputOutput16, so admission must read
+    /// its type instead of relying on a correctly declared capability.
+    pub(crate) fn stage_io_module(storage: u32, width: u32) -> Vec<u32> {
+        module_with(&[
+            (3 << 16) | 22, 1, width,
+            (4 << 16) | 23, 2, 1, 4,
+            (4 << 16) | 32, 3, storage, 2,
+            (4 << 16) | 59, 3, 4, storage,
+        ])
+    }
 
     /// Build a minimal module: header, `OpCapability Shader`, `OpMemoryModel`,
     /// then whatever body words are given.

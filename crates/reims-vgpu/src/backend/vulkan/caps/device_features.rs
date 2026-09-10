@@ -281,6 +281,8 @@ pub struct DeviceFeatures {
     /// and not from a reading of the spec's table.
     pub color_attachment: [bool; TexelLayout::ALL.len()],
     pub storage16: bool,
+    /// 16-bit Input/Output storage, independent of half arithmetic and buffers.
+    pub storage_input_output16: bool,
     pub storage8: bool,
     pub float16: bool,
     pub int8: bool,
@@ -671,10 +673,11 @@ impl DeviceFeatures {
         self.dynamic_polygon_mode || self.dynamic_depth_clamp
     }
 
-    /// 16-bit storage-buffer access, for shaders that pack half-precision data.
+    /// Independent 16-bit buffer and stage-interface storage features.
     pub fn enabled_16bit_storage(&self) -> vk::PhysicalDevice16BitStorageFeatures<'static> {
         vk::PhysicalDevice16BitStorageFeatures::default()
             .storage_buffer16_bit_access(self.storage16)
+            .storage_input_output16(self.storage_input_output16)
     }
 
     /// One line naming every feature and limit this backend resolved against the
@@ -722,6 +725,7 @@ impl DeviceFeatures {
             sampled_linear_filter,
             color_attachment,
             storage16,
+            storage_input_output16,
             storage8,
             float16,
             int8,
@@ -791,7 +795,8 @@ impl DeviceFeatures {
              storage_image_write_without_format={storage_image_write_without_format} \
              storage_image_read_without_format={storage_image_read_without_format} \
              bgra8_storage={bgra8_storage} no_linear_filter={} no_blendable_attachment={} \
-             storage16={storage16} storage8={storage8} float16={float16} int8={int8} \
+             storage16={storage16} storage_input_output16={storage_input_output16} \
+             storage8={storage8} float16={float16} int8={int8} \
              shader_output_viewport_index={shader_output_viewport_index} \
              timeline_semaphore={timeline_semaphore} \
              descriptor_binding_partially_bound={descriptor_binding_partially_bound} \
@@ -1119,6 +1124,7 @@ pub unsafe fn query(
         sampled_linear_filter,
         color_attachment,
         storage16: supported_16.storage_buffer16_bit_access == vk::TRUE,
+        storage_input_output16: supported_16.storage_input_output16 == vk::TRUE,
         storage8: supported_8.storage_buffer8_bit_access == vk::TRUE,
         float16: supported_f16i8.shader_float16 == vk::TRUE,
         int8: supported_f16i8.shader_int8 == vk::TRUE,
@@ -1142,6 +1148,30 @@ fn image_view_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_output16_enablement_is_independent_of_buffer_and_arithmetic_features() {
+        for storage16 in [false, true] {
+            for float16 in [false, true] {
+                for storage_input_output16 in [false, true] {
+                    let features = DeviceFeatures {
+                        storage16,
+                        float16,
+                        storage_input_output16,
+                        ..DeviceFeatures::default()
+                    };
+                    let enabled = features.enabled_16bit_storage();
+                    assert_eq!(
+                        enabled.storage_input_output16 == vk::TRUE,
+                        storage_input_output16
+                    );
+                    assert_eq!(enabled.storage_buffer16_bit_access == vk::TRUE, storage16);
+                    assert_eq!(enabled.uniform_and_storage_buffer16_bit_access, vk::FALSE);
+                    assert_eq!(enabled.storage_push_constant16, vk::FALSE);
+                }
+            }
+        }
+    }
 
     #[test]
     fn graphics_storage_pixel_interlock_is_enabled_only_with_its_extension() {
@@ -1199,6 +1229,7 @@ mod tests {
             sampled_linear_filter: [true; TexelLayout::ALL.len()],
             color_attachment: [true; TexelLayout::ALL.len()],
             storage16: true,
+            storage_input_output16: true,
             storage8: true,
             float16: true,
             int8: true,

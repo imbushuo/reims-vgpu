@@ -29,6 +29,23 @@ pub(crate) fn vk_sample_count(count: u32) -> vk::SampleCountFlags {
     }
 }
 
+fn admit_shader_input_output(
+    words: &[u32],
+    features: &crate::backend::vulkan::caps::device_features::DeviceFeatures,
+) -> Result<(), super::reason::DrawReason> {
+    use super::reason::DrawReason;
+    use crate::runtime::spirv_bind::{input_output16_requirement, InputOutput16Requirement};
+    match input_output16_requirement(words) {
+        None => Err(DrawReason::SpirvInvalid),
+        Some(InputOutput16Requirement::NotRequired) => Ok(()),
+        Some(_) if !features.storage_input_output16 => {
+            Err(DrawReason::ShaderInputOutput16Unsupported)
+        }
+        Some(InputOutput16Requirement::MissingCapability) => Err(DrawReason::SpirvInvalid),
+        Some(InputOutput16Requirement::Declared) => Ok(()),
+    }
+}
+
 /// A device-specific widening of an optional three-component vertex format.
 ///
 /// The draw remains executable, but the pipeline is not byte-for-byte what the
@@ -1973,6 +1990,18 @@ impl ObjectCaches {
             return Ok((key, m));
         }
         counters.shader_misses.fetch_add(1, Ordering::Relaxed);
+        // Check the final, specialized module, not its AIR or pre-legalization
+        // types. spirv-val does not know which device features were enabled and
+        // may be unavailable, so both the feature and capability are checked here.
+        if let Err(reason) = admit_shader_input_output(words, &ctx.features) {
+            crate::observe::Emit::decline("spirv_capability", &reason)
+                .field("words", words.len())
+                .field("storage_input_output16", ctx.features.storage_input_output16)
+                .fail();
+            let err = DrawError::Unsupported(reason);
+            self.shaders.insert_negative(key, err.clone());
+            return Err(err);
+        }
         // Last gate before the driver, and the only place every module from
         // every path passes through exactly once. An invalid module is
         // undefined behaviour inside a driver rather than an error it returns,
@@ -3128,6 +3157,64 @@ mod color0_load_tests {
                 !declared.preserves_prior_contents(),
                 "ordinal {raw} declared {declared:?}: only a clear may write the \
                  whole attachment when no prior contents were found"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod shader_input_output16_tests {
+    use super::super::reason::DrawReason;
+    use super::*;
+    use crate::backend::vulkan::caps::device_features::DeviceFeatures;
+    use crate::runtime::spirv_bind::test_support::{module_with, stage_io_module};
+
+    #[test]
+    fn input_output16_admission_uses_only_the_enabled_interface_feature() {
+        for enabled in [false, true] {
+            let features = DeviceFeatures {
+                storage_input_output16: enabled,
+                // Neither of these permits a 16-bit interface.
+                storage16: !enabled,
+                float16: !enabled,
+                ..DeviceFeatures::default()
+            };
+            for storage in [1, 3, 6, 12] {
+                for width in [16, 32] {
+                    let mut words = stage_io_module(storage, width);
+                    if width == 16 && matches!(storage, 1 | 3) {
+                        words.extend_from_slice(&[(2 << 16) | 17, 4436]);
+                    }
+                    let expected = if width == 16 && matches!(storage, 1 | 3) && !enabled {
+                        Err(DrawReason::ShaderInputOutput16Unsupported)
+                    } else {
+                        Ok(())
+                    };
+                    assert_eq!(
+                        admit_shader_input_output(&words, &features),
+                        expected
+                    );
+                }
+            }
+            assert_eq!(
+                admit_shader_input_output(&module_with(&[(2 << 16) | 17, 4436]), &features),
+                if enabled {
+                    Ok(())
+                } else {
+                    Err(DrawReason::ShaderInputOutput16Unsupported)
+                }
+            );
+            assert_eq!(
+                admit_shader_input_output(&[], &features),
+                Err(DrawReason::SpirvInvalid)
+            );
+            assert_eq!(
+                admit_shader_input_output(&stage_io_module(3, 16), &features),
+                Err(if enabled {
+                    DrawReason::SpirvInvalid
+                } else {
+                    DrawReason::ShaderInputOutput16Unsupported
+                })
             );
         }
     }

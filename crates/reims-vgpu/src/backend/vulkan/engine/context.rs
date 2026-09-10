@@ -1095,7 +1095,6 @@ impl DeviceContext {
         let storage_image_write_without_format_bgra =
             features.storage_image_write_without_format_bgra();
         let sampled_linear_filter = features.sampled_linear_filter;
-        let has16 = features.storage16;
         // Defined bounds-clamped behavior for out-of-range shader buffer access
         // is among these — the ONE feature the Vulkan spec requires every
         // implementation to support, so enabling it is portability-clean and
@@ -1240,15 +1239,13 @@ impl DeviceContext {
             .queue_create_infos(&qci)
             .enabled_features(&enabled)
             .enabled_extension_names(&enabled_device_extensions)
-            .push_next(&mut enabled_vulkan12);
+            .push_next(&mut enabled_vulkan12)
+            .push_next(&mut en16);
         if portability_subset {
             dci = dci.push_next(&mut enabled_portability);
         }
         if vertex_attribute_divisor {
             dci = dci.push_next(&mut enabled_divisor_features);
-        }
-        if has16 {
-            dci = dci.push_next(&mut en16);
         }
         if features.image_robustness.is_available() {
             dci = dci.push_next(&mut en_image_robustness);
