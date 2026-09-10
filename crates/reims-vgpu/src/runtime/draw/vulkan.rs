@@ -1223,6 +1223,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         {
             is_linear_tex = true;
         }
+        if entry.object_type == OBJECT_TYPE_MAPPER_REF_TEXTURE {
+            ref_texture_view = resource.decoded().as_ref().ok().and_then(mapper_surface_texture_view);
+        }
     }
     if !is_ref_texture {
         // Runs for the linear and unclassified types too, not only for the
@@ -1239,96 +1242,31 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     if let Some(mid) = surface {
         // Ensure backing pages exist for this surface id.
         let _ = objects::ensure_surface_for_texture_bind(state, host, mid);
-        // A ref-texture serialized record is the exact Metal texture view over the
-        // IOSurface bytes. Materialize it only when it differs from (or cannot
-        // be inferred from) the base mapping. Exact base views keep the fast
-        // resident/cache path below; an unknown 2-B/texel base FourCC exposed
-        // as RG8 must instead use the serialized view's native interpretation.
-        // `ref_texture_view` is set only on the branch that also set `surface` to that
-        // view's own surface id, so reaching here with a view in hand already
-        // means `mid` is the surface it describes.
-        if let Some(view) = ref_texture_view {
-            let needs_materialization = state
+        // Both texture record forms describe a binding, not a new interpretation
+        // for every resource sharing the mapping. Full views of identical
+        // physical storage can share a resident with distinct sampled mappings;
+        // other layouts and cold aliases materialize their declared native bytes.
+        // The retained resource supplies both its view and its mapping reference;
+        // a later alias registration cannot change this binding's interpretation.
+        let distinct_view = ref_texture_view.filter(|view| {
+            state
                 .mappings
                 .get(&mid)
                 .map(|m| {
                     ref_texture_view_requires_materialization(
-                        m.has_geom, m.width, m.height, m.format, view,
+                        m.has_geom, m.width, m.height, m.format, *view,
                     )
                 })
-                .unwrap_or(true);
-            if needs_materialization {
-                // What this bind reads, before either arm decides how to carry
-                // it. The window is the *view's* -- a plane of a multiplanar
-                // surface has its own format, extent and offset, and the
-                // mapping-derived window cannot describe it, which is why the
-                // video planes were absent from this record.
-                if let Some(bpp) = crate::protocol::pixel_format::bytes_per_pixel(view.pixel_format)
-                {
-                    if let Some((base_off, bpr, _)) = state.mappings.get(&mid).and_then(|m| {
-                        crate::runtime::mapping_write::ref_texture_sample_window(
-                            m,
-                            view.plane_index,
-                            view.width,
-                            view.height,
-                            view.pixel_format,
-                        )
-                    }) {
-                        crate::runtime::scanout::note_sampled_surface_field_window(
-                            state,
-                            &*host,
-                            mid,
-                            texture_ref,
-                            "ref_texture_view",
-                            crate::runtime::scanout::SampledFieldWindow {
-                                width: view.width,
-                                height: view.height,
-                                format: u32::from(view.pixel_format),
-                                base_off,
-                                bpr,
-                                bpp,
-                            },
-                        );
-                    }
-                }
-                // Zero-copy the decoded plane straight from guest pages when
-                // it samples byte-identically (video NV12 R8/RG8, BGRA8/
-                // RGBA8). This bypasses the ~1.5 MB/plane/frame CPU read +
-                // upload the CPU loader below would pay every decoded frame.
-                if let Some(src) = resolved_resource.as_ref().and_then(|resource| {
-                    try_ref_texture_sample_zero_copy(
-                        state,
-                        host,
-                        mid,
-                        view,
-                        resource.lifetime_ref(),
-                    )
-                }) {
-                    // Success path: a healthy video decodes ~2 planes/frame,
-                    // so this fires per-bind (~99k lines/boot). The aggregate
-                    // lives in `sampled_branch_census` (`t5_zc=count:bytes`),
-                    // which is the always-on signal; keep the per-bind detail
-                    // for deep debugging behind REIMS_VGPU_DRAW_LOG (observe::line)
-                    // rather than flooding the always-on fail sink.
-                    crate::observe::line(format!(
-                        "ref_texture_view_zc ref={texture_ref} sid={mid} view={}x{} fmt={:#x} plane={}",
-                        view.width, view.height, view.pixel_format, view.plane_index
-                    ));
-                    return Some((view.width, view.height, mid, src));
-                }
-                let (w, h, rgba, identity, byte_format) =
-                    load_ref_texture_view_rgba(state, host, task_id, texture_ref, mid, view)?;
-                return Some((
-                    w,
-                    h,
-                    mid,
-                    SampledSourceRequest::Bytes(
-                        rgba,
-                        Some(identity),
-                        byte_format,
-                        crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView,
-                    ),
-                ));
+                .unwrap_or(true)
+        });
+        let resident_view_format = ref_texture_view.and_then(|view| {
+            state.mappings.get(&mid).and_then(|mapping| resident_surface_view_format(mapping, view))
+        });
+        if let Some(view) = distinct_view {
+            if resident_view_format.is_none() {
+                return materialize_surface_sample_view(
+                    state, host, task_id, texture_ref, mid, view, resolved_resource.as_deref(),
+                );
             }
         }
         if let Some(m) = state.mappings.get(&mid) {
@@ -1393,7 +1331,8 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // channels.
                 if guest_allocation_sample_is_direct(resident_backing, may_bind_resident) {
                     crate::runtime::drain::note_store_route("t11rung_resident");
-                    let format = crate::backend::vulkan::present_identity::surface_sample_format(state, mid);
+                    let format = resident_view_format.unwrap_or_else(||
+                        crate::backend::vulkan::present_identity::surface_sample_format(state, mid));
                     return Some((w, h, mid, SampledSourceRequest::Target(
                         resident_id, format.vk, format.components,
                     )));
@@ -1468,7 +1407,8 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 } else if resident_ready {
                     if !guest_replaced {
                         note_mapper_ref_texture_sample_rung("t11rung_resident", guest_write);
-                        let format = crate::backend::vulkan::present_identity::surface_sample_format(state, mid);
+                        let format = resident_view_format.unwrap_or_else(||
+                            crate::backend::vulkan::present_identity::surface_sample_format(state, mid));
                         return Some((
                             w,
                             h,
@@ -1607,6 +1547,15 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                             ));
                         }
                     }
+                }
+
+                // A cache/memo is converted in the mapping's interpretation.
+                // A distinct view must read native bytes in its own format
+                // instead of reusing that conversion under a different name.
+                if let Some(view) = distinct_view {
+                    return materialize_surface_sample_view(
+                        state, host, task_id, texture_ref, mid, view, resolved_resource.as_deref(),
+                    );
                 }
 
                 // 1) Host cache — the other host-side copy of these pages, and
@@ -1914,6 +1863,88 @@ mod resource_resident_ownership_tests {
             assert!(!resource_type_owns_gva_resident(object_type));
         }
     }
+}
+
+pub(super) fn mapper_surface_texture_view(
+    descriptor: &crate::runtime::decode::resource::Descriptor,
+) -> Option<objects::RefTextureView> {
+    let crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
+        pixel_format, width, height, ..
+    } = descriptor else { return None };
+    // A zero declaration retains the existing mapping-default contract.
+    (*pixel_format != 0).then_some(objects::RefTextureView {
+        pixel_format: *pixel_format,
+        width: *width,
+        height: *height,
+        depth: 1,
+        plane_index: 0,
+    })
+}
+
+pub(super) fn resident_surface_view_format(
+    mapping: &crate::model::MappingEntry,
+    view: objects::RefTextureView,
+) -> Option<translate::pixel::PixelFormat> {
+    if !mapping.has_geom || view.depth != 1 || view.plane_index != 0
+        || (mapping.width, mapping.height) != (view.width, view.height)
+    {
+        return None;
+    }
+    let allocation = translate::pixel::translate(mapping_write::mapping_store_format(mapping)).ok()?;
+    let requested = translate::pixel::translate(view.pixel_format).ok()?;
+    let block = translate::pixel::vk_block_geometry(allocation.vk)?;
+    // A8/R8 and linear/sRGB interpretations share storage, not sampled
+    // components. Other view layouts keep the existing materialization path.
+    (block.width == 1 && block.height == 1 && allocation.linear_vk == requested.linear_vk)
+        .then_some(requested)
+}
+
+fn materialize_surface_sample_view<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    mid: u32,
+    view: objects::RefTextureView,
+    resource: Option<&crate::model::TaskResource>,
+) -> Option<(u32, u32, u32, SampledSourceRequest)> {
+    if let Some(bpp) = pixel_format::bytes_per_pixel(view.pixel_format) {
+        if let Some((base_off, bpr, _)) = state.mappings.get(&mid).and_then(|m| {
+            mapping_write::ref_texture_sample_window(
+                m, view.plane_index, view.width, view.height, view.pixel_format,
+            )
+        }) {
+            crate::runtime::scanout::note_sampled_surface_field_window(
+                state, &*host, mid, texture_ref, "ref_texture_view",
+                crate::runtime::scanout::SampledFieldWindow {
+                    width: view.width,
+                    height: view.height,
+                    format: u32::from(view.pixel_format),
+                    base_off,
+                    bpr,
+                    bpp,
+                },
+            );
+        }
+    }
+    if let Some(src) = resource.and_then(|resource| {
+        try_ref_texture_sample_zero_copy(state, host, mid, view, resource.lifetime_ref())
+    }) {
+        crate::observe::line(format!(
+            "ref_texture_view_zc ref={texture_ref} sid={mid} view={}x{} fmt={:#x} plane={}",
+            view.width, view.height, view.pixel_format, view.plane_index
+        ));
+        return Some((view.width, view.height, mid, src));
+    }
+    let (w, h, rgba, identity, byte_format) =
+        load_ref_texture_view_rgba(state, host, task_id, texture_ref, mid, view)?;
+    Some((
+        w, h, mid,
+        SampledSourceRequest::Bytes(
+            rgba, Some(identity), byte_format,
+            crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView,
+        ),
+    ))
 }
 
 #[inline]
@@ -10254,6 +10285,14 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
     identity: &crate::backend::vulkan::engine::TargetIdentity,
     guest_owned: &[(u64, u64)],
 ) -> bool {
+    if let Some(merged) = crate::runtime::render_writeback::vulkan::merge_native_surface(
+        state, host, mapping_id, identity, width, height, guest_owned,
+    ) {
+        if merged {
+            crate::runtime::drain::note_store_route("t11sample_resident_merged");
+        }
+        return merged;
+    }
     let readback = match crate::backend::vulkan::engine::read_target(identity) {
         Ok(rb) => rb,
         Err(e) => {

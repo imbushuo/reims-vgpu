@@ -108,22 +108,28 @@ static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 static FAIL_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static DRAW_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+fn log_path(name: &str) -> String {
+    reims_vgpu_config::path(reims_vgpu_config::LOG_DIRECTORY)
+        .map(|directory| directory.join(name).to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("/tmp/{name}"))
+}
+
 fn test_path(kind: &str) -> String {
-    format!("/tmp/reims-vgpu-{kind}-test-{}.log", std::process::id())
+    log_path(&format!("reims-vgpu-{kind}-test-{}.log", std::process::id()))
 }
 
 pub fn fail_log_path() -> &'static str {
     #[cfg(any(test, feature = "testing"))]
     return FAIL_PATH.get_or_init(|| test_path("fail"));
     #[cfg(not(any(test, feature = "testing")))]
-    FAIL_PATH.get_or_init(|| "/tmp/reims-vgpu-fail.log".to_string())
+    FAIL_PATH.get_or_init(|| log_path("reims-vgpu-fail.log"))
 }
 
 pub fn draw_log_path() -> &'static str {
     #[cfg(any(test, feature = "testing"))]
     return DRAW_PATH.get_or_init(|| test_path("draw"));
     #[cfg(not(any(test, feature = "testing")))]
-    DRAW_PATH.get_or_init(|| "/tmp/reims-vgpu-draw.log".to_string())
+    DRAW_PATH.get_or_init(|| log_path("reims-vgpu-draw.log"))
 }
 
 /// Test-harness support: point the always-on sinks at per-process files so a

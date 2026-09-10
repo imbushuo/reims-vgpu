@@ -14,6 +14,56 @@ use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
+fn surface_sample_views_keep_resource_formats_independent_of_mapping_registration_order() {
+    use crate::backend::vulkan::translate::pixel;
+    use crate::runtime::decode::resource::Descriptor;
+    let declared = |format, object_ref| Descriptor::IOSurfaceTexture {
+        mapping_id: 4, object_ref, pixel_format: format, width: 64, height: 32,
+    };
+    let red = mapper_surface_texture_view(&declared(pixel_format::MTL_FORMAT_R8_UNORM, 6)).unwrap();
+    let alpha = mapper_surface_texture_view(&declared(pixel_format::MTL_FORMAT_A8_UNORM, 7)).unwrap();
+    for last_registered in [red.pixel_format, alpha.pixel_format] {
+        let mapping = crate::model::MappingEntry {
+            has_geom: true, width: 64, height: 32, format: last_registered, ..Default::default()
+        };
+        let red_format = resident_surface_view_format(&mapping, red).unwrap();
+        let alpha_format = resident_surface_view_format(&mapping, alpha).unwrap();
+        assert_eq!(red_format.vk, ash::vk::Format::R8_UNORM);
+        assert_eq!(alpha_format.vk, red_format.vk, "the allocation is shared");
+        assert_eq!(red_format.components, pixel_format::swizzle_identity());
+        assert_eq!(alpha_format.components, pixel::translate(alpha.pixel_format).unwrap().components);
+        assert_ne!(alpha_format.components, red_format.components, "interpretation is per binding");
+        let different = if last_registered == red.pixel_format { alpha } else { red };
+        assert!(ref_texture_view_requires_materialization(
+            true, 64, 32, last_registered, different,
+        ), "cold cache/page fallback must not reuse the mapping's converted channel order");
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn surface_sample_views_materialize_different_storage_or_geometry() {
+    let mapping = crate::model::MappingEntry {
+        has_geom: true, width: 64, height: 32,
+        format: pixel_format::MTL_FORMAT_A8_UNORM, ..Default::default()
+    };
+    let view = objects::RefTextureView {
+        pixel_format: pixel_format::MTL_FORMAT_R8_UNORM,
+        width: 64, height: 32, depth: 1, plane_index: 0,
+    };
+    assert!(resident_surface_view_format(&mapping, view).is_some());
+    for other in [
+        objects::RefTextureView { pixel_format: pixel_format::MTL_FORMAT_BGRA8_UNORM, ..view },
+        objects::RefTextureView { width: 32, ..view },
+        objects::RefTextureView { depth: 2, ..view },
+        objects::RefTextureView { plane_index: 1, ..view },
+    ] {
+        assert!(resident_surface_view_format(&mapping, other).is_none());
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
 fn m2v_draw_boundary_preserves_the_engine_vk_call_slug() {
     let req = DrawEncodeRequest {
         pipeline_ref: 73,

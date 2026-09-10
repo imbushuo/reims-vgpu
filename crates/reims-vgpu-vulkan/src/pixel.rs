@@ -1046,15 +1046,21 @@ impl StorageImageFormat {
 /// those formats renderable and samplable, which the guest never asked for and
 /// the contract does not say.
 ///
-/// # Why this is a union and not a third table
+/// # Why this is a union and not another format table
 ///
-/// Neither half is written here. A render target's answer is
+/// No membership list is written here. A render target's answer is
 /// `store_texel_order` composed with [`vk_texel_layout`]; a storage image's is
 /// `storage_selector` composed with [`storage_image_from_selector`] and
-/// `StorageImageFormat::vk_format`. Both already existed, both are already the
-/// authority for their own rail, and a format either admits is a format that
+/// `StorageImageFormat::vk_format`; a sampled image's native layout comes from
+/// [`sampled_pixels`]. These are already the authority for their own rail, and
+/// a format any admits is a format that
 /// rail creates images at — so nothing new is claimed about any format, and a
 /// new arm in either table reaches this without being added twice.
+///
+/// Sampled component mappings do not transform stored bytes. In particular,
+/// A8 and R8 both occupy one R8 texel, even though sampling A8 returns that byte
+/// in alpha. Copying an R8 attachment into A8-mapped storage is a raw byte copy,
+/// not an admission of A8 as a render target or storage-image binding.
 ///
 /// The order does not matter, and `the_two_verbatim_texel_tables_never_disagree`
 /// is why: where both answer they must name the same format and the same width,
@@ -1063,8 +1069,15 @@ pub fn verbatim_texel(mtl: u16) -> Option<(vk::Format, u32)> {
     if let Some(layout) = pixel_format::store_texel_order(mtl) {
         return Some((vk_texel_layout(layout), layout.bytes_per_texel()));
     }
-    let storage = storage_image_from_selector(pixel_format::storage_selector(mtl)?);
-    Some((storage.vk_format(), storage.bytes_per_texel() as u32))
+    if let Some(selector) = pixel_format::storage_selector(mtl) {
+        let storage = storage_image_from_selector(selector);
+        return Some((storage.vk_format(), storage.bytes_per_texel() as u32));
+    }
+    let sampled = sampled_pixels(mtl).ok()?;
+    if sampled.layout.is_block_compressed() {
+        return None;
+    }
+    Some((vk_texel_layout(sampled.layout), sampled.layout.bytes_per_texel()))
 }
 
 /// The engine's storage-image format for a contract
@@ -2105,6 +2118,29 @@ mod tests {
 
     /// The sweep is the whole `u16` space because neither table publishes its
     /// membership as a list, and both are cheap total functions.
+    #[test]
+    fn sampled_native_texels_are_byte_copy_destinations_without_render_admission() {
+        assert_eq!(verbatim_texel(p::MTL_FORMAT_A8_UNORM), Some((vk::Format::R8_UNORM, 1)));
+        assert_eq!(verbatim_texel(p::MTL_FORMAT_R8_UNORM), Some((vk::Format::R8_UNORM, 1)));
+        assert!(color_attachment(p::MTL_FORMAT_A8_UNORM).is_err());
+        assert!(p::storage_selector(p::MTL_FORMAT_A8_UNORM).is_none());
+        let mut covered = 0;
+        for mtl in 0..=u16::MAX {
+            let Ok(sampled) = sampled_pixels(mtl) else { continue };
+            if sampled.layout.is_block_compressed() {
+                assert!(verbatim_texel(mtl).is_none(), "block pitches are not linear texel pitches");
+                continue;
+            }
+            covered += 1;
+            assert_eq!(
+                verbatim_texel(mtl),
+                Some((vk_texel_layout(sampled.layout), sampled.layout.bytes_per_texel())),
+                "sampled format {mtl:#x} must copy its physical texels, not its sampled channels",
+            );
+        }
+        assert!(covered > 10);
+    }
+
     #[test]
     fn the_two_verbatim_texel_tables_never_disagree() {
         let mut overlap = 0usize;

@@ -1633,6 +1633,27 @@ pub fn write_native_image<M: HostMemory + HostOps>(
     height: u32,
     format: u16,
 ) -> bool {
+    write_native_image_skipping(
+        state, host, mapping_id, src, src_stride, width, height, format, &[],
+    )
+}
+
+/// Publish native texels while leaving guest-owned byte ranges untouched.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "native storage geometry and the byte ranges the writer may not overwrite"
+)]
+pub fn write_native_image_skipping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    format: u16,
+    skip: SkipRanges<'_>,
+) -> bool {
     if !scanout_extent_ok(width, height) {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }
@@ -1725,31 +1746,46 @@ pub fn write_native_image<M: HostMemory + HostOps>(
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         for y in 0..height as usize {
             let src_off = y * src_stride as usize;
-            let dst = unsafe { base.add(y * bpr as usize) };
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr().add(src_off), dst, tight as usize);
+            let row_off = base_off + (y as u64) * u64::from(bpr);
+            if skip.is_empty() {
+                let dst = unsafe { base.add(y * bpr as usize) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr().add(src_off), dst, tight as usize);
+                }
+            } else {
+                for (lo, hi) in unskipped(row_off, row_off + u64::from(tight), skip) {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr().add(src_off + (lo - row_off) as usize),
+                            base.add((lo - base_off) as usize),
+                            (hi - lo) as usize,
+                        );
+                    }
+                }
             }
         }
     } else {
         for y in 0..height as usize {
             let src_off = y * src_stride as usize;
             let row_off = base_off.saturating_add((y as u64).saturating_mul(u64::from(bpr)));
-            let row = &src[src_off..src_off + tight as usize];
-            if !mapper::write_mapping_bytes(state, host, mapping_id, row_off, row, &vouched) {
-                return refuse(
-                    mapping_id,
-                    SurfaceWriteRefusal::MapperWrite {
-                        lo: row_off,
-                        len: row.len(),
-                    },
-                );
+            let whole = (row_off, row_off + u64::from(tight));
+            let pieces = (!skip.is_empty()).then(|| unskipped(whole.0, whole.1, skip));
+            for &(lo, hi) in pieces.as_deref().unwrap_or(std::slice::from_ref(&whole)) {
+                let start = src_off + (lo - row_off) as usize;
+                let row = &src[start..start + (hi - lo) as usize];
+                if !mapper::write_mapping_bytes(state, host, mapping_id, lo, row, &vouched) {
+                    return refuse(
+                        mapping_id,
+                        SurfaceWriteRefusal::MapperWrite { lo, len: row.len() },
+                    );
+                }
             }
         }
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
-    // Native integer texels have no BGRA host-cache representation. Guest pages
-    // are authoritative after this write, so an older cache entry must retire.
+    // Native storage may have multiple sampled interpretations. Guest pages
+    // are authoritative after this write, so an older converted cache retires.
     crate::runtime::surface_cache::forget(state, mapping_id);
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true

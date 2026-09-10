@@ -4450,9 +4450,8 @@ pub(crate) unsafe fn execute_draw_inner(
     // capture the prior resident content into a same-format GPU image before
     // changing the attachment. This preserves Metal's semantics without a
     // readback or host upload.
-    let mut snapshotted_targets = std::collections::HashSet::new();
+    let mut recorded_resident_accesses = RecordedResidentAccesses::default();
     let mut snapshotted_images = std::collections::HashSet::new();
-    let mut target_snapshotted = false;
     for sampled_image in &sampled {
         let PreparedSampled::Snapshot {
             identity,
@@ -4465,7 +4464,6 @@ pub(crate) unsafe fn execute_draw_inner(
         else {
             continue;
         };
-        target_snapshotted = true;
         unsafe { outside_pass.before_record(PassObstacle::Snapshot, pools, &ctx.device, cb) };
         // Duplicate descriptor bindings of one attachment/key share one image.
         // Its copy and two layout transitions are commands on the image, not on
@@ -4480,12 +4478,14 @@ pub(crate) unsafe fn execute_draw_inner(
         // *first* is unconditional — the source is a registry resident this
         // draw's own predecessor may have written, and the layout it sits in
         // says nothing about that.
-        if snapshotted_targets.insert(identity.clone()) {
+        if let Some(prior) =
+            recorded_resident_accesses.record(identity, *source_access, *next_access)
+        {
             barrier_resident_for_transfer_read(
                 &ctx.device,
                 cb,
                 *source_image,
-                *source_access,
+                prior,
                 *next_access,
             );
         }
@@ -4539,14 +4539,15 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
+    let target_prior =
+        recorded_resident_accesses.prior(req.target_identity.as_ref(), target_access);
+
     // Seed upload (CPU import).
     if target_loads_guest_backing {
         // The attachment already contains the shared allocation's bytes.
     } else if let Some(seed) = &seed_slot {
         unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
-        let (src_stage, src_access) =
-            target_prior_access(target_snapshotted, target_access, target_guest_backed)
-                .source_scope();
+        let (src_stage, src_access) = target_prior.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -4610,9 +4611,7 @@ pub(crate) unsafe fn execute_draw_inner(
             seed_access,
             seed_next_access,
         );
-        let (dst_stage, dst_access) =
-            target_prior_access(target_snapshotted, target_access, target_guest_backed)
-                .source_scope();
+        let (dst_stage, dst_access) = target_prior.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(dst_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -4670,17 +4669,13 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     } else if load_uses_gpu_content
         && !(target_feedback && req.continues_render_pass && pools.open_pass_echoes(&echo))
-        && !pass_exit_needs_no_barrier(target_prior_access(
-            target_snapshotted,
-            target_access,
-            target_guest_backed,
-        ))
+        && !pass_exit_needs_no_barrier(target_prior)
     {
         unsafe { outside_pass.before_record(PassObstacle::TargetLayout, pools, &ctx.device, cb) };
         // A prior direct sample may have left this target shader-readable, or a
         // readback may have left it a transfer source; transition from the
         // registry's tracked layout back to attachment use.
-        let prior = target_prior_access(target_snapshotted, target_access, target_guest_backed);
+        let prior = target_prior;
         let (src_stage, src_access) = target_source_scope(prior, target_loads_guest_backing);
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
@@ -4699,7 +4694,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &barrier,
         );
     } else if !load_uses_gpu_content
-        && (target_snapshotted || target_access != super::pools::ResidentAccess::Untouched)
+        && target_prior != super::pools::ResidentAccess::Untouched
     {
         unsafe { outside_pass.before_record(PassObstacle::ClearWait, pools, &ctx.device, cb) };
         // The Clear render pass discards prior content via initialLayout
@@ -4710,8 +4705,8 @@ pub(crate) unsafe fn execute_draw_inner(
         // `srcStageMask = TOP_OF_PIPE` with `srcAccessMask = 0`, which orders
         // against nothing at all.
         //
-        // `target_snapshotted` is this draw's own snapshot read and names the
-        // newer access. Otherwise the registry's tracked layout names the
+        // A snapshot of this target names the newer access. A snapshot of any
+        // other image cannot change it. Otherwise the registry names the
         // previous draw's: `SHADER_READ_ONLY_OPTIMAL` when it sampled this
         // resident, `TRANSFER_SRC_OPTIMAL` when it read it back or presented
         // it. Both are reads that a clear would otherwise be free to overtake.
@@ -4719,9 +4714,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // A pooled or freshly created target tracks `UNDEFINED` — nothing has
         // touched it, so it is excluded rather than barriered, which keeps this
         // off the pooled path entirely.
-        let (src_stage, src_access) =
-            target_prior_access(target_snapshotted, target_access, target_guest_backed)
-                .source_scope();
+        let (src_stage, src_access) = target_prior.source_scope();
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
@@ -4738,7 +4731,6 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // Resident samples: transition the persistent target in place. Duplicate
     // bindings of one target share the same image and therefore one barrier.
-    let mut transitioned_resident = std::collections::HashSet::new();
     for image in &sampled {
         let PreparedSampled::Resident {
             identity,
@@ -4747,6 +4739,10 @@ pub(crate) unsafe fn execute_draw_inner(
             next_access,
             ..
         } = image
+        else {
+            continue;
+        };
+        let Some(access) = recorded_resident_accesses.record(identity, *access, *next_access)
         else {
             continue;
         };
@@ -4769,8 +4765,7 @@ pub(crate) unsafe fn execute_draw_inner(
         //
         // This is what retires `passmerge_outside_resident_layout`: the barrier
         // it charged is not moved earlier or made cheaper, it stops being owed.
-        if !transitioned_resident.insert(identity.clone())
-            || access == next_access
+        if access == *next_access
             || (access.layout() == next_access.layout() && access.covered_by_pass_entry())
         {
             continue;
@@ -4969,9 +4964,7 @@ pub(crate) unsafe fn execute_draw_inner(
     if !target_loads_guest_backing {
         if let (Some(source), Some(seed)) = (&target_guest_texels, &req.target_guest_seed) {
             unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
-            let (src_stage, src_access) =
-                target_prior_access(target_snapshotted, target_access, target_guest_backed)
-                    .source_scope();
+            let (src_stage, src_access) = target_prior.source_scope();
             let barrier = [vk::ImageMemoryBarrier::default()
                 .src_access_mask(src_access)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -5060,12 +5053,13 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
-    // MRT secondary attachments that were left shader-readable (sampled by a
-    // prior draw) must transition back to color-attachment use, and the write
-    // must wait for that prior read (WAR). A freshly-created secondary tracks
-    // UNDEFINED and needs no barrier — the render pass discards on CLEAR.
-    for (secondary_index, (_id, image, access)) in mrt_secondaries.iter().enumerate() {
-        if *access == super::pools::ResidentAccess::Untouched {
+    // MRT secondary attachments must transition from their own last access,
+    // including a snapshot recorded by this draw, back to color-attachment
+    // use. A freshly-created secondary tracks UNDEFINED and needs no barrier —
+    // the render pass discards on CLEAR.
+    for (secondary_index, (identity, image, tracked)) in mrt_secondaries.iter().enumerate() {
+        let access = recorded_resident_accesses.prior(Some(identity), *tracked);
+        if access == super::pools::ResidentAccess::Untouched {
             continue;
         }
         let attachment_index = secondary_index + 1;
@@ -5876,23 +5870,9 @@ pub(crate) unsafe fn execute_draw_inner(
             _ => {}
         }
     }
-    for image in &sampled {
-        match image {
-            PreparedSampled::Resident {
-                identity,
-                next_access,
-                ..
-            } => pools.registry_note_access(identity, *next_access),
-            PreparedSampled::Snapshot {
-                identity,
-                next_access,
-                ..
-            } if req.attachment_slot(identity).is_none() => {
-                pools.registry_note_access(identity, *next_access)
-            }
-            _ => {}
-        }
-    }
+    recorded_resident_accesses.publish(req, |identity, access| {
+        pools.registry_note_access(identity, access);
+    });
     if let Some((_, _, next_access)) = seed_from_resolved {
         if let Some(seed_identity) = &req.seed_from_target {
             pools.registry_note_access(seed_identity, next_access);
@@ -6441,14 +6421,12 @@ impl std::ops::Deref for ClearValues {
     }
 }
 
-/// The access a barrier over *this draw's own colour target* must name as its
-/// source, given what the registry last recorded and what this draw has already
-/// done to it.
+/// Resident reads recorded by this draw, keyed by the image's owning identity.
 ///
-/// `snapshotted` is this draw's own copy-on-sample read of the target, recorded
-/// into this same command buffer *after* the registry's access was read, so it
-/// names the newer touch and wins. Everything else the target could be carrying
-/// is already in [`super::pools::ResidentAccess`].
+/// Preparation captures the registry before any commands are recorded. A
+/// snapshot can supersede that access only for its own source, and a later
+/// direct sample supersedes the snapshot. Publication follows these operations,
+/// not descriptor binding order.
 ///
 /// # Why the write sites need a source scope at all
 ///
@@ -6484,15 +6462,60 @@ impl std::ops::Deref for ClearValues {
 /// The registry-resident target is the exception, and by design — see
 /// [`super::pools::ResidentAccess`], which is where that argument now lives in a form the
 /// compiler carries.
-fn target_prior_access(
-    snapshotted: bool,
-    tracked: super::pools::ResidentAccess,
-    host_accessible: bool,
-) -> super::pools::ResidentAccess {
-    if snapshotted {
-        super::pools::ResidentAccess::transfer_read(host_accessible)
-    } else {
-        tracked
+#[derive(Default)]
+struct RecordedResidentAccesses {
+    last: std::collections::HashMap<TargetIdentity, super::pools::ResidentAccess>,
+}
+
+impl RecordedResidentAccesses {
+    fn prior(
+        &self,
+        identity: Option<&TargetIdentity>,
+        tracked: super::pools::ResidentAccess,
+    ) -> super::pools::ResidentAccess {
+        identity
+            .and_then(|identity| self.last.get(identity))
+            .copied()
+            .unwrap_or(tracked)
+    }
+
+    /// Return the actual predecessor once per distinct consecutive read.
+    /// The first read still owes its dependency even when its layout matches.
+    fn record(
+        &mut self,
+        identity: &TargetIdentity,
+        tracked: super::pools::ResidentAccess,
+        next: super::pools::ResidentAccess,
+    ) -> Option<super::pools::ResidentAccess> {
+        match self.last.entry(identity.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(next);
+                Some(tracked)
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let prior = *entry.get();
+                if prior == next {
+                    None
+                } else {
+                    entry.insert(next);
+                    Some(prior)
+                }
+            }
+        }
+    }
+
+    fn publish(
+        self,
+        req: &DrawRequest,
+        mut publish: impl FnMut(&TargetIdentity, super::pools::ResidentAccess),
+    ) {
+        for (identity, access) in self.last {
+            // Attachment writes happened after the snapshot and already
+            // published their exact pass-exit access.
+            if req.attachment_slot(&identity).is_none() {
+                publish(&identity, access);
+            }
+        }
     }
 }
 
@@ -8147,13 +8170,138 @@ mod tests {
     /// read, so it names the newer touch and outranks whatever was there.
     #[test]
     fn a_snapshotted_target_waits_for_its_own_snapshot() {
-        for tracked in every_access() {
+        let identity = sampled_identity();
+        for host_accessible in [false, true] {
+            for tracked in every_access() {
+                let mut recorded = RecordedResidentAccesses::default();
+                let transfer = ResidentAccess::transfer_read(host_accessible);
+                assert_eq!(recorded.prior(Some(&identity), tracked), tracked);
+                assert_eq!(
+                    recorded.record(&identity, tracked, transfer),
+                    Some(tracked),
+                );
+                assert_eq!(
+                    recorded.prior(Some(&identity), tracked),
+                    transfer,
+                    "a snapshot of a {tracked:?} target is still the newest touch"
+                );
+                assert_eq!(
+                    recorded.record(&identity, tracked, transfer),
+                    None,
+                    "duplicate source bindings do not record a second transition"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unrelated_snapshot_preserves_the_primary_targets_recorded_access() {
+        let primary = sampled_identity();
+        let unrelated = TargetIdentity::Surface {
+            id: 8,
+            width: 64,
+            height: 32,
+            generation: 3,
+            format: vk::Format::R32_SFLOAT,
+        };
+        for host_accessible in [false, true] {
+            let mut recorded = RecordedResidentAccesses::default();
+            let transfer = ResidentAccess::transfer_read(host_accessible);
+            let source_prior = ResidentAccess::shader_read(host_accessible);
             assert_eq!(
-                target_prior_access(true, tracked, false),
-                ResidentAccess::transfer_read(false),
-                "a snapshot of a {tracked:?} target is still the newest touch"
+                recorded.record(&unrelated, source_prior, transfer),
+                Some(source_prior),
             );
-            assert_eq!(target_prior_access(false, tracked, false), tracked);
+            for tracked in every_access().into_iter().chain([
+                ResidentAccess::ColorWrite(vk::ImageLayout::GENERAL),
+                ResidentAccess::GuestBacking,
+                ResidentAccess::shader_read(true),
+                ResidentAccess::transfer_read(true),
+            ]) {
+                assert_eq!(recorded.prior(Some(&primary), tracked), tracked);
+                assert_eq!(recorded.prior(None, tracked), tracked);
+                assert_eq!(recorded.prior(Some(&unrelated), tracked), transfer);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_snapshot_and_direct_bindings_follow_recorded_access_order() {
+        let identity = sampled_identity();
+        for host_accessible in [false, true] {
+            let transfer = ResidentAccess::transfer_read(host_accessible);
+            let shader = ResidentAccess::shader_read(host_accessible);
+            for tracked in [
+                ResidentAccess::ColorWrite(vk::ImageLayout::GENERAL),
+                transfer,
+                shader,
+            ] {
+                for bindings in [
+                    [shader, transfer, shader, transfer],
+                    [transfer, shader, transfer, shader],
+                ] {
+                    let mut recorded = RecordedResidentAccesses::default();
+                    let mut transitions = Vec::new();
+                    // Snapshot copies precede direct sampling regardless of
+                    // descriptor order. Duplicate bindings share transitions.
+                    for phase in [transfer, shader] {
+                        for next in bindings {
+                            if next == phase {
+                                if let Some(prior) = recorded.record(&identity, tracked, next) {
+                                    transitions.push((prior, next));
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(transitions, [(tracked, transfer), (transfer, shader)]);
+                    assert_eq!(recorded.prior(Some(&identity), tracked), shader);
+                    let mut published = Vec::new();
+                    recorded.publish(&DrawRequest::default(), |identity, access| {
+                        published.push((identity.clone(), access));
+                    });
+                    assert_eq!(published, [(identity.clone(), shader)]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attachment_snapshot_reads_do_not_replace_pass_exit_access() {
+        let primary = sampled_identity();
+        let secondary = secondary_with_clear(super::super::types::ColorClearValue::default());
+        let secondary_identity = secondary.identity.clone();
+        let req = DrawRequest {
+            target_identity: Some(primary.clone()),
+            secondary_targets: vec![secondary],
+            ..DrawRequest::default()
+        };
+        let mut recorded = RecordedResidentAccesses::default();
+        for identity in [&primary, &secondary_identity] {
+            let tracked = ResidentAccess::ColorWrite(vk::ImageLayout::GENERAL);
+            assert_eq!(
+                recorded.record(identity, tracked, ResidentAccess::transfer_read(false)),
+                Some(tracked),
+            );
+        }
+        recorded.publish(&req, |identity, access| {
+            panic!("snapshot {identity:?}/{access:?} overwrote the later attachment access")
+        });
+    }
+
+    #[test]
+    fn a_secondary_snapshot_updates_only_its_own_attachment_entry() {
+        let primary = sampled_identity();
+        let secondary = secondary_with_clear(super::super::types::ColorClearValue::default());
+        let tracked = ResidentAccess::ColorWrite(vk::ImageLayout::GENERAL);
+        for host_accessible in [false, true] {
+            let mut recorded = RecordedResidentAccesses::default();
+            let transfer = ResidentAccess::transfer_read(host_accessible);
+            assert_eq!(
+                recorded.record(&secondary.identity, tracked, transfer),
+                Some(tracked),
+            );
+            assert_eq!(recorded.prior(Some(&primary), tracked), tracked);
+            assert_eq!(recorded.prior(Some(&secondary.identity), tracked), transfer);
         }
     }
 
@@ -8166,6 +8314,7 @@ mod tests {
     /// transition, which is undefined behaviour and not an error.
     #[test]
     fn only_a_target_left_where_the_next_pass_wants_it_may_skip_its_barrier() {
+        let identity = sampled_identity();
         for tracked in every_access() {
             let skippable = tracked
                 == ResidentAccess::ColorWrite(super::super::caches::color0_pass_exit_layout());
@@ -8176,8 +8325,13 @@ mod tests {
             );
             // A snapshot is this draw's own transfer read and always needs the
             // transition back, whatever the registry was tracking.
+            let mut recorded = RecordedResidentAccesses::default();
+            assert_eq!(
+                recorded.record(&identity, tracked, ResidentAccess::transfer_read(false)),
+                Some(tracked),
+            );
             assert!(
-                !pass_exit_needs_no_barrier(target_prior_access(true, tracked, false)),
+                !pass_exit_needs_no_barrier(recorded.prior(Some(&identity), tracked)),
                 "a snapshotted {tracked:?} target still has to come back from TRANSFER_SRC"
             );
         }

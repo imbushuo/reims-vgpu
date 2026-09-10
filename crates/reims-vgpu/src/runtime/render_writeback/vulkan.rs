@@ -20,6 +20,34 @@
 use super::*;
 use crate::runtime::host::{HostMemory, HostOps};
 
+mod native;
+
+/// Merge native storage without converting either the GPU's texels or the
+/// bytes the guest owns. Canonical scanout retains its existing merging rail.
+pub(crate) fn merge_native_surface<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+    guest_owned: &[(u64, u64)],
+) -> Option<bool> {
+    let format = state.mappings.get(&mapping_id).map(crate::runtime::mapping_write::mapping_store_format)?;
+    if !native::required(format) {
+        return None;
+    }
+    let source = match crate::backend::vulkan::engine::read_target_native(identity) {
+        Ok(source) => source,
+        Err(error) => {
+            crate::observe::Emit::decline("sampled_resident_merge_fail", &error)
+                .field("mapping", mapping_id).field("at", "native_read").fail();
+            return Some(false);
+        }
+    };
+    Some(native::store_skipping(state, host, mapping_id, width, height, &source, guest_owned))
+}
+
 /// Copy `identity`'s pixels into `mapping_id`'s guest pages.
 ///
 /// `true` when the guest's pages hold the frame. `false` is a real loss and is
@@ -56,6 +84,25 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
                 .fail_once(u64::from(mapping_id));
             crate::runtime::drain::note_store_route("render_flush_gpu_declined");
         }
+    }
+    let format = state.mappings.get(&mapping_id)
+        .map(crate::runtime::mapping_write::mapping_store_format);
+    if format.is_some_and(native::required) {
+        let readback = match crate::backend::vulkan::engine::read_target_native(identity) {
+            Ok(readback) => readback,
+            Err(error) => {
+                crate::observe::Emit::decline("render_store_lost", &error)
+                    .field("mapping", mapping_id).field("at", "native_read").fail();
+                return false;
+            }
+        };
+        let bytes = readback.pixels.len();
+        if !native::store(state, host, mapping_id, width, height, &readback) {
+            return false;
+        }
+        crate::runtime::drain::note_store_route("render_flush_native_copied");
+        finish(state, mapping_id, identity, bytes, started, false);
+        return true;
     }
     // The copying arms. These are the only arms on a host that cannot import
     // guest RAM, and the arm a discrete GPU takes regardless.

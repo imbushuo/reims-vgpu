@@ -1243,6 +1243,25 @@ choices! {
 pub const RAIL: &str = "REIMS_VGPU_RAIL";
 }
 
+macro_rules! paths {
+    ($( $(#[$doc:meta])* pub const $ident:ident: &str = $name:literal; )*) => {
+        $( $(#[$doc])* pub const $ident: &str = $name; )*
+        /// Path-valued configuration, reported without switch or choice parsing.
+        pub const ALL_PATHS: &[&str] = &[$($ident),*];
+    };
+}
+
+paths! {
+/// Optional directory for per-run diagnostic files. The caller creates it;
+/// unset preserves the existing product and per-process test destinations.
+pub const LOG_DIRECTORY: &str = "REIMS_VGPU_LOG_DIRECTORY";
+}
+
+/// Read a filesystem path without changing its case or interpreting shell syntax.
+pub fn path(name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os(name).filter(|value| !value.is_empty()).map(std::path::PathBuf::from)
+}
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -1429,7 +1448,7 @@ pub fn report_line() -> String {
     // narrowed against belong to the module that carries them, and this line is
     // written before any device exists to ask. What the device *did* with the
     // ask is reported where it is adopted.
-    for name in ALL_CHOICES {
+    for name in ALL_CHOICES.into_iter().chain(ALL_PATHS.iter().copied()) {
         let short = name.strip_prefix("REIMS_VGPU_").unwrap_or(name);
         let raw = std::env::var_os(name)
             .map(|v| v.to_string_lossy().into_owned())
@@ -1443,6 +1462,16 @@ pub fn report_line() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_directory_paths_preserve_case_and_are_reported() {
+        with_probe(Some("evidence/Run A"), || {
+            assert_eq!(path("REIMS_VGPU_TEST_PROBE"), Some(std::path::PathBuf::from("evidence/Run A")));
+        });
+        with_probe(Some(""), || assert_eq!(path("REIMS_VGPU_TEST_PROBE"), None));
+        assert!(ALL_PATHS.contains(&LOG_DIRECTORY));
+        assert!(report_line().contains(" log_directory="));
+    }
 
     /// One process-wide lock for every test that mutates the environment.
     /// `set_var` is process-global and unsynchronized; two tests setting

@@ -175,11 +175,13 @@ Declaration order across files does not matter in Swift, so a case file may use
 anything in `Support.swift` and vice versa. Adding a case is: a function in the
 right `cases/` file, and a call in `main.swift`.
 
-`--alpha-surface-only` runs 16 R8/A8 IOSurface alias cases at 64x32 and
+`--alpha-surface-only` runs 24 R8/A8 IOSurface alias cases at 64x32 and
 702x576. Each checks raw bytes, R8 reads, and alpha-only A8 reads after
 completed render commands, with separate red/alpha write masks and scissored
 Load preservation. It covers the native-format identity and sampled-channel
-contract behind the macOS 15 System Information crash.
+contract behind the macOS 15 System Information crash. Paired reads bind both
+views in one draw, in both slot orders, while loading an unrelated primary
+attachment, covering snapshot/direct-read access ordering as well.
 
 `--fragment-texture-writes-only` runs the framebuffer-snapshot regression:
 a fragment shader with no color output saves the framebuffer into a writable

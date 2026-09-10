@@ -27,6 +27,15 @@ func alphaSurfaceRenderCases(_ w: Int, _ h: Int) {
         constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::nearest);
         return tex.sample(s, p.xy / float2(tex.get_width(), tex.get_height()));
     }
+    fragment float4 alpha_surface_paired_read(float4 p [[position]],
+        texture2d<float> first [[texture(0)]], texture2d<float> second [[texture(1)]]) {
+        float4 a = first.read(uint2(p.xy)), b = second.read(uint2(p.xy));
+        bool red_first = a.a == 1.0f && all(a.gb == float2(0)) &&
+            all(b.rgb == float3(0)) && a.r == b.a;
+        bool alpha_first = b.a == 1.0f && all(b.gb == float2(0)) &&
+            all(a.rgb == float3(0)) && b.r == a.a;
+        return red_first || alpha_first ? a : float4(1, 0, 1, 0);
+    }
     """
     let shaders: MTLLibrary
     do {
@@ -60,22 +69,29 @@ func alphaSurfaceRenderCases(_ w: Int, _ h: Int) {
     }
 
     func samplePass(_ command: MTLCommandBuffer, _ texture: MTLTexture,
-                    _ output: MTLTexture, _ pipe: MTLRenderPipelineState) -> Bool {
+                    _ output: MTLTexture, _ pipe: MTLRenderPipelineState,
+                    paired: MTLTexture? = nil) -> Bool {
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = output
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].clearColor = MTLClearColor(red: 1, green: 0, blue: 1, alpha: 1)
         pass.colorAttachments[0].storeAction = .store
+        if paired != nil {
+            guard let seed = command.makeRenderCommandEncoder(descriptor: pass) else { return false }
+            seed.endEncoding()
+            pass.colorAttachments[0].loadAction = .load
+        }
         guard let encoder = command.makeRenderCommandEncoder(descriptor: pass) else { return false }
         encoder.setRenderPipelineState(pipe)
         encoder.setFragmentTexture(texture, index: 0)
+        if let paired { encoder.setFragmentTexture(paired, index: 1) }
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
         return true
     }
 
     for (maskName, mask) in masks {
-        for readName in ["read", "sample"] {
+        for readName in ["read", "sample", "paired_read"] {
             let label = "a8_iosurface_render_mask_\(maskName)_\(readName)_\(w)x\(h)"
             do {
                 let write = try pipeline("alpha_surface_write", .r8Unorm, mask)
@@ -128,8 +144,11 @@ func alphaSurfaceRenderCases(_ w: Int, _ h: Int) {
                 }
                 // Completed-command ordering isolates channel interpretation
                 // from synchronization between separate IOSurface wrappers.
-                guard samplePass(sampleCommand, alpha, alphaOutput, read),
-                      samplePass(sampleCommand, red, redOutput, read) else {
+                // Paired mode exercises both snapshot/direct binding orders
+                // while LOAD belongs to an unrelated primary attachment.
+                let paired = readName == "paired_read"
+                guard samplePass(sampleCommand, alpha, alphaOutput, read, paired: paired ? red : nil),
+                      samplePass(sampleCommand, red, redOutput, read, paired: paired ? alpha : nil) else {
                     report(label, false, "sample encoder refused"); continue
                 }
                 sampleCommand.commit()

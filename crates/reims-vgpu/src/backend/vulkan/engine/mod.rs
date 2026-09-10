@@ -3696,6 +3696,7 @@ impl GuestPageTarget {
             pitch_bytes: self.pitch_bytes(),
             width_texels: self.width,
             height_texels: self.height,
+            bytes_per_texel: self.bytes_per_texel(),
         }
     }
 
@@ -3862,7 +3863,7 @@ pub fn copy_target_to_guest_pages(
         // imported pages, so these bytes are the host readback this rail elides
         // rather than one it paid.
         counters.note_target_read(
-            u64::from(dst.width) * u64::from(dst.height) * 4,
+            u64::from(dst.width) * u64::from(dst.height) * dst.bytes_per_texel(),
             TargetReadDelivery::GuestPagesOnGpu,
         );
     }
@@ -5528,7 +5529,17 @@ fn readback_snapshot(
     Ok((snap, layout))
 }
 
-fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+pub(crate) struct NativeTargetReadback {
+    pub pixels: Vec<u8>,
+    pub layout: crate::protocol::pixel_format::TexelLayout,
+    pub format: ash::vk::Format,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Read the allocation's texels without applying a sampled interpretation or
+/// narrowing them. A surface Store copies these bytes, including A8/R8 aliases.
+pub(crate) fn read_target_native(identity: &TargetIdentity) -> Result<NativeTargetReadback, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -5539,9 +5550,8 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
     let (snap, layout) = readback_snapshot(pools, identity)?;
-    // Asked for at the resident's own width — the copy is a raw image→buffer
-    // move and reads the image format's texel — and narrowed below if that is
-    // not what the caller can read.
+    // The copy reads the image format's texel. Only the legacy colour reader
+    // narrows it; native publication keeps these bytes untouched.
     let pixels = (snap.width as u64) * (snap.height as u64);
     let rb_size = pixels * u64::from(layout.bytes_per_texel());
     let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
@@ -5561,12 +5571,23 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         )?;
         pools.registry_note_access(identity, read_access);
         counters.note_target_read(rb_size, TargetReadDelivery::Host);
-        // A wide resident is quantized here rather than refused; see
-        // `narrow_readback_to_rgba8` for why that direction is the safe one.
-        let (pixels, texel) =
-            narrow_readback_to_rgba8(out, layout, snap.format, pixels, snap.bgra())?;
-        Ok(TargetReadback { pixels, texel })
+        Ok(NativeTargetReadback {
+            pixels: out,
+            layout,
+            format: snap.format,
+            width: snap.width,
+            height: snap.height,
+        })
     }
+}
+
+fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+    let native = read_target_native(identity)?;
+    let count = u64::from(native.width) * u64::from(native.height);
+    let bgra = crate::backend::vulkan::translate::pixel::has_bgra_order(native.format);
+    let (pixels, texel) =
+        narrow_readback_to_rgba8(native.pixels, native.layout, native.format, count, bgra)?;
+    Ok(TargetReadback { pixels, texel })
 }
 
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
@@ -6344,6 +6365,26 @@ mod guest_page_target_tests {
             // are all four-byte extent arithmetic.
             format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
             shared_backing: None,
+        }
+    }
+
+    #[test]
+    fn guest_copy_geometry_carries_native_texel_width() {
+        use ash::vk::Format;
+        for (format, bytes) in [
+            (Format::R8_UNORM, 1u64),
+            (Format::R16_SFLOAT, 2),
+            (Format::R8G8B8A8_UNORM, 4),
+            (Format::R16G16B16A16_SFLOAT, 8),
+            (Format::R32G32B32A32_SFLOAT, 16),
+        ] {
+            let pitch = (702 * bytes).div_ceil(128) * 128;
+            let mut dst = target(702, 576, (pitch / bytes) as u32);
+            dst.format = format;
+            let geometry = dst.geometry();
+            assert_eq!(geometry.bytes_per_texel, bytes);
+            assert_eq!(geometry.pitch_bytes, pitch);
+            assert_eq!(geometry.extent_end(), 575 * pitch + 702 * bytes);
         }
     }
 
