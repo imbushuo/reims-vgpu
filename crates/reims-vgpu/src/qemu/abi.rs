@@ -1152,7 +1152,7 @@ mod tests {
 
     #[test]
     fn backend_name_metal_default() {
-        let mut buf = [0i8; 32];
+        let mut buf: [c_char; 32] = [0; 32];
         assert_eq!(
             unsafe { reims_vgpu_qemu_backend_name(buf.as_mut_ptr(), buf.len()) },
             REIMS_VGPU_QEMU_OK

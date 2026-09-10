@@ -45,7 +45,7 @@ use crate::census::{Census, DeviceExtensions};
 use crate::queues::QueuePlan;
 use ash::vk;
 use reims_vgpu_core::identity::DeviceEpoch as EpochId;
-use std::ffi::CString;
+use std::ffi::{c_char, CString};
 
 /// What device creation turns on.
 ///
@@ -285,7 +285,7 @@ fn with_create_info<R>(
         .into_iter()
         .map(|n| CString::new(n).expect("an extension name has no interior NUL"))
         .collect();
-    let pointers: Vec<*const i8> = names.iter().map(|n| n.as_ptr()).collect();
+    let pointers: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
 
     let priorities = [1.0f32];
     let queue_info = [vk::DeviceQueueCreateInfo::default()
@@ -785,6 +785,18 @@ mod tests {
             let listed = enabled.extensions.names();
 
             let chained = with_create_info(&enabled, 0, |create| {
+                let names: Vec<_> = (0..create.enabled_extension_count as usize)
+                    .map(|index| {
+                        // SAFETY: the pointer array and its C strings live
+                        // throughout this closure, including on unsigned-char hosts.
+                        unsafe {
+                            std::ffi::CStr::from_ptr(*create.pp_enabled_extension_names.add(index))
+                        }
+                        .to_str()
+                        .expect("extension names are ASCII")
+                    })
+                    .collect();
+                assert_eq!(names, listed, "{label}: extension names changed at the C ABI");
                 let mut seen = Vec::new();
                 let mut next = create.p_next;
                 while !next.is_null() {
