@@ -40,6 +40,14 @@ if CommandLine.arguments.contains("--float-sampling-only") {
     finish()
 }
 
+if CommandLine.arguments.contains("--alpha-surface-only") {
+    _ = library
+    report("shader_compile", true, "runtime library built")
+    alphaSurfaceRenderCases(64, 32)
+    alphaSurfaceRenderCases(702, 576)
+    finish()
+}
+
 if CommandLine.arguments.contains("--fragment-texture-writes-only") {
     _ = library
     report("shader_compile", true, "runtime library built")
@@ -76,6 +84,9 @@ report("shader_compile", true, "runtime library built")
 topologyCases()
 
 floatSamplingCases()
+
+alphaSurfaceRenderCases(64, 32)
+alphaSurfaceRenderCases(702, 576)
 
 indexedDrawCases()
 

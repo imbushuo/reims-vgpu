@@ -794,12 +794,12 @@ pub(super) enum SampledSourceRequest {
         SampledByteFormat,
         crate::backend::vulkan::engine::SampledByteOrigin,
     ),
-    /// Engine-resident allocation plus the exact view format this sampled
-    /// texture declared. Allocation identity and view interpretation are
-    /// separate parts of the texture contract.
+    /// Engine-resident allocation plus the sampled format and its channel plan.
+    /// A8 and R8 share native storage but not their sampled interpretation.
     Target(
         crate::backend::vulkan::engine::TargetIdentity,
         ash::vk::Format,
+        pixel_format::SwizzlePlan,
     ),
     /// Zero-copy guest gather: the engine copies the texel bytes from
     /// imported guest RAM inside the draw CB — no CPU read, no memo, no
@@ -1393,8 +1393,10 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // channels.
                 if guest_allocation_sample_is_direct(resident_backing, may_bind_resident) {
                     crate::runtime::drain::note_store_route("t11rung_resident");
-                    let format = resident_id.resident_format();
-                    return Some((w, h, mid, SampledSourceRequest::Target(resident_id, format)));
+                    let format = crate::backend::vulkan::present_identity::surface_sample_format(state, mid);
+                    return Some((w, h, mid, SampledSourceRequest::Target(
+                        resident_id, format.vk, format.components,
+                    )));
                 }
 
                 // What the hypervisor can say about the guest's own stores into
@@ -1466,12 +1468,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 } else if resident_ready {
                     if !guest_replaced {
                         note_mapper_ref_texture_sample_rung("t11rung_resident", guest_write);
-                        let format = resident_id.resident_format();
+                        let format = crate::backend::vulkan::present_identity::surface_sample_format(state, mid);
                         return Some((
                             w,
                             h,
                             mid,
-                            SampledSourceRequest::Target(resident_id, format),
+                            SampledSourceRequest::Target(resident_id, format.vk, format.components),
                         ));
                     }
                     note_mapper_ref_texture_sample_rung("t11rung_resident_refused", guest_write);
@@ -4397,9 +4399,9 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
         }
     };
     let declared_format = tex.declared_pixel_format()?;
-    let format = translate::pixel::translate(declared_format).ok()?.vk;
+    let format = translate::pixel::translate(declared_format).ok()?;
     note_store_route("gvarung_resident");
-    Some((w, h, SampledSourceRequest::Target(identity, format)))
+    Some((w, h, SampledSourceRequest::Target(identity, format.vk, format.components)))
 }
 
 /// Which repair would let the linear zero-copy rung carry this format, as a
@@ -7686,6 +7688,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                                     .map(|resolved| resolved.0.vk)
                                             })
                                             .unwrap_or_else(|| identity.resident_format()),
+                                        pixel_format::swizzle_identity(),
                                     ),
                                 )
                             }
@@ -7799,7 +7802,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // handed the guest's own bytes over untouched.
                 let mut sampled_components = pixel_format::swizzle_identity();
                 let mut source_planes = 1;
-                let source_is_target = matches!(&loaded, SampledSourceRequest::Target(_, _));
+                let source_is_target = matches!(&loaded, SampledSourceRequest::Target(..));
                 let source_is_planar = matches!(&loaded, SampledSourceRequest::Planar(_));
                 let source = match loaded {
                     SampledSourceRequest::Planar(image) => {
@@ -7817,8 +7820,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         byte_origin = origin;
                         crate::backend::vulkan::engine::SampledSource::Bytes(rgba)
                     }
-                    SampledSourceRequest::Target(identity, format) => {
+                    SampledSourceRequest::Target(identity, format, components) => {
                         sampled_vk_format = format;
+                        sampled_components = components;
                         // The source resolver carries the sampled texture's
                         // exact view format beside the allocation identity. A
                         // resident attachment view is not necessarily the view

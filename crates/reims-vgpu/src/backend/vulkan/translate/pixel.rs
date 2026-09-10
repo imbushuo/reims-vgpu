@@ -940,6 +940,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn attachment_alias_formats_require_identity_components() {
+        assert_eq!(p::render_target_bpp(p::MTL_FORMAT_A8_UNORM), None);
+        assert!(matches!(
+            color_attachment(p::MTL_FORMAT_A8_UNORM),
+            Err(TranslateReason::NoColorAttachmentFormat(p::MTL_FORMAT_A8_UNORM))
+        ));
+        assert_ne!(translate(p::MTL_FORMAT_A8_UNORM).unwrap().components, rail::IDENTITY);
+        assert!(color_attachment(p::MTL_FORMAT_R8_UNORM).is_ok());
+
+        for mtl in translated().filter(|&mtl| color_attachment(mtl).is_ok()) {
+            assert_eq!(
+                translate(mtl).unwrap().components,
+                rail::IDENTITY,
+                "attachment-alias Target binds an admitted attachment with identity components; \
+                 admitting {mtl:#x} requires carrying its sampled component mapping"
+            );
+        }
+    }
+
     /// The engine-internal format constants are not a second opinion: each is
     /// exactly what the pixel table answers for the Metal format it stands for.
     /// A drift here is a red/blue channel swap on the present path, which reads

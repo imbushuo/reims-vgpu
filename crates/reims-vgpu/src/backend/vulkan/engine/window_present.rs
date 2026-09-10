@@ -57,8 +57,11 @@ pub(crate) fn window_presents_in_flight() -> bool {
 ///
 /// Called only where `PresentFrame::submitted` is set, and paired with
 /// [`end_present_in_flight`] at every place it is cleared.
-fn begin_present_in_flight(fence: vk::Fence) -> retirement::WindowWork {
-    retirement::begin(fence)
+fn begin_present_in_flight(
+    fence: vk::Fence,
+    host_submission: super::queue_owner::SubmissionReceipt,
+) -> retirement::WindowWork {
+    retirement::begin(fence, host_submission)
 }
 
 /// Caller holds ENGINE, as do every reset and destruction of these fences.
@@ -79,7 +82,10 @@ pub(crate) struct PresentInFlightForTest(retirement::WindowWork);
 #[cfg(test)]
 impl PresentInFlightForTest {
     pub(crate) fn claim() -> Self {
-        Self(begin_present_in_flight(vk::Fence::null()))
+        Self(begin_present_in_flight(
+            vk::Fence::null(),
+            super::queue_owner::SubmissionReceipt::completed(),
+        ))
     }
 }
 
@@ -845,12 +851,11 @@ impl WindowPresenter {
     /// caller is about to record into.
     unsafe fn retire(&mut self, ctx: &DeviceContext) -> Result<bool, DrawError> {
         for ix in 0..self.frames.len() {
-            if self.frames[ix].submitted.is_none() {
+            let Some(work) = self.frames[ix].submitted.as_ref() else {
                 continue;
-            }
-            let signaled = ctx
-                .device
-                .get_fence_status(self.frames[ix].in_flight)
+            };
+            let signaled = work
+                .poll(|| ctx.device.get_fence_status(self.frames[ix].in_flight))
                 .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowFenceStatus, error)))?;
             if !signaled {
                 continue;
@@ -882,7 +887,11 @@ impl WindowPresenter {
         if fences.is_empty() {
             return;
         }
-        if let Err(error) = ctx.device.wait_for_fences(&fences, true, u64::MAX) {
+        let waited = self.frames.iter()
+            .filter_map(|frame| frame.submitted.as_ref())
+            .try_for_each(|work| work.wait_submission())
+            .and_then(|()| ctx.device.wait_for_fences(&fences, true, u64::MAX));
+        if let Err(error) = waited {
             let decline = VkCall::new(VkOp::WindowFenceStatus, error);
             crate::observe::Emit::decline("host_window_staging_wait", &decline).fail_once(0);
         }
@@ -1388,7 +1397,10 @@ impl WindowPresenter {
         let submission = submit_result?;
         // Claimed before the latch, so the slot is never observed clear while
         // the latch says an entry is outstanding.
-        self.frames[frame_ix].submitted = Some(begin_present_in_flight(frame_in_flight));
+        self.frames[frame_ix].submitted = Some(begin_present_in_flight(
+            frame_in_flight,
+            submission.host_submission(),
+        ));
         // Only a successful submit advances the ring; a `Busy` return above
         // leaves the slot for the next attempt.
         self.frame_ix = (frame_ix + 1) % self.frames.len();

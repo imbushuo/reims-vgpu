@@ -140,6 +140,10 @@ pub struct DeviceFeatures {
     /// Defined bounds-clamped behaviour for out-of-range shader buffer access.
     /// The one feature the spec requires every implementation to support.
     pub robust_buffer_access: bool,
+    /// Core Vulkan permits both; portability-subset devices must advertise
+    /// and enable the corresponding optional feature bits.
+    pub image_view_format_reinterpretation: bool,
+    pub image_view_format_swizzle: bool,
     pub sampler_anisotropy: bool,
     pub max_sampler_anisotropy: f32,
     /// `VkPhysicalDeviceLimits::maxImageDimension2D` — the largest 2D image
@@ -494,6 +498,12 @@ pub struct DeviceFeatures {
 }
 
 impl DeviceFeatures {
+    pub fn enabled_portability_subset(&self) -> vk::PhysicalDevicePortabilitySubsetFeaturesKHR<'static> {
+        vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default()
+            .image_view_format_reinterpretation(self.image_view_format_reinterpretation)
+            .image_view_format_swizzle(self.image_view_format_swizzle)
+    }
+
     /// Whether this device can bind a Metal sampled-texture handle array.
     /// Both halves are required: the shader indexes an array, and Metal permits
     /// the guest to leave array elements nil.
@@ -685,6 +695,8 @@ impl DeviceFeatures {
     pub fn report_line(&self) -> String {
         let Self {
             robust_buffer_access,
+            image_view_format_reinterpretation,
+            image_view_format_swizzle,
             sampler_anisotropy,
             max_sampler_anisotropy,
             max_image_dimension_2d,
@@ -752,6 +764,8 @@ impl DeviceFeatures {
         };
         format!(
             "vk_features robust_buffer_access={robust_buffer_access} \
+             image_view_format_reinterpretation={image_view_format_reinterpretation} \
+             image_view_format_swizzle={image_view_format_swizzle} \
              image_robustness={image_robustness:?} \
              attachment_feedback_loop_layout={attachment_feedback_loop_layout} \
              rasterization_order_color_access={rasterization_order_color_access} \
@@ -855,14 +869,21 @@ pub unsafe fn query(
     // extension name valid — so one query covers both rungs and only the
     // *enable* side has to know which it took.
     let mut supported_image_robustness = vk::PhysicalDeviceImageRobustnessFeaturesEXT::default();
+    let portability_subset = has_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
+    let mut supported_portability = vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default();
     let mut features2 = vk::PhysicalDeviceFeatures2::default()
         .push_next(&mut supported_16)
         .push_next(&mut supported_8)
         .push_next(&mut supported_f16i8)
         .push_next(&mut supported_vulkan12)
         .push_next(&mut supported_image_robustness);
+    if portability_subset {
+        features2 = features2.push_next(&mut supported_portability);
+    }
     unsafe { instance.get_physical_device_features2(pd, &mut features2) };
     let supported = features2.features;
+    let (image_view_format_reinterpretation, image_view_format_swizzle) =
+        image_view_capabilities(portability_subset.then_some(&supported_portability));
     let props = unsafe { instance.get_physical_device_properties(pd) };
     // Subgroup size is Vulkan 1.1 core and chains onto `Properties2`; the
     // baseline is 1.2, so it is always answerable. It is what the guest's
@@ -1025,6 +1046,8 @@ pub unsafe fn query(
 
     DeviceFeatures {
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
+        image_view_format_reinterpretation,
+        image_view_format_swizzle,
         image_robustness,
         attachment_feedback_loop_layout,
         rasterization_order_color_access,
@@ -1107,6 +1130,15 @@ pub unsafe fn query(
     }
 }
 
+fn image_view_capabilities(
+    portability: Option<&vk::PhysicalDevicePortabilitySubsetFeaturesKHR<'_>>,
+) -> (bool, bool) {
+    portability.map_or((true, true), |features| (
+        features.image_view_format_reinterpretation == vk::TRUE,
+        features.image_view_format_swizzle == vk::TRUE,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,6 +1172,8 @@ mod tests {
             wide_lines: true,
             line_width_range: [1.0, 8.0],
             robust_buffer_access: true,
+            image_view_format_reinterpretation: true,
+            image_view_format_swizzle: true,
             texture_compression_bc: true,
             sampler_anisotropy: true,
             max_sampler_anisotropy: 16.0,
@@ -1185,6 +1219,29 @@ mod tests {
             depth_clamp: true,
             multi_viewport: true,
             max_viewports: 16,
+        }
+    }
+
+    #[test]
+    fn image_view_portability_features_are_queried_and_enabled_together() {
+        assert_eq!(image_view_capabilities(None), (true, true));
+        for reinterpretation in [false, true] {
+            for swizzle in [false, true] {
+                let supported = vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default()
+                    .image_view_format_reinterpretation(reinterpretation)
+                    .image_view_format_swizzle(swizzle);
+                let (image_view_format_reinterpretation, image_view_format_swizzle) =
+                    image_view_capabilities(Some(&supported));
+                let features = DeviceFeatures {
+                    image_view_format_reinterpretation,
+                    image_view_format_swizzle,
+                    ..Default::default()
+                };
+                let enabled = features.enabled_portability_subset();
+                assert_eq!(enabled.image_view_format_reinterpretation == vk::TRUE, reinterpretation);
+                assert_eq!(enabled.image_view_format_swizzle == vk::TRUE, swizzle);
+                assert_eq!(enabled.events, vk::FALSE, "do not widen unrelated feature enablement");
+            }
         }
     }
 

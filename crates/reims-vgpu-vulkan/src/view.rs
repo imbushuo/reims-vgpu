@@ -60,6 +60,8 @@ use ash::vk;
 use reims_vgpu_core::pixel_format::{format_has_depth_aspect, format_has_stencil_aspect};
 use reims_vgpu_core::texture_shape::{Dimensions, Texture, TextureKind};
 
+pub mod format;
+
 /// The aspects a guest format's texels are made of.
 ///
 /// Depth and stencil together for a combined format: a view used as an

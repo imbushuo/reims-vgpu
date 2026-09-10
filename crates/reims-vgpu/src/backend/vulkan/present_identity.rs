@@ -16,7 +16,6 @@
 
 use crate::backend::vulkan::engine::TargetIdentity;
 use crate::model::DeviceState;
-use ash::vk;
 
 /// Build a protocol-stable resident identity for this mapping at its current
 /// [`crate::model::MappingEntry::map_generation`].
@@ -30,20 +29,27 @@ use ash::vk;
 /// residue class.
 /// The image format a resident for this mapping is created with.
 ///
-/// The guest's own declaration, taken from the single place the writeback also
-/// reads it. A declaration with no linear Vulkan texel — a compressed or planar
-/// plane, which nothing renders into — falls back to guest scanout order, which
-/// is what this namespace answered for every mapping before it could answer at
-/// all; the GPU writeback rail then refuses that pair by name and the copying
-/// rail converts, exactly as it did.
-fn surface_format(state: &DeviceState, mapping_id: u32) -> vk::Format {
+/// Native storage and sampled interpretation are independent of whether the
+/// guest Store supports a byte copy. In particular, A8 occupies R8 storage,
+/// not the BGRA fallback of the narrower Store-admission table.
+pub(crate) fn surface_sample_format(
+    state: &DeviceState,
+    mapping_id: u32,
+) -> crate::backend::vulkan::translate::pixel::PixelFormat {
+    use crate::backend::vulkan::translate::pixel;
     state
         .mappings
         .get(&mapping_id)
         .map(crate::runtime::mapping_write::mapping_store_format)
-        .and_then(crate::protocol::pixel_format::store_texel_order)
-        .map(crate::backend::vulkan::translate::pixel::vk_texel_layout)
-        .unwrap_or(crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT)
+        .and_then(|format| pixel::translate(format).ok())
+        .filter(|format| {
+            pixel::vk_block_geometry(format.vk)
+                .is_some_and(|block| block.width == 1 && block.height == 1)
+        })
+        .unwrap_or_else(|| {
+            pixel::translate(crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM)
+                .expect("the scanout format has a native translation")
+        })
 }
 
 pub fn surface_identity(
@@ -62,13 +68,14 @@ pub fn surface_identity(
         width,
         height,
         generation: gen,
-        format: surface_format(state, mapping_id),
+        format: surface_sample_format(state, mapping_id).linear_vk,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ash::vk;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
 
     /// Two mappings must never share an identity, and one mapping must never
@@ -167,13 +174,13 @@ mod tests {
             surface_identity(&state, 7, 64, 32).resident_format(),
             SCANOUT_FORMAT
         );
-        // Declared as a format with no `TexelLayout` to store into.
+        // A block-compressed plane has no linear resident texel.
         {
             let m = state.mappings.get_mut(&7).unwrap();
             m.has_geom = true;
             m.width = 64;
             m.height = 32;
-            m.format = crate::protocol::pixel_format::MTL_FORMAT_RGBA32_FLOAT;
+            m.format = crate::protocol::pixel_format::MTL_FORMAT_BC1_RGBA;
         }
         assert_eq!(
             surface_identity(&state, 7, 64, 32).resident_format(),
@@ -184,6 +191,51 @@ mod tests {
             surface_identity(&state, 999, 64, 32).resident_format(),
             SCANOUT_FORMAT
         );
+    }
+
+    #[test]
+    fn surface_identity_keeps_native_formats_outside_store_copy_admission() {
+        use crate::protocol::pixel_format as p;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.map_surface(6));
+        for (guest, native) in [
+            (p::MTL_FORMAT_A8_UNORM, vk::Format::R8_UNORM),
+            (p::MTL_FORMAT_R8_UNORM, vk::Format::R8_UNORM),
+            (p::MTL_FORMAT_R16_FLOAT, vk::Format::R16_SFLOAT),
+            (p::MTL_FORMAT_RG16_FLOAT, vk::Format::R16G16_SFLOAT),
+            (p::MTL_FORMAT_RGBA32_FLOAT, vk::Format::R32G32B32A32_SFLOAT),
+        ] {
+            assert!(p::store_texel_order(guest).is_none(), "exercise the old fallback");
+            let m = state.mappings.get_mut(&6).unwrap();
+            m.has_geom = true;
+            m.width = 702;
+            m.height = 576;
+            m.format = guest;
+            assert_eq!(surface_identity(&state, 6, 702, 576).resident_format(), native);
+            assert_eq!(surface_sample_format(&state, 6).vk, native);
+        }
+    }
+
+    #[test]
+    fn alpha_surface_shares_r8_storage_but_keeps_its_sampled_channels() {
+        use crate::protocol::pixel_format as p;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.map_surface(6));
+        let m = state.mappings.get_mut(&6).unwrap();
+        m.has_geom = true;
+        m.width = 702;
+        m.height = 576;
+        m.format = p::MTL_FORMAT_A8_UNORM;
+        let alpha_identity = surface_identity(&state, 6, 702, 576);
+        let alpha = surface_sample_format(&state, 6);
+        state.mappings.get_mut(&6).unwrap().format = p::MTL_FORMAT_R8_UNORM;
+        assert_eq!(alpha_identity, surface_identity(&state, 6, 702, 576));
+        assert_eq!(alpha.vk, vk::Format::R8_UNORM);
+        assert_eq!(alpha.components.source, [
+            p::SwizzleSource::Zero, p::SwizzleSource::Zero,
+            p::SwizzleSource::Zero, p::SwizzleSource::R,
+        ]);
+        assert!(p::swizzle_is_identity(&surface_sample_format(&state, 6).components));
     }
 
     /// A compositor swapchain — several scanout buffers presenting at ONE

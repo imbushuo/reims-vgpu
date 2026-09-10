@@ -163,7 +163,7 @@ pub struct WritebackDebt {
     /// The payment refuses when the mapping's generation has moved since, so a
     /// surface the guest has remapped is void rather than paid into pages that
     /// now back something else. This is about the *destination*; see
-    /// [`Self::identity`] for the source, which used to be inferred from this
+    /// [`Self::target`] for the source, which used to be inferred from this
     /// and cannot be.
     pub map_generation: u32,
     /// Arm order, for choosing which debt an over-full ledger pays first.
@@ -391,24 +391,52 @@ impl PendingWritebacks {
         height: u32,
         map_generation: u32,
     ) -> Option<WritebackKey> {
+        self.arm_with(
+            mapping_id,
+            target,
+            width,
+            height,
+            map_generation,
+            |target| crate::backend::selected().abandon_resident(target),
+        )
+    }
+
+    fn arm_with(
+        &mut self,
+        mapping_id: u32,
+        target: ResidentTarget,
+        width: u32,
+        height: u32,
+        map_generation: u32,
+        abandon: impl FnOnce(&ResidentTarget),
+    ) -> Option<WritebackKey> {
         let evict = match self.debts.len() >= MAX_DEBTS && !self.debts.contains_key(&mapping_id) {
             true => self.oldest(),
             false => None,
         };
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let previous = self.debts.insert(
-            mapping_id,
-            WritebackDebt {
-                target,
-                width,
-                height,
-                map_generation,
-                seq,
-            },
-        );
-        if previous.is_some() {
-            crate::runtime::drain::note_store_route("wbdebt_superseded");
+        let debt = WritebackDebt {
+            target,
+            width,
+            height,
+            map_generation,
+            seq,
+        };
+        match self.debts.entry(mapping_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(debt);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                // A Store into the same image renews its sole-copy claim. Only
+                // a different image becomes an orphan when its debt is replaced.
+                if entry.get().target != debt.target {
+                    abandon(&entry.get().target);
+                    crate::runtime::drain::note_store_route("wbdebt_abandoned_replaced");
+                }
+                entry.insert(debt);
+                crate::runtime::drain::note_store_route("wbdebt_superseded");
+            }
         }
         crate::runtime::drain::note_store_route("wbdebt_armed");
         evict
@@ -1634,11 +1662,9 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
 
 /// Run the Store the debt stands for, now.
 ///
-/// Everything the copy needs is resolved here and not at the arm — the identity
-/// from the mapping's *current* generation, the page walk inside
-/// `store_render_frame`. Two answers other than writing, and both release the
-/// resident's `gpu_only_content` where they can, because that flag is what keeps
-/// the reclaim off an image holding pixels nothing else has:
+/// The destination is resolved now, but the source is the exact resident the
+/// debt captured. Both answers other than writing release that resident's
+/// `gpu_only_content`, because the debt no longer owes its pixels:
 ///
 /// * **The guest superseded the frame.** `clear_host_valid` after the arm means
 ///   the guest wrote these pages itself, and landing an older frame on top of
@@ -1646,13 +1672,9 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
 ///   fourth. [`crate::runtime::resource_validity::licence_of`] is the existing
 ///   happens-before and it is read rather than re-derived.
 /// * **The mapping's generation moved.** The guest remapped the surface, so the
-///   identity this debt was armed under names a resident that is now an orphan,
-///   and the pages it would be written into belong to something else. There is
-///   no way to name that orphan from here — the current generation resolves to a
-///   different identity — so its `gpu_only_content` outlives it and one image
-///   leaks per occurrence. `wbdebt_generation_moved` is how a boot says how many;
-///   a reading above single digits is the signal to carry the arm's whole
-///   identity rather than the four integers that re-derive it.
+///   identity this debt was armed under names an orphan, and the destination
+///   pages belong to something else. Release the captured source without writing
+///   into the replacement mapping. A deleted mapping has the same disposition.
 fn pay<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1660,34 +1682,56 @@ fn pay<M: HostMemory + HostOps>(
     debt: WritebackDebt,
     route: &'static str,
 ) {
+    let rail = crate::backend::selected();
+    pay_with(
+        state,
+        host,
+        mapping_id,
+        debt,
+        route,
+        |target| rail.abandon_resident(target),
+        |state, host, debt| {
+            rail.pay_surface_writeback(
+                state,
+                host,
+                mapping_id,
+                &debt.target,
+                debt.width,
+                debt.height,
+            )
+        },
+    );
+}
+
+fn pay_with<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    debt: WritebackDebt,
+    route: &'static str,
+    abandon: impl FnOnce(&ResidentTarget),
+    store: impl FnOnce(&mut DeviceState, &mut M, &WritebackDebt) -> bool,
+) {
     let Some(entry) = state.mappings.get(&mapping_id) else {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
+        abandon(&debt.target);
         return;
     };
     let (map_generation, validity) = (entry.map_generation, entry.validity);
     if map_generation != debt.map_generation {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
+        abandon(&debt.target);
         return;
     }
-    // The resident the draw registered, not the one a fresh derivation would
-    // name today. See `WritebackDebt::target`.
-    let rail = crate::backend::selected();
     if crate::runtime::resource_validity::licence_of(validity)
         == crate::runtime::resource_validity::WritebackLicence::Superseded
     {
         crate::runtime::drain::note_store_route("wbdebt_abandoned_guest_wrote");
-        rail.abandon_resident(&debt.target);
+        abandon(&debt.target);
         return;
     }
     crate::runtime::drain::note_store_route(route);
-    if !rail.pay_surface_writeback(
-        state,
-        host,
-        mapping_id,
-        &debt.target,
-        debt.width,
-        debt.height,
-    ) {
+    if !store(state, host, &debt) {
         // The rail reports its own loss on the failure channel; this names the
         // rail that owed it, because a debt paid late and refused is a different
         // investigation from a Store refused where it was issued.
@@ -1969,6 +2013,104 @@ mod tests {
         let debt = pending.take(7).expect("mapping 7 owes a frame");
         assert_eq!(debt.seq, 1, "the later Store is the one owed");
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn replacing_surface_debt_releases_only_a_different_resident() {
+        let mut pending = PendingWritebacks::default();
+        let first = ident(7, 1920, 1080, 3);
+        let second = ident(7, 1920, 1080, 4);
+        let mut abandoned = Vec::new();
+        for target in [&first, &first, &second, &second] {
+            assert_eq!(
+                pending.arm_with(7, target.clone(), 1920, 1080, 9, |old| {
+                    abandoned.push(old.clone());
+                }),
+                None,
+            );
+        }
+        assert_eq!(abandoned, vec![first]);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.take(7).unwrap().target, second);
+    }
+
+    #[test]
+    fn surface_debt_invalid_destinations_release_exact_resident_without_writing() {
+        use crate::model::{DeviceId, MappingEntry, PAGE_SHIFT_ARM64E};
+        use crate::runtime::host::FakeHost;
+
+        for (generation, guest_wrote) in [(None, false), (Some(10), false), (Some(9), true)] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let mut host = FakeHost::new();
+            if let Some(map_generation) = generation {
+                let mut entry = MappingEntry {
+                    map_generation,
+                    ..Default::default()
+                };
+                if guest_wrote {
+                    entry.validity.host_published_seq = 1;
+                    entry.validity.host_cleared_seq = 2;
+                }
+                state.mappings.insert(7, entry);
+            }
+            let target = ident(7, 1920, 1080, 8);
+            let debt = WritebackDebt {
+                target: target.clone(),
+                width: 1920,
+                height: 1080,
+                map_generation: 9,
+                seq: 0,
+            };
+            let mut abandoned = Vec::new();
+            pay_with(
+                &mut state,
+                &mut host,
+                7,
+                debt,
+                "wbdebt_paid_named",
+                |old| abandoned.push(old.clone()),
+                |_, _, _| panic!("an invalid destination must not receive the old frame"),
+            );
+            assert_eq!(abandoned, vec![target]);
+        }
+    }
+
+    #[test]
+    fn surface_debt_current_destination_pays_without_abandoning_resident() {
+        use crate::model::{DeviceId, MappingEntry, PAGE_SHIFT_ARM64E};
+        use crate::runtime::host::FakeHost;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        state.mappings.insert(
+            7,
+            MappingEntry {
+                map_generation: 9,
+                ..Default::default()
+            },
+        );
+        let target = ident(7, 1920, 1080, 8);
+        let debt = WritebackDebt {
+            target: target.clone(),
+            width: 1920,
+            height: 1080,
+            map_generation: 9,
+            seq: 0,
+        };
+        let mut paid = Vec::new();
+        pay_with(
+            &mut state,
+            &mut host,
+            7,
+            debt,
+            "wbdebt_paid_named",
+            |_| panic!("a current frame must remain owned until its copy completes"),
+            |_, _, debt| {
+                paid.push(debt.target.clone());
+                true
+            },
+        );
+        assert_eq!(paid, vec![target]);
     }
 
     /// Geometry travels with the debt, because the payment writes at the

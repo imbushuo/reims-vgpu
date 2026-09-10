@@ -710,6 +710,7 @@ impl ResourcePools {
                         cmd_buf,
                         fence,
                         pending: None,
+                        host_submission: SubmissionReceipt::completed(),
                         span: super::gpu_span::SlotSpan::Idle,
                         readback_span_armed: false,
                     });
@@ -1479,8 +1480,10 @@ impl ResourcePools {
             ));
         }
         let fence = self.slots[index].fence;
-        ctx.device
-            .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
+        self.slots[index]
+            .host_submission
+            .wait(FENCE_TIMEOUT_NS)
+            .and_then(|timeout| ctx.device.wait_for_fences(&[fence], true, timeout))
             .map_err(|e| {
                 // The wait that every macos-11 freeze lands in. Until now the
                 // failure said only that *a* wait timed out; this names the
@@ -1512,6 +1515,7 @@ impl ResourcePools {
         // queries are readable exactly now and never before.
         unsafe { self.readback_span_read(ctx, index) };
         let pending = self.slots[index].pending.take().expect("checked above");
+        self.slots[index].host_submission = SubmissionReceipt::completed();
         self.in_flight = self.in_flight.saturating_sub(1);
         // Its fence has signalled, so this submission is no longer a candidate
         // for a wedge. Paired with the `note_submit` in `finish_entry_async`.
@@ -1536,9 +1540,9 @@ impl ResourcePools {
             if self.slots[index].pending.is_none() {
                 continue;
             }
-            let signaled = ctx
-                .device
-                .get_fence_status(self.slots[index].fence)
+            let signaled = self.slots[index]
+                .host_submission
+                .poll(|| ctx.device.get_fence_status(self.slots[index].fence))
                 .map_err(|e| Self::wait_error(counters, e, status_op))?;
             if !signaled {
                 break;
@@ -1607,9 +1611,9 @@ impl ResourcePools {
             // Count as a "block" only when the fence is genuinely unsignaled
             // (the GPU still owns the slot); reclaiming a finished slot on
             // advance is bookkeeping, not a stall.
-            let still_running = !ctx
-                .device
-                .get_fence_status(self.slots[next].fence)
+            let still_running = !self.slots[next]
+                .host_submission
+                .poll(|| ctx.device.get_fence_status(self.slots[next].fence))
                 .map_err(|e| {
                     Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
                 })?;
@@ -1693,8 +1697,23 @@ impl ResourcePools {
     ///
     /// # Safety
     ///
-    /// `device` must be the device every parked handle belongs to.
+    /// `device` must be the device every parked handle belongs to, and the host
+    /// submit call must have returned. A queued host call uses
+    /// `finish_entry_after_handoff` with its own completion receipt.
     pub(crate) unsafe fn finish_entry_async(&mut self, device: &ash::Device, sealed: SealedEntry) {
+        self.finish_entry_after_handoff(
+            device,
+            sealed,
+            SubmissionReceipt::completed(),
+        );
+    }
+
+    unsafe fn finish_entry_after_handoff(
+        &mut self,
+        device: &ash::Device,
+        sealed: SealedEntry,
+        host_submission: SubmissionReceipt,
+    ) {
         let SealedEntry {
             cleanup,
             admissions,
@@ -1703,6 +1722,7 @@ impl ResourcePools {
             self.slots[self.cur].pending.is_none(),
             "current slot already owes cleanup"
         );
+        self.slots[self.cur].host_submission = host_submission;
         self.slots[self.cur].pending = Some(cleanup);
         self.in_flight += 1;
         // The submission is now outstanding, and this is the one point both
@@ -2087,7 +2107,7 @@ impl ResourcePools {
             close_started.elapsed().as_micros() as u64,
             Ordering::Relaxed,
         );
-        let submit = (|| -> Result<(), DrawError> {
+        let submit = (|| -> Result<SubmissionReceipt, DrawError> {
             let end_started = std::time::Instant::now();
             let end_result = ctx.device.end_command_buffer(batch.cb);
             counters
@@ -2102,7 +2122,7 @@ impl ResourcePools {
                 Ordering::Relaxed,
             );
             match result {
-                Ok(()) => Ok(()),
+                Ok(receipt) => Ok(receipt),
                 Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
                     Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
                         op: DeviceLostOp::PoolsSubmitBatch,
@@ -2113,10 +2133,10 @@ impl ResourcePools {
             }
         })();
         match submit {
-            Ok(()) => {
+            Ok(receipt) => {
                 let finish_started = std::time::Instant::now();
                 let sealed = self.seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
-                self.finish_entry_async(&ctx.device, sealed);
+                self.finish_entry_after_handoff(&ctx.device, sealed, receipt);
                 counters.batch_flush_finish_us.fetch_add(
                     finish_started.elapsed().as_micros() as u64,
                     Ordering::Relaxed,
@@ -2165,8 +2185,15 @@ impl ResourcePools {
                 DeviceLostOp::PoolsWaitFencesEntry,
             ));
         }
+        let timeout = self
+            .slots
+            .iter()
+            .find(|slot| slot.fence == fence)
+            .map(|slot| slot.host_submission.wait(FENCE_TIMEOUT_NS))
+            .unwrap_or(Ok(FENCE_TIMEOUT_NS))
+            .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))?;
         ctx.device
-            .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
+            .wait_for_fences(&[fence], true, timeout)
             .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))
     }
 
@@ -4089,6 +4116,9 @@ impl ResourcePools {
             backing,
             owner_id: owner.id(),
         };
+        let components = super::view_contract::sampled_components(
+            key.image.format, &key.image.swizzle, ctx.features.image_view_format_swizzle,
+        )?;
         if let Some(slot) = self.guest_sampled.get_mut(&key) {
             return Ok(Some(GuestSampledUse {
                 key,
@@ -4138,7 +4168,7 @@ impl ResourcePools {
                     .image(imported.image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(key.image.format)
-                    .components(translate::pixel::vk_component_mapping(&key.image.swizzle))
+                    .components(components)
                     .subresource_range(super::super::color_subresource_range()),
                 None,
             )
@@ -4208,6 +4238,9 @@ impl ResourcePools {
             format,
             swizzle,
         } = sk;
+        let components = super::view_contract::sampled_components(
+            format, &swizzle, ctx.features.image_view_format_swizzle,
+        )?;
         // A hit reuses a recycled slot — no vkAllocateMemory this acquire. A miss
         // is counted here, at the empty free list, rather than after the create
         // succeeds: the census question is whether the pool had one, not whether
@@ -4286,7 +4319,7 @@ impl ResourcePools {
                 // sampled rail admits only formats whose Metal channels sit
                 // identically on their Vulkan ones, and declines the rest by
                 // name rather than binding a plan it cannot carry.
-                .components(translate::pixel::vk_component_mapping(&swizzle))
+                .components(components)
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
@@ -6240,6 +6273,7 @@ mod recycle_tests {
         CmdSlot {
             cmd_buf: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            host_submission: SubmissionReceipt::completed(),
             pending: Some(PendingGpuCleanup {
                 dsets: Vec::new(),
                 scatter_dsets: Vec::new(),
@@ -6262,9 +6296,27 @@ mod recycle_tests {
             cmd_buf: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             pending: None,
+            host_submission: SubmissionReceipt::completed(),
             span: super::gpu_span::SlotSpan::Idle,
             readback_span_armed: false,
         }
+    }
+
+    #[test]
+    fn an_async_ring_slot_cannot_poll_or_retire_before_host_submission_returns() {
+        let mut slot = pending_slot();
+        let (receipt, complete) = SubmissionReceipt::pending_for_test();
+        slot.host_submission = receipt;
+        assert_eq!(
+            slot.host_submission.poll(|| panic!("vkQueueSubmit still owns this fence")),
+            Ok(false),
+        );
+        assert_eq!(slot.host_submission.wait(0), Err(vk::Result::TIMEOUT));
+        assert!(slot.pending.is_some(), "cleanup remains owned while the host call runs");
+        complete(Ok(()));
+        assert_eq!(slot.host_submission.wait(0), Ok(0));
+        assert_eq!(slot.host_submission.poll(|| Ok(false)), Ok(false));
+        assert!(slot.pending.is_some(), "host submission alone is not GPU completion");
     }
 
     /// The completion stamp pays for the guest-read rail exactly when the rail

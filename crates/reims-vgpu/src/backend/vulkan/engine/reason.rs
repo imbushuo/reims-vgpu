@@ -264,6 +264,21 @@ pub enum DrawReason {
     StorageImageNeedsComponentMapping {
         format: crate::backend::vulkan::engine::types::StorageImageFormat,
     },
+    ResidentViewFormatIncompatible {
+        allocation: ash::vk::Format,
+        requested: ash::vk::Format,
+    },
+    ResidentViewFormatReinterpretationUnsupported {
+        allocation: ash::vk::Format,
+        requested: ash::vk::Format,
+    },
+    ResidentViewFormatUnknown {
+        allocation: ash::vk::Format,
+        requested: ash::vk::Format,
+    },
+    ImageViewSwizzleUnsupported {
+        format: ash::vk::Format,
+    },
     /// No device-local memory type for a shared optimal-image slab.
     NoDeviceLocalMemoryForSlab {
         memory_type_bits: u32,
@@ -393,6 +408,11 @@ impl crate::observe::Decline for DrawReason {
             Self::StorageImageNeedsComponentMapping { .. } => {
                 "storage_image_needs_component_mapping"
             }
+            Self::ResidentViewFormatIncompatible { .. } => "resident_view_format_incompatible",
+            Self::ResidentViewFormatReinterpretationUnsupported { .. } =>
+                "resident_view_format_reinterpretation_unsupported",
+            Self::ResidentViewFormatUnknown { .. } => "resident_view_format_unknown",
+            Self::ImageViewSwizzleUnsupported { .. } => "image_view_swizzle_unsupported",
             Self::NoDeviceLocalMemoryForSlab { .. } => "no_device_local_memory_for_slab",
             Self::NoDeviceLocalMemoryForMrtSecondary { .. } => {
                 "no_device_local_memory_for_mrt_secondary"
@@ -432,6 +452,12 @@ impl std::fmt::Display for DrawReason {
             Self::PassLocalFormatUnsupported { format, blend } => {
                 write!(f, " format={format:?} blend={blend}")
             }
+            Self::ResidentViewFormatIncompatible { allocation, requested }
+            | Self::ResidentViewFormatReinterpretationUnsupported { allocation, requested }
+            | Self::ResidentViewFormatUnknown { allocation, requested } => {
+                write!(f, " allocation={allocation:?} requested={requested:?}")
+            }
+            Self::ImageViewSwizzleUnsupported { format } => write!(f, " format={format:?}"),
             Self::ResidentSampledNot2d { binding } | Self::GuestRunSampledNot2d { binding } => {
                 write!(f, " binding={binding}")
             }

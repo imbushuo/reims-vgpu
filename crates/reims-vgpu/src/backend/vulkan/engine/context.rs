@@ -813,6 +813,16 @@ pub(crate) enum PresentSubmission {
     Pending(super::queue_owner::PendingPresent),
 }
 
+#[cfg(feature = "host-window")]
+impl PresentSubmission {
+    pub(crate) fn host_submission(&self) -> super::queue_owner::SubmissionReceipt {
+        match self {
+            Self::Complete(_) => super::queue_owner::SubmissionReceipt::completed(),
+            Self::Pending(pending) => pending.host_submission(),
+        }
+    }
+}
+
 /// The two host queue operations that make one display transaction.
 ///
 /// Keeping the submission and presentation operands in one value prevents a
@@ -1198,6 +1208,7 @@ impl DeviceContext {
                 .vertex_attribute_instance_rate_divisor(vertex_divisor.instance_rate_divisor)
                 .vertex_attribute_instance_rate_zero_divisor(vertex_divisor.zero_divisor);
         let mut enabled_vulkan12 = features.enabled_vulkan12();
+        let mut enabled_portability = features.enabled_portability_subset();
         // Any extension the feature set itself requires — today only the
         // pre-1.2 spelling of mirror-clamp-to-edge, on a device that has the
         // extension but not the core feature.
@@ -1230,6 +1241,9 @@ impl DeviceContext {
             .enabled_features(&enabled)
             .enabled_extension_names(&enabled_device_extensions)
             .push_next(&mut enabled_vulkan12);
+        if portability_subset {
+            dci = dci.push_next(&mut enabled_portability);
+        }
         if vertex_attribute_divisor {
             dci = dci.push_next(&mut enabled_divisor_features);
         }
@@ -1716,13 +1730,14 @@ impl DeviceContext {
         &self,
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
-    ) -> Result<(), vk::Result> {
+    ) -> Result<super::queue_owner::SubmissionReceipt, vk::Result> {
         let timeline = self
             .stamp_completion
             .as_ref()
             .map(|completion| completion.reserve_submission());
         let Some(owner) = self.queue_owner.as_ref() else {
-            return unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) };
+            unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) }?;
+            return Ok(super::queue_owner::SubmissionReceipt::completed());
         };
         owner.submit_async(command_buffers, fence, timeline)
     }

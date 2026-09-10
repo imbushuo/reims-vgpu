@@ -4,11 +4,13 @@
 
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use ash::vk;
+use super::super::queue_owner::SubmissionReceipt;
 
 #[derive(Debug)]
 struct Completion {
     fence: vk::Fence,
     done: AtomicBool,
+    host_submission: SubmissionReceipt,
 }
 
 #[derive(Debug)]
@@ -17,6 +19,17 @@ pub(super) struct WindowWork(Arc<Completion>);
 impl WindowWork {
     pub(super) fn complete(&self) {
         self.0.done.store(true, Ordering::Release);
+    }
+
+    pub(super) fn poll(
+        &self,
+        query: impl FnOnce() -> Result<bool, vk::Result>,
+    ) -> Result<bool, vk::Result> {
+        self.0.host_submission.poll(query)
+    }
+
+    pub(super) fn wait_submission(&self) -> Result<(), vk::Result> {
+        self.0.host_submission.wait(u64::MAX).map(|_| ())
     }
 }
 
@@ -38,9 +51,9 @@ impl Registry {
         self.pending.retain(|work| !work.done.load(Ordering::Acquire));
     }
 
-    fn begin(&mut self, fence: vk::Fence) -> WindowWork {
+    fn begin(&mut self, fence: vk::Fence, host_submission: SubmissionReceipt) -> WindowWork {
         self.prune();
-        let work = Arc::new(Completion { fence, done: AtomicBool::new(false) });
+        let work = Arc::new(Completion { fence, done: AtomicBool::new(false), host_submission });
         self.pending.push(Arc::clone(&work));
         WindowWork(work)
     }
@@ -50,11 +63,14 @@ impl Registry {
         WindowRetirement(self.pending.clone())
     }
 
-    fn poll<E>(&mut self, mut ready: impl FnMut(vk::Fence) -> Result<bool, E>) -> Result<usize, E> {
+    fn poll(
+        &mut self,
+        mut ready: impl FnMut(vk::Fence) -> Result<bool, vk::Result>,
+    ) -> Result<usize, vk::Result> {
         self.prune();
         let mut retired = 0;
         for work in &self.pending {
-            if ready(work.fence)? {
+            if work.host_submission.poll(|| ready(work.fence))? {
                 work.done.store(true, Ordering::Release);
                 retired += 1;
             }
@@ -66,8 +82,8 @@ impl Registry {
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry { pending: Vec::new() });
 
-pub(super) fn begin(fence: vk::Fence) -> WindowWork {
-    REGISTRY.lock().unwrap_or_else(|error| error.into_inner()).begin(fence)
+pub(super) fn begin(fence: vk::Fence, host_submission: SubmissionReceipt) -> WindowWork {
+    REGISTRY.lock().unwrap_or_else(|error| error.into_inner()).begin(fence, host_submission)
 }
 
 pub(super) fn snapshot() -> WindowRetirement {
@@ -81,6 +97,7 @@ pub(super) fn in_flight() -> bool {
 }
 
 /// Caller holds ENGINE, which also serializes window fence reset/destruction.
+/// Each receipt additionally excludes the queue worker's unfinished host call.
 /// Polling here avoids depending on another redraw to discover GPU completion.
 pub(super) unsafe fn poll(device: &ash::Device) -> Result<usize, vk::Result> {
     REGISTRY.lock().unwrap_or_else(|error| error.into_inner())
@@ -94,9 +111,9 @@ mod tests {
     #[test]
     fn later_presents_cannot_extend_a_retirement_snapshot() {
         let mut registry = Registry { pending: Vec::new() };
-        let old = registry.begin(vk::Fence::null());
+        let old = registry.begin(vk::Fence::null(), SubmissionReceipt::completed());
         let retired = registry.snapshot();
-        let newer = registry.begin(vk::Fence::null());
+        let newer = registry.begin(vk::Fence::null(), SubmissionReceipt::completed());
         assert!(!retired.is_complete());
         old.complete();
         assert!(retired.is_complete());
@@ -108,8 +125,8 @@ mod tests {
     #[test]
     fn every_captured_present_must_complete_even_out_of_order() {
         let mut registry = Registry { pending: Vec::new() };
-        let first = registry.begin(vk::Fence::null());
-        let second = registry.begin(vk::Fence::null());
+        let first = registry.begin(vk::Fence::null(), SubmissionReceipt::completed());
+        let second = registry.begin(vk::Fence::null(), SubmissionReceipt::completed());
         let retired = registry.snapshot();
         second.complete();
         assert!(!retired.is_complete());
@@ -122,7 +139,7 @@ mod tests {
     fn an_empty_snapshot_never_acquires_future_dependencies() {
         let mut registry = Registry { pending: Vec::new() };
         let empty = registry.snapshot();
-        let later = registry.begin(vk::Fence::null());
+        let later = registry.begin(vk::Fence::null(), SubmissionReceipt::completed());
         assert!(empty.is_complete());
         assert!(!registry.snapshot().is_complete());
         later.complete();
@@ -131,14 +148,15 @@ mod tests {
     #[test]
     fn completed_fences_retire_without_another_window_redraw() {
         let mut registry = Registry { pending: Vec::new() };
-        let _frame_still_holds_its_claim = registry.begin(vk::Fence::null());
+        let _frame_still_holds_its_claim =
+            registry.begin(vk::Fence::null(), SubmissionReceipt::completed());
         let retired = registry.snapshot();
-        assert_eq!(registry.poll::<()>(|_| Ok(false)), Ok(0));
+        assert_eq!(registry.poll(|_| Ok(false)), Ok(0));
         assert!(!retired.is_complete());
-        assert_eq!(registry.poll::<()>(|_| Ok(true)), Ok(1));
+        assert_eq!(registry.poll(|_| Ok(true)), Ok(1));
         assert!(retired.is_complete());
         // Reusing the frame's fence creates a new completion, not an ABA alias.
-        let later = registry.begin(vk::Fence::null());
+        let later = registry.begin(vk::Fence::null(), SubmissionReceipt::completed());
         assert!(retired.is_complete());
         assert!(!registry.snapshot().is_complete());
         later.complete();
@@ -147,9 +165,49 @@ mod tests {
     #[test]
     fn a_failed_fence_query_does_not_release_unfinished_work() {
         let mut registry = Registry { pending: Vec::new() };
-        let work = registry.begin(vk::Fence::null());
+        let work = registry.begin(vk::Fence::null(), SubmissionReceipt::completed());
         let retired = registry.snapshot();
-        assert_eq!(registry.poll(|_| Err("device lost")), Err("device lost"));
+        assert_eq!(
+            registry.poll(|_| Err(vk::Result::ERROR_DEVICE_LOST)),
+            Err(vk::Result::ERROR_DEVICE_LOST),
+        );
+        assert!(!retired.is_complete());
+        work.complete();
+    }
+
+    #[test]
+    fn window_retirement_cannot_poll_a_queued_or_still_submitting_fence() {
+        let mut registry = Registry { pending: Vec::new() };
+        let (receipt, returned) = SubmissionReceipt::pending_for_test();
+        let work = registry.begin(vk::Fence::null(), receipt);
+        let retired = registry.snapshot();
+        assert_eq!(registry.poll(|_| panic!("worker still owns the host fence")), Ok(0));
+        assert_eq!(work.poll(|| panic!("present must use the same host gate")), Ok(false));
+        assert!(!retired.is_complete());
+        returned(Ok(()));
+        assert_eq!(registry.poll(|_| Ok(false)), Ok(0));
+        assert!(!retired.is_complete(), "host return is not GPU completion");
+        assert_eq!(registry.poll(|_| Ok(true)), Ok(1));
+        assert!(retired.is_complete());
+        let (later_receipt, later_returned) = SubmissionReceipt::pending_for_test();
+        let _later = registry.begin(vk::Fence::null(), later_receipt);
+        assert!(retired.is_complete(), "fence reuse cannot reopen the old snapshot");
+        assert_eq!(registry.poll(|_| panic!("reused fence is submitting again")), Ok(0));
+        later_returned(Ok(()));
+        assert_eq!(registry.poll(|_| Ok(true)), Ok(1));
+    }
+
+    #[test]
+    fn a_failed_present_submit_cannot_release_its_retirement_snapshot() {
+        let mut registry = Registry { pending: Vec::new() };
+        let (receipt, returned) = SubmissionReceipt::pending_for_test();
+        let work = registry.begin(vk::Fence::null(), receipt);
+        let retired = registry.snapshot();
+        returned(Err(vk::Result::ERROR_DEVICE_LOST));
+        assert_eq!(
+            registry.poll(|_| panic!("failed submission must not query its fence")),
+            Err(vk::Result::ERROR_DEVICE_LOST),
+        );
         assert!(!retired.is_complete());
         work.complete();
     }

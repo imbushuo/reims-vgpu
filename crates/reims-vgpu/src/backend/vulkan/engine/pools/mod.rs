@@ -19,6 +19,7 @@ use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
 use super::{buffer_slab, color_subresource_range, gpu_span, host_ram, reason, slab, types};
+use super::queue_owner::SubmissionReceipt;
 use crate::backend::vulkan::caps::{MappedMemoryKind, MemoryClass};
 use crate::backend::vulkan::translate;
 use crate::model::ComputeStorageResidencyKey;
@@ -1205,6 +1206,7 @@ struct CmdSlot {
     cmd_buf: vk::CommandBuffer,
     fence: vk::Fence,
     pending: Option<PendingGpuCleanup>,
+    host_submission: SubmissionReceipt,
     /// Whether this slot's GPU timestamp pair has been written, and how far.
     /// Read and cleared when the slot retires, which is the first moment the
     /// fence makes the queries readable. See [`super::gpu_span`].
@@ -3685,6 +3687,7 @@ impl Drop for SlowStagingWrite {
 
 pub mod buffer_gather_working_set;
 mod images_and_registry;
+mod view_contract;
 pub mod sampled_working_set;
 mod submission_and_buffers;
 /// The lease's own extent travels with its pointer; see [`ReadbackLease`].

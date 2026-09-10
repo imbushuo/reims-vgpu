@@ -136,6 +136,19 @@ impl ResourcePools {
         key: StorageImageKey,
         counters: &EngineCounters,
     ) -> Result<StorageImageSlot, DrawError> {
+        let plan = translate::pixel::storage_image_components(key.format);
+        let components = if key.sampled_only {
+            super::view_contract::sampled_components(
+                key.format.vk_format(), &plan, ctx.features.image_view_format_swizzle,
+            )?
+        } else {
+            if !plan.is_identity() {
+                return Err(DrawError::Unsupported(
+                    reason::DrawReason::StorageImageNeedsComponentMapping { format: key.format },
+                ));
+            }
+            translate::pixel::vk_component_mapping(&plan)
+        };
         if let Some(slot) = self.storage_image_free.take(&key) {
             self.storage_image_live.push(StorageImageSlot {
                 image: slot.image,
@@ -229,25 +242,6 @@ impl ResourcePools {
                 ctx.device.destroy_image(image, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindStorageImage, e))
             })?;
-        // A guest format whose channels do not sit identically on its Vulkan
-        // format samples through a component mapping instead of being rewritten
-        // on the CPU. Only a *sampled* view may carry one: Vulkan requires the
-        // identity mapping on a storage-image view, and no format admitted to
-        // that role has a non-identity plan, so a storage key that somehow named
-        // one is a contradiction and is refused rather than built.
-        let plan = translate::pixel::storage_image_components(key.format);
-        let components = if key.sampled_only {
-            translate::pixel::vk_component_mapping(&plan)
-        } else {
-            if !crate::protocol::pixel_format::swizzle_is_identity(&plan) {
-                ctx.device.free_memory(memory, None);
-                ctx.device.destroy_image(image, None);
-                return Err(DrawError::Unsupported(
-                    reason::DrawReason::StorageImageNeedsComponentMapping { format: key.format },
-                ));
-            }
-            translate::pixel::vk_component_mapping(&plan)
-        };
         let view = ctx
             .device
             .create_image_view(
@@ -888,6 +882,28 @@ impl ResourcePools {
         if slot.format.allocation() == format {
             return Ok(Some(slot.view));
         }
+        let plan = super::view_contract::registry_view_plan(
+            slot.format.allocation(), format, ctx.features.image_view_format_reinterpretation,
+        )
+            .map_err(|reason| {
+                crate::observe::Emit::decline("vk_resident_view", &reason)
+                    .field("identity", format!("{identity:?}").replace(' ', ""))
+                    .field("allocation", format!("{:?}", slot.format.allocation()))
+                    .field("requested", format!("{format:?}"))
+                    .field("image", format!("{:?}", slot.image))
+                    .field("base_view", format!("{:?}", slot.view))
+                    .field("extent", format!("{}x{}", slot.width, slot.height))
+                    .field("view_type", "TYPE_2D")
+                    .field("mips", "0+1")
+                    .field("layers", "0+1")
+                    .field("samples", slot.sample_count)
+                    .field("guest_imported", slot.memory.is_guest_imported())
+                    .field("ready", slot.content_ready)
+                    .field("pins", slot.pin_count)
+                    .field("released", slot.resource_released)
+                    .fail();
+                DrawError::Unsupported(reason)
+            })?;
         if let Some((_, view)) = slot
             .alternate_views
             .iter()
@@ -897,11 +913,7 @@ impl ResourcePools {
         }
         let view = unsafe {
             ctx.device.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(slot.image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
-                    .subresource_range(super::super::registry_subresource_range(format)),
+                &plan.create_info(slot.image),
                 None,
             )
         }

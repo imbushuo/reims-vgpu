@@ -13,6 +13,10 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use super::stamp_completion::SubmissionNote;
 
+mod submission;
+pub(crate) use submission::SubmissionReceipt;
+use submission::SubmissionCompletion;
+
 type Reply = mpsc::SyncSender<Result<QueueOutcome, vk::Result>>;
 type PresentReply = mpsc::SyncSender<Result<bool, vk::Result>>;
 
@@ -29,6 +33,7 @@ struct OwnedSubmit {
     fence: vk::Fence,
     timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
     async_queued_at: Option<std::time::Instant>,
+    host_completion: Option<SubmissionCompletion>,
 }
 
 /// Completion of one ordered submit-plus-present transaction.
@@ -39,9 +44,14 @@ struct OwnedSubmit {
 /// completing the host driver calls are two different events.
 pub(crate) struct PendingPresent {
     receiver: mpsc::Receiver<Result<bool, vk::Result>>,
+    host_submission: SubmissionReceipt,
 }
 
 impl PendingPresent {
+    pub(crate) fn host_submission(&self) -> SubmissionReceipt {
+        self.host_submission.clone()
+    }
+
     pub(crate) fn wait(self) -> Result<bool, vk::Result> {
         self.receiver
             .recv()
@@ -180,6 +190,7 @@ impl QueueOwner {
             fence,
             timeline,
             async_queued_at: None,
+            host_completion: None,
         };
         self.send_sync(|reply| Request::Submit {
             submit,
@@ -193,13 +204,14 @@ impl QueueOwner {
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
         timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
-    ) -> Result<(), vk::Result> {
+    ) -> Result<SubmissionReceipt, vk::Result> {
         if let Some(result) = self.failure.get() {
             return Err(result);
         }
         let queued_point = timeline
             .as_ref()
             .map(|(_, value, note)| (*value, note.clone()));
+        let (receipt, completion) = SubmissionReceipt::pending();
         self.sender
             .send(Request::Submit {
                 submit: OwnedSubmit {
@@ -210,6 +222,7 @@ impl QueueOwner {
                     fence,
                     timeline,
                     async_queued_at: Some(std::time::Instant::now()),
+                    host_completion: Some(completion),
                 },
                 reply: None,
             })
@@ -217,7 +230,7 @@ impl QueueOwner {
         if let Some((value, note)) = queued_point {
             note.queued(value);
         }
-        Ok(())
+        Ok(receipt)
     }
 
     pub(crate) fn submit_sync_ordered(
@@ -236,6 +249,7 @@ impl QueueOwner {
             fence,
             timeline: None,
             async_queued_at: None,
+            host_completion: None,
         };
         self.send_sync(|reply| Request::Submit {
             submit,
@@ -259,6 +273,7 @@ impl QueueOwner {
         if let Some(result) = self.failure.get() {
             return Err(result);
         }
+        let (host_submission, completion) = SubmissionReceipt::pending();
         let submit = OwnedSubmit {
             command_buffers: transaction.command_buffers.to_vec(),
             wait_semaphores: transaction.wait_semaphores.to_vec(),
@@ -267,6 +282,7 @@ impl QueueOwner {
             fence: transaction.fence,
             timeline: None,
             async_queued_at: None,
+            host_completion: Some(completion),
         };
         let (reply, receiver) = mpsc::sync_channel(1);
         self.sender
@@ -280,7 +296,7 @@ impl QueueOwner {
                 reply,
             })
             .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
-        Ok(PendingPresent { receiver })
+        Ok(PendingPresent { receiver, host_submission })
     }
 
     pub(crate) fn wait_idle(&self) -> Result<(), vk::Result> {
@@ -341,9 +357,11 @@ fn run(
             Request::Submit { submit, reply } => {
                 let async_queued_at = submit.async_queued_at;
                 let driver_started = std::time::Instant::now();
-                let result = failure
-                    .get()
-                    .map_or_else(|| unsafe { execute_submit(device, queue, submit) }, Err);
+                let result = complete_host_submission(submit, |submit| {
+                    failure
+                        .get()
+                        .map_or_else(|| unsafe { execute_submit(device, queue, submit) }, Err)
+                });
                 if let Some(queued_at) = async_queued_at {
                     stats.async_submits.fetch_add(1, Ordering::Relaxed);
                     stats.async_queue_us.fetch_add(
@@ -376,7 +394,9 @@ fn run(
                 let driver_started = std::time::Instant::now();
                 let result = complete_present_transaction(
                     failure,
-                    || unsafe { execute_submit(device, queue, submit) },
+                    || complete_host_submission(submit, |submit| unsafe {
+                        execute_submit(device, queue, submit)
+                    }),
                     || {
                         let waits = [wait];
                         let swapchains = [swapchain];
@@ -421,6 +441,18 @@ fn run(
             Request::Stop => return,
         }
     }
+}
+
+fn complete_host_submission(
+    mut submit: OwnedSubmit,
+    driver: impl FnOnce(OwnedSubmit) -> Result<(), vk::Result>,
+) -> Result<(), vk::Result> {
+    let completion = submit.host_completion.take();
+    let result = driver(submit);
+    if let Some(completion) = completion {
+        completion.finish(result);
+    }
+    result
 }
 
 fn complete_present_transaction(
@@ -503,7 +535,7 @@ mod tests {
         let owner = owner_with_sender(sender);
         let probe = super::super::stamp_completion::SubmissionProbe::new();
 
-        owner
+        let receipt = owner
             .submit_async(
                 &[vk::CommandBuffer::from_raw(1)],
                 vk::Fence::from_raw(2),
@@ -511,6 +543,7 @@ mod tests {
             )
             .expect("owner accepted submission");
 
+        assert_eq!(receipt.poll(|| panic!("submission is only enqueued")), Ok(false));
         assert_eq!(probe.latest_queued(), Some(7));
         let request = receiver
             .try_recv()
@@ -523,6 +556,11 @@ mod tests {
             submit.timeline.as_ref().map(|(_, value, _)| *value),
             Some(7)
         );
+        complete_host_submission(submit, |_| {
+            assert_eq!(receipt.poll(|| panic!("submit call has not returned")), Ok(false));
+            Ok(())
+        }).unwrap();
+        assert_eq!(receipt.poll(|| Ok(true)), Ok(true));
     }
 
     #[test]
@@ -537,8 +575,8 @@ mod tests {
                 &[vk::CommandBuffer::from_raw(1)],
                 vk::Fence::from_raw(2),
                 Some((vk::Semaphore::from_raw(3), 7, probe.note())),
-            ),
-            Err(vk::Result::ERROR_DEVICE_LOST)
+            ).err(),
+            Some(vk::Result::ERROR_DEVICE_LOST)
         );
         assert_eq!(probe.latest_queued(), None);
     }
@@ -546,7 +584,7 @@ mod tests {
     #[test]
     fn a_pending_display_transaction_returns_its_exact_completion() {
         let (reply, receiver) = mpsc::sync_channel(1);
-        let pending = PendingPresent { receiver };
+        let pending = PendingPresent { receiver, host_submission: SubmissionReceipt::completed() };
         let sender = std::thread::spawn(move || reply.send(Ok(true)).unwrap());
 
         assert_eq!(pending.wait(), Ok(true));
@@ -557,7 +595,7 @@ mod tests {
     fn a_lost_display_transaction_owner_cannot_look_successful() {
         let (reply, receiver) = mpsc::sync_channel(1);
         drop(reply);
-        let pending = PendingPresent { receiver };
+        let pending = PendingPresent { receiver, host_submission: SubmissionReceipt::completed() };
 
         assert_eq!(pending.wait(), Err(vk::Result::ERROR_DEVICE_LOST));
     }
