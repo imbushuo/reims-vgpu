@@ -32,6 +32,9 @@ use crate::access::{requires_edge, AccessIntent, AccessKey, BackingId};
 use crate::identity::{ChannelId, IngressOrdinal};
 use std::collections::HashMap;
 
+// Batch reclamation of completed accesses, never a limit on live guest work.
+const COMPACT_MIN_RETIRED: usize = 1024;
+
 /// One live access, and the transaction that declared it.
 #[derive(Clone, Copy, Debug)]
 struct Entry {
@@ -68,13 +71,15 @@ pub struct Census {
 
 /// The live hazard state.
 ///
-/// Holds only accesses whose transactions have not retired. Retiring is the
-/// caller's obligation and is what keeps this bounded; nothing here evicts on
-/// its own, because an eviction would silently drop an edge a later
-/// transaction was owed.
+/// Retiring is the caller's obligation. Admission periodically reclaims retired
+/// entries when they occupy at least half the graph; no live access is evicted,
+/// because that would silently drop an edge a later transaction was owed.
 #[derive(Debug, Default)]
 pub struct DependencyGraph {
     entries: Vec<Entry>,
+    retired_entries: usize,
+    /// Compaction may remove even the latest admission's accesses.
+    last_ordinal: Option<IngressOrdinal>,
     by_backing: HashMap<BackingId, Vec<usize>>,
     /// Keyed by the heap, not by `HeapId`: the membership generation says
     /// which set a record was written against and never which memory exists, so
@@ -113,7 +118,7 @@ impl DependencyGraph {
     /// Live accesses, for a test or a report. Not a bound anything enforces.
     #[must_use]
     pub fn live_accesses(&self) -> usize {
-        self.entries.iter().filter(|e| e.live).count()
+        self.entries.len() - self.retired_entries
     }
 
     /// Admit one transaction's accesses and return the ordinals it must wait
@@ -136,11 +141,15 @@ impl DependencyGraph {
         accesses: &[AccessIntent],
     ) -> Vec<IngressOrdinal> {
         assert!(
-            self.entries
-                .last()
-                .is_none_or(|last| ordinal > last.ordinal),
+            self.last_ordinal.is_none_or(|last| ordinal > last),
             "transactions are admitted in ingress order; {ordinal:?} arrived after a later one"
         );
+        if self.retired_entries >= COMPACT_MIN_RETIRED
+            && self.retired_entries >= self.live_accesses()
+        {
+            self.compact();
+        }
+        self.last_ordinal = Some(ordinal);
         // Taken out so the gathering below can borrow the indexes; put back
         // before returning, so the next admission finds the capacity this one
         // grew. Both are cleared here rather than at the end, because a
@@ -260,10 +269,12 @@ impl DependencyGraph {
     /// creating edges when the work that declared it has finished, and a caller
     /// that retires early publishes a hazard it still owes.
     pub fn retire(&mut self, ordinal: IngressOrdinal) {
-        for &idx in self.by_ordinal.get(&ordinal).into_iter().flatten() {
-            self.entries[idx].live = false;
+        if let Some(indices) = self.by_ordinal.remove(&ordinal) {
+            self.retired_entries += indices.len();
+            for idx in indices {
+                self.entries[idx].live = false;
+            }
         }
-        self.by_ordinal.remove(&ordinal);
     }
 
     /// Drop retired entries and rebuild the indexes.
@@ -272,8 +283,12 @@ impl DependencyGraph {
     /// path and this is not: an index rebuild in a completion handler is work
     /// charged to the thing that finished rather than to the thing that grew.
     pub fn compact(&mut self) {
+        if self.retired_entries == 0 {
+            return;
+        }
         let live: Vec<_> = self.entries.iter().copied().filter(|e| e.live).collect();
         self.entries.clear();
+        self.retired_entries = 0;
         self.by_backing.clear();
         self.by_heap.clear();
         self.by_domain.clear();
@@ -524,6 +539,87 @@ mod tests {
             g.admit(ord(3), &[intent(k, AccessMode::Write)]),
             vec![ord(2)]
         );
+    }
+
+    #[test]
+    fn admission_reclaims_retired_history_without_evicting_live_accesses() {
+        let mut g = DependencyGraph::new();
+        let key = AccessKey::Whole(res(1));
+        g.admit(ord(0), &[intent(key, AccessMode::Read)]);
+        let rounds = COMPACT_MIN_RETIRED * 4;
+        for n in 1..=rounds {
+            let at = ord(n as u64);
+            assert_eq!(
+                g.admit(at, &[intent(key, AccessMode::Write)]),
+                vec![ord(0)],
+                "the live reader must survive every compaction"
+            );
+            g.retire(at);
+            g.retire(at);
+            assert_eq!(g.live_accesses(), 1);
+            assert_eq!(g.retired_entries, g.entries.len() - 1);
+            assert!(g.entries.len() <= COMPACT_MIN_RETIRED + 1);
+            assert_eq!(g.by_backing[&BackingId(1)].len(), g.entries.len());
+            assert_eq!(g.by_domain[&ChannelId(1)].len(), g.entries.len());
+            assert_eq!(g.by_ordinal.len(), 1);
+        }
+        assert_eq!(g.census().accesses, rounds + 1);
+        assert_eq!(g.census().by_rung, [0, rounds + 1, 0]);
+        assert_eq!(g.census().edges, rounds);
+        g.retire(ord(0));
+        g.compact();
+        assert_eq!(g.live_accesses(), 0);
+        assert_eq!(g.retired_entries, 0);
+        assert!(g.entries.is_empty());
+        assert!(g.by_backing.is_empty());
+        assert!(g.by_domain.is_empty());
+    }
+
+    #[test]
+    fn admission_batches_compaction_until_retired_entries_dominate() {
+        let mut g = DependencyGraph::new();
+        let access = intent(AccessKey::Whole(res(1)), AccessMode::Read);
+        let count = COMPACT_MIN_RETIRED * 3;
+        for n in 0..count {
+            g.admit(ord(n as u64), &[access]);
+        }
+        for n in 0..COMPACT_MIN_RETIRED {
+            g.retire(ord(n as u64));
+        }
+        g.admit(ord(count as u64), &[access]);
+        assert_eq!(g.entries.len(), count + 1);
+        assert_eq!(g.retired_entries, COMPACT_MIN_RETIRED);
+
+        for n in COMPACT_MIN_RETIRED..2 * COMPACT_MIN_RETIRED {
+            g.retire(ord(n as u64));
+        }
+        let census = g.census();
+        g.admit(ord(count as u64 + 1), &[]);
+        assert_eq!(g.entries.len(), COMPACT_MIN_RETIRED + 1);
+        assert_eq!(g.live_accesses(), COMPACT_MIN_RETIRED + 1);
+        assert_eq!(g.retired_entries, 0);
+        assert_eq!(g.census(), census);
+    }
+
+    #[test]
+    #[should_panic(expected = "transactions are admitted in ingress order")]
+    fn compaction_preserves_ingress_order_after_the_graph_empties() {
+        let mut g = DependencyGraph::new();
+        g.admit(
+            ord(5),
+            &[intent(AccessKey::Whole(res(1)), AccessMode::Read)],
+        );
+        g.retire(ord(5));
+        g.compact();
+        g.admit(ord(5), &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "transactions are admitted in ingress order")]
+    fn empty_admissions_preserve_ingress_order() {
+        let mut g = DependencyGraph::new();
+        g.admit(ord(5), &[]);
+        g.admit(ord(4), &[]);
     }
 
     /// Ordering bought with ignorance is counted apart from ordering bought

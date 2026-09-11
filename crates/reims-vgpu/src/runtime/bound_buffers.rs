@@ -97,6 +97,7 @@
 //! and reference and so are indifferent to it.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::runtime::guest_ram::GuestRun;
@@ -222,6 +223,44 @@ pub struct RegistryShape {
     pub max_offsets: u32,
 }
 
+struct RegistryCensus {
+    last_ms: AtomicU64,
+    peak_entries: AtomicU64,
+}
+
+impl RegistryCensus {
+    const fn new() -> Self {
+        Self {
+            last_ms: AtomicU64::new(0),
+            peak_entries: AtomicU64::new(0),
+        }
+    }
+
+    fn sample(
+        &self,
+        entries: usize,
+        now: u64,
+        shape: impl FnOnce() -> RegistryShape,
+    ) -> Option<(RegistryShape, u64)> {
+        let peak = self
+            .peak_entries
+            .fetch_max(entries as u64, Ordering::Relaxed)
+            .max(entries as u64);
+        let last = self.last_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 1000 {
+            return None;
+        }
+        if self
+            .last_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        Some((shape(), peak))
+    }
+}
+
 /// Report the registry's shape once per census interval, on the same one-second
 /// cadence as `store_routes` so the two line up row for row.
 ///
@@ -231,27 +270,14 @@ pub struct RegistryShape {
 /// whether the 12.8x more fresh resolutions on an importing host are churn in
 /// the retirement rules or churn in the keys.
 pub fn note_registry_levels(state: &crate::model::DeviceState) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LAST_MS: AtomicU64 = AtomicU64::new(0);
-    static PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
-
-    let shape = state.bound_buffers.shape();
-    let peak = PEAK_ENTRIES
-        .fetch_max(shape.entries as u64, Ordering::Relaxed)
-        .max(shape.entries as u64);
+    static CENSUS: RegistryCensus = RegistryCensus::new();
 
     let now = crate::observe::elapsed_ms() as u64;
-    let last = LAST_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < 1000 {
+    let Some((shape, peak)) = CENSUS.sample(state.bound_buffers.len(), now, || {
+        state.bound_buffers.shape()
+    }) else {
         return;
-    }
-    // Losing the race only costs a skipped interval, never a double line.
-    if LAST_MS
-        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
-    }
+    };
     crate::observe::off(format!(
         "bound_buffers (levels, not per-interval) entries={} peak={} pairs={} \
          multi_offset_pairs={} max_offsets={}",
@@ -446,6 +472,43 @@ impl BoundBuffers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_census_computes_shape_only_once_per_interval() {
+        let census = RegistryCensus::new();
+        let calls = std::cell::Cell::new(0);
+        let shape = RegistryShape {
+            entries: 3,
+            pairs: 2,
+            multi_offset_pairs: 1,
+            max_offsets: 2,
+        };
+        for now in 0..3000 {
+            let sample = census.sample(shape.entries, now, || {
+                calls.set(calls.get() + 1);
+                shape
+            });
+            let due = now != 0 && now % 1000 == 0;
+            assert_eq!(sample, due.then_some((shape, 3)));
+        }
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn registry_census_keeps_peaks_between_reports_without_computing_shape() {
+        let census = RegistryCensus::new();
+        assert_eq!(census.sample(20, 500, || panic!("shape is not due")), None);
+        let shape = RegistryShape {
+            entries: 2,
+            ..RegistryShape::default()
+        };
+        assert_eq!(census.sample(2, 1000, || shape), Some((shape, 20)));
+        assert_eq!(
+            census.sample(30, 1000, || panic!("this interval was already claimed")),
+            None
+        );
+        assert_eq!(census.sample(2, 2000, || shape), Some((shape, 30)));
+    }
 
     fn bound(gva: u64, span: u64) -> BoundBuffer {
         BoundBuffer {
