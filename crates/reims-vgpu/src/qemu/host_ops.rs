@@ -51,8 +51,8 @@ pub struct ReimsVgpuHostOps {
         Option<unsafe extern "C" fn(ctx: *mut c_void, gpa: u64, buf: *const u8, len: usize) -> i32>,
     /// Monotonic nanoseconds.
     pub mono_ns: Option<unsafe extern "C" fn(ctx: *mut c_void) -> u64>,
-    /// Wake QEMU main-loop BH to drain pending work / HostActions.
-    /// Safe from any thread (schedules oneshot BH).
+    /// Wake the ordered GPU drain worker. Safe from any thread.
+    /// HostAction delivery is scheduled independently by `notify_actions`.
     pub schedule_bh: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
     /// Read guest kernel VA (cpu_memory_rw_debug). Returns 0 on success.
     pub read_kva:
@@ -143,9 +143,10 @@ pub struct ReimsVgpuHostOps {
         Option<unsafe extern "C" fn(ctx: *mut c_void, out: *mut PageAliasCensus) -> i32>,
 }
 
-// SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
-// touch QEMU state under the BQL / from the AIO BH. We store the table as raw
-// pointers and never move the C context.
+// SAFETY: QEMU keeps the context valid until worker/window threads have joined.
+// GPA and notification callbacks support concurrent callers; CPU-register,
+// kernel-VA and accelerator capture remain on the originating vCPU/BQL ingress.
+// We store the table as raw pointers and never move the C context.
 unsafe impl Send for ReimsVgpuHostOps {}
 unsafe impl Sync for ReimsVgpuHostOps {}
 
@@ -502,7 +503,7 @@ impl HostOps for QemuHost<'_> {
 
     fn schedule_bh(&mut self) {
         if let Some(f) = self.ops.schedule_bh {
-            // SAFETY: QEMU owns ctx; schedules oneshot BH (apple-gfx pattern).
+            // SAFETY: QEMU owns ctx; the worker wake is thread-safe.
             unsafe { f(self.ops.ctx) }
         } else {
             QemuHostDecline::ScheduleBhCallbackMissing.emit(0);

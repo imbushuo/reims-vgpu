@@ -2588,18 +2588,40 @@ pub struct PresentState {
     pub light_captures: u64,
 }
 
-/// Hardware cursor model.
-#[derive(Clone, Debug, Default)]
-pub struct CursorState {
+#[derive(Clone, Copy, Debug)]
+pub struct CursorPosition {
     pub show: bool,
     pub x: u16,
     pub y: u16,
+}
+
+impl Default for CursorPosition {
+    fn default() -> Self {
+        Self {
+            show: true,
+            x: 0,
+            y: 0,
+        }
+    }
+}
+
+/// Display-page identity and cursor controls shared with MMIO producers.
+/// Hold this only for control updates and their action publication, never GPU work.
+#[derive(Clone, Debug, Default)]
+pub struct DisplayControl {
+    pub shared_gpa: u64,
+    pub cursor: CursorPosition,
+}
+
+/// Hardware cursor glyph, owned by the render worker.
+#[derive(Clone, Debug, Default)]
+pub struct CursorState {
     pub width: u16,
     pub height: u16,
     pub hot_x: u16,
     pub hot_y: u16,
-    /// QEMUCursor pixels as 0xAARRGGBB (guest BGRA reordered).
-    pub pixels: Vec<u32>,
+    /// Immutable QEMUCursor pixels (0xAARRGGBB), retained by popped glyph actions.
+    pub pixels: Arc<Vec<u32>>,
     /// True when `pixels` holds a complete glyph for the host console.
     pub glyph_ready: bool,
 }
@@ -2607,7 +2629,7 @@ pub struct CursorState {
 /// Display shared-state handshake (archive setupSharedState + online poll).
 #[derive(Clone, Debug, Default)]
 pub struct DisplayHandshake {
-    pub shared_gpa: u64,
+    pub control: Arc<parking_lot::Mutex<DisplayControl>>,
     pub display_index: u32,
     pub online_acked: bool,
     pub online_tries: u32,
@@ -3580,10 +3602,7 @@ impl DeviceState {
             fence_flushed_mappings: std::collections::BTreeSet::new(),
             surface_write_kind: BTreeMap::new(),
             present: PresentState::default(),
-            cursor: CursorState {
-                show: true,
-                ..Default::default()
-            },
+            cursor: CursorState::default(),
             mapper_capture: None,
             mapper_device_kva: 0,
             display: DisplayHandshake::default(),
@@ -3961,6 +3980,7 @@ impl DeviceState {
         let intr_fault = Arc::clone(&self.gfx.interrupt_fault);
         let fifo_read = Arc::clone(&self.gfx.fifo_read);
         let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
+        let display_control = Arc::clone(&self.display.control);
         intr_disp.store(0, Ordering::Release);
         intr_gpu.store(0, Ordering::Release);
         intr_fault.store(0, Ordering::Release);
@@ -3968,12 +3988,14 @@ impl DeviceState {
         // Cleared as well as kept: a reset drops every channel, so a bit rung
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
+        *display_control.lock() = DisplayControl::default();
         *self = Self::new(id, page_shift);
         self.gfx.interrupt_status_disp = intr_disp;
         self.gfx.interrupt_status_gpu = intr_gpu;
         self.gfx.interrupt_fault = intr_fault;
         self.gfx.fifo_read = fifo_read;
         self.gfx.child_doorbell_rung = child_rung;
+        self.display.control = display_control;
     }
 
     /// Queue the engine-unpin for a dying linear cache entry that still owns a

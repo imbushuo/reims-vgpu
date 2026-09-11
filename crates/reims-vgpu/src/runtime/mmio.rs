@@ -1,7 +1,7 @@
 //! Gfx and iosfc MMIO read/write handlers.
 //!
 //! Handlers only update bounded device state, set pending-work flags, and
-//! schedule a host BH. No heavy decode or GPU work on this path.
+//! wake the ordered worker. No heavy decode or GPU work on this path.
 
 use crate::model::*;
 use crate::model::{DeviceState, FailEvent};
@@ -113,7 +113,7 @@ pub fn gfx_write<H: HostMemory + HostOps>(
             state.gfx.control_fifo = val;
             if state.gfx.control_fifo != 0 {
                 state.pending.main_drain = true;
-                // Doorbells only publish work. QEMU's one-shot BH drains after
+                // Doorbells only publish work. QEMU's ordered worker drains after
                 // this MMIO callback releases the device lock, keeping shader
                 // translation/GPU waits off the guest vCPU and BQL path.
                 host.schedule_bh();
@@ -148,7 +148,7 @@ pub fn gfx_write<H: HostMemory + HostOps>(
                 // it did: openness is `DeviceState::session`'s and a channel
                 // definition is its one event. See that field's doc.
                 state.pending.child_mask |= 1u32 << val;
-                // Decode/execute belongs to the host BH, never the producer
+                // Decode/execute belongs to the GPU worker, never the producer
                 // vCPU's MMIO callback (ack-fast/render-async invariant).
                 host.schedule_bh();
             }
@@ -203,43 +203,56 @@ pub fn gfx_write<H: HostMemory + HostOps>(
         GFX_REG_EFI_FB_DEPTH => state.gfx.efi_fb_depth = val,
         GFX_REG_EFI_FB_MODE => state.gfx.efi_fb_mode = val,
         GFX_REG_EFI_DISPLAY_IRQ => {
-            // Dual-use: cursor sample doorbell + display IRQ bit.
-            if val < 32 {
-                state
-                    .gfx
-                    .interrupt_status_disp
-                    .fetch_or(1u32 << val, std::sync::atomic::Ordering::AcqRel);
-                // Sample cursor position from display shared page (GPA).
-                if state.display.shared_gpa != 0 {
-                    let mut pos = [0u8; 4];
-                    if host
-                        .read_gpa(
-                            state.display.shared_gpa + DISPLAY_SHARED_CURSOR_POS,
-                            &mut pos,
-                        )
-                        .is_ok()
-                    {
-                        let packed = u32::from_le_bytes(pos);
-                        if packed != 0xffff_ffff {
-                            state.cursor.x = (packed & 0xffff) as u16;
-                            state.cursor.y = ((packed >> 16) & 0xffff) as u16;
-                        }
-                    }
-                    host.enqueue(HostAction::cursor(
-                        state.cursor.x,
-                        state.cursor.y,
-                        state.cursor.show,
-                    ));
-                }
-                host.enqueue(HostAction::irq_gfx());
-                host.schedule_bh();
-            }
+            display_doorbell(
+                &state.display.control,
+                &state.gfx.interrupt_status_disp,
+                host,
+                val,
+            );
         }
         GFX_REG_EFI_FB_STRIDE => {
             state.gfx.efi_fb_stride = val;
             crate::observe::off(format!("efi_fb_stride -> {val:#x}"));
         }
         _ => state.gfx.sparse_set(offset, val),
+    }
+}
+
+/// Sample and publish cursor movement without acquiring render state. The
+/// control lock orders page changes, show/hide commands and cursor actions.
+pub(crate) fn display_doorbell<H: HostMemory + HostOps>(
+    control: &parking_lot::Mutex<DisplayControl>,
+    intr_disp: &std::sync::atomic::AtomicU32,
+    host: &mut H,
+    index: u32,
+) {
+    if index < 32 {
+        intr_disp.fetch_or(1u32 << index, std::sync::atomic::Ordering::AcqRel);
+        let mut control = control.lock();
+        if control.shared_gpa != 0 {
+            let mut pos = [0u8; 4];
+            match host.read_gpa(control.shared_gpa + DISPLAY_SHARED_CURSOR_POS, &mut pos) {
+                Ok(()) => {
+                    let packed = u32::from_le_bytes(pos);
+                    if packed != 0xffff_ffff {
+                        control.cursor.x = packed as u16;
+                        control.cursor.y = (packed >> 16) as u16;
+                    }
+                }
+                Err(error) => crate::observe::fail(format!(
+                    "cursor_position_read_failed gpa={:#x} error={error:?}",
+                    control.shared_gpa
+                )),
+            }
+            host.enqueue(HostAction::cursor(
+                control.cursor.x,
+                control.cursor.y,
+                control.cursor.show,
+            ));
+        }
+        drop(control);
+        host.enqueue(HostAction::irq_gfx());
+        host.schedule_bh();
     }
 }
 
@@ -316,5 +329,64 @@ mod tests {
         assert_ne!(state.pending.child_mask & (1 << 4), 0);
         assert_ne!(state.pending.child_mask & (1 << 4), 0);
         assert!(host.bh_scheduled);
+    }
+
+    #[test]
+    fn display_doorbell_preserves_position_sentinel_and_visibility() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        {
+            let mut control = state.display.control.lock();
+            control.shared_gpa = 0x4000;
+            control.cursor.show = false;
+        }
+        for packed in [(29u32 << 16) | 17, u32::MAX] {
+            host.write_gpa(0x4000 + DISPLAY_SHARED_CURSOR_POS, &packed.to_le_bytes())
+                .expect("cursor position");
+            gfx_write(&mut state, &mut host, GFX_REG_EFI_DISPLAY_IRQ, 31, MMIO_U32);
+            let cursor = &host.actions[host.actions.len() - 2];
+            assert_eq!(
+                cursor.kind,
+                crate::runtime::host::HostActionKind::CursorUpdate
+            );
+            assert_eq!((cursor.a0, cursor.a1, cursor.a2), (17, 29, 0));
+        }
+        assert_eq!(
+            gfx_read(&mut state, GFX_REG_INTR_STATUS_DISP, MMIO_U32),
+            1 << 31
+        );
+
+        host.mark_non_ram(0x4000, 0x1000);
+        gfx_write(&mut state, &mut host, GFX_REG_EFI_DISPLAY_IRQ, 0, MMIO_U32);
+        let cursor = &host.actions[host.actions.len() - 2];
+        assert_eq!((cursor.a0, cursor.a1, cursor.a2), (17, 29, 0));
+        assert_eq!(gfx_read(&mut state, GFX_REG_INTR_STATUS_DISP, MMIO_U32), 1);
+    }
+
+    #[test]
+    fn display_doorbell_handles_missing_page_and_invalid_index() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        gfx_write(&mut state, &mut host, GFX_REG_EFI_DISPLAY_IRQ, 2, MMIO_U32);
+        assert_eq!(host.actions.len(), 1);
+        assert_eq!(
+            host.actions[0].kind,
+            crate::runtime::host::HostActionKind::IrqGfxPulse
+        );
+        assert_eq!(gfx_read(&mut state, GFX_REG_INTR_STATUS_DISP, MMIO_U32), 4);
+        host.actions.clear();
+        host.bh_scheduled = false;
+        for index in [32, u32::MAX] {
+            gfx_write(
+                &mut state,
+                &mut host,
+                GFX_REG_EFI_DISPLAY_IRQ,
+                index as u64,
+                MMIO_U32,
+            );
+        }
+        assert!(host.actions.is_empty());
+        assert!(!host.bh_scheduled);
+        assert_eq!(gfx_read(&mut state, GFX_REG_INTR_STATUS_DISP, MMIO_U32), 0);
     }
 }

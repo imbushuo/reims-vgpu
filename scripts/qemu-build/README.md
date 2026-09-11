@@ -33,6 +33,28 @@ builds. Steps:
 Re-runs are idempotent (skips configure when the target/backend stamp matches). Switching target
 or backend forces reconfigure. Patch record: `vendor/qemu-patches/`.
 
+## GPU worker ownership
+
+Both `reims-vgpu-mmio` and `reims-vgpu-pci` execute the Rust GPU drain on a dedicated,
+RCU-registered worker without QEMU's Big QEMU Lock (BQL). `schedule_bh` wakes that
+worker; `notify_actions` schedules a separate main-loop bottom half for completed
+IRQ, display, and input actions. GPU completion waits must not move back into the
+action bottom half.
+
+Cursor-position doorbells use a shared Rust display-control owner, independent of
+the render-state lock. Page changes, show/hide state, and cursor-action publication
+are serialized there; glyph decoding remains on the GPU worker.
+Popping a glyph action retains its immutable pixel payload and metadata separately
+from render state, so the main-loop info/copy handoff cannot lose it to contention.
+
+Guest-register and kernel-VA capture stays on the originating vCPU, and dirty-log
+harvesting stays on the BQL-protected MMIO ingress. Reset quiesces the worker before
+resetting Rust state or releasing packed guest-memory aliases. A shutdown that pauses
+QEMU keeps the GPU alive for a subsequent reset. Terminal shutdown joins the worker
+and stops the host window before destroying the backend and its notification target.
+The shared worker's scheduling, reset, and teardown tests are in QEMU's
+`tests/unit/test-reims-vgpu-worker.c`.
+
 ## Run
 
 ```sh

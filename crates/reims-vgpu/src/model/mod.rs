@@ -15,13 +15,13 @@ pub(crate) use regs::*;
 // `mod`, so this is the only path those links can name — and rustc's
 // unused-import lint cannot see a doc link, so it will call this dead.
 pub use state::{
-    Acted, BackingWalk, ChannelRing, ComputeStorageResidencyKey, Declaration, DeviceId,
-    DeviceState, ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness,
-    GvaHostView, HostLinearTexture, HostSurface, MapperCapture, MappingEntry, PacketFault,
-    PresentBacking, PresentState, RailDeviceState, RailResourceState, RenderFlushWitness,
-    ResourceValidity, StampPublication, StorageIncarnation, SurfaceWriteKind, TaskEntry,
-    TaskReferenceStates, TaskResource, TaskResourceLifetimeRef, TaskSamplerState, TaskTable,
-    UnimplementedCommand, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
+    Acted, BackingWalk, ChannelRing, ComputeStorageResidencyKey, CursorState, Declaration,
+    DeviceId, DeviceState, DisplayControl, ExecFault, FailEvent, GfxRegs, GuestLinearMemo,
+    GvaBacking, GvaEvictionWitness, GvaHostView, HostLinearTexture, HostSurface, MapperCapture,
+    MappingEntry, PacketFault, PresentBacking, PresentState, RailDeviceState, RailResourceState,
+    RenderFlushWitness, ResourceValidity, StampPublication, StorageIncarnation, SurfaceWriteKind,
+    TaskEntry, TaskReferenceStates, TaskResource, TaskResourceLifetimeRef, TaskSamplerState,
+    TaskTable, UnimplementedCommand, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
     FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
 };
 
@@ -696,11 +696,11 @@ mod tests {
         let mut d = dev();
         d.state.present.width = 1440;
         d.state.present.height = 900;
-        d.state.cursor.show = true;
+        d.state.display.control.lock().cursor.show = true;
         d.state.cursor.hot_x = 1;
         d.state.cursor.hot_y = 2;
         assert_eq!(d.state.present.width, 1440);
-        assert!(d.state.cursor.show);
+        assert!(d.state.display.control.lock().cursor.show);
     }
 
     /// An opcode no ledger row names does not run, and the ring does not stop

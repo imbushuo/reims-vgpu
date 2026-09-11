@@ -15,21 +15,22 @@
 //!
 //! | Work | x86 / PCI | arm64 / MMIO |
 //! |---|---|---|
-//! | Guest command execution (`device_drain`) | dedicated `reims-vgpu-pci-drain` thread | **the vCPU thread, inside its MMIO store** |
+//! | Guest GPU execution (`device_drain`) | dedicated `reims-vgpu-pci-drain` thread | dedicated `reims-vgpu-mmio-drain` thread |
+//! | IOSurface mapper capture and resolve | not exposed | publishing vCPU, inside its IOSurface MMIO store |
 //! | `HostAction` delivery (`device_pop_action`) | main-loop BH | main-loop BH |
 //! | Poll / re-drive (`device_poll`) | 4 ms heartbeat thread | 4 ms main-loop timer |
 //! | Window event loop and `vkQueuePresentKHR` | dedicated `reims-vgpu-window` thread | **process main thread** (AppKit) |
 //!
-//! **No pathway executes guest GPU work on QEMU's main loop**, and neither of
-//! the two exceptions above is an oversight:
+//! Both drain workers run without QEMU's Big QEMU Lock. The main-loop BH only
+//! applies completed actions; `notify_actions` wakes it independently so IRQs
+//! can reach the guest before the worker's tranche ends. Reset quiesces the
+//! worker, and shutdown joins it before destroying the device or its callbacks.
 //!
-//! * The arm64 drain runs on the vCPU because the mapper rail resolves guest
-//!   *virtual* addresses, and `reims_vgpu_shim_read_kva` needs `current_cpu`
-//!   set. Moving it to a worker would have to fall back to `first_cpu` or
-//!   `do_run_on_cpu`, and the shim header records why that is an AB-BA hang
-//!   rather than a slower answer. The cost is real and is the guest's own: a
-//!   tranche stalls the vCPU that handed it over, and `engine_lock`'s `device`
-//!   counters are what price it.
+//! * The arm64 IOSurface mapper handshake remains on the publishing vCPU:
+//!   `runtime::mmio::iosfc_write` captures the handoff registers and consumes
+//!   the mapper ring before waking the worker. Its kernel-VA reads need
+//!   `current_cpu`; the worker's GPA-based GPU drain must not replace them
+//!   with `first_cpu` or `do_run_on_cpu`.
 //! * The macOS window loop runs on the process main thread because AppKit
 //!   requires it. QEMU's Darwin wrapper has already moved emulation off that
 //!   thread by then, so the two do not share.
@@ -481,7 +482,8 @@ pub unsafe extern "C" fn reims_vgpu_qemu_iosfc_write(
     )
 }
 
-/// BH body: drain pending FIFOs (GPA via HostOps). Then pop actions with
+/// Worker body: drain pending FIFOs without BQL (GPA via HostOps).
+/// Deliver actions separately on the main loop with
 /// [`reims_vgpu_qemu_device_pop_action`].
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {

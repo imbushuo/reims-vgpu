@@ -295,7 +295,7 @@ fn note_scanout_copy_consumed<H: HostOps>(
     host.schedule_bh();
 }
 
-/// Cursor glyph metadata for the QEMU console.
+/// Metadata of the last popped cursor glyph for the QEMU console.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CursorGlyphInfo {
@@ -308,8 +308,7 @@ pub struct CursorGlyphInfo {
 
 pub fn device_cursor_glyph_info(id: u64) -> Option<CursorGlyphInfo> {
     let slot = device_slot(id)?;
-    let d = slot.inner.try_lock()?;
-    let c = &d.device.state.cursor;
+    let c = slot.published_cursor_glyph.lock();
     if !c.glyph_ready || c.pixels.is_empty() {
         return None;
     }
@@ -325,8 +324,7 @@ pub fn device_cursor_glyph_info(id: u64) -> Option<CursorGlyphInfo> {
 /// Copy QEMUCursor ARGB pixels. Returns number of pixels written.
 pub fn device_cursor_glyph_copy(id: u64, out: &mut [u32]) -> Option<usize> {
     let slot = device_slot(id)?;
-    let d = slot.inner.try_lock()?;
-    let c = &d.device.state.cursor;
+    let c = slot.published_cursor_glyph.lock();
     if !c.glyph_ready || c.pixels.is_empty() {
         return None;
     }

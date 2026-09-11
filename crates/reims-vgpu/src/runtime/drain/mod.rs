@@ -728,20 +728,21 @@ fn apply_setup_shared_state<H: HostMemory + HostOps>(
     // event → always-on so a bad boot leaves a display-lifecycle timeline.
     let reinit = state.display.online_acked as u8;
     state.display.display_index = index;
-    state.display.shared_gpa = state.pfn_gpa(pfn);
+    let gpa = state.pfn_gpa(pfn);
+    state.display.control.lock().shared_gpa = gpa;
     state.display.online_acked = false;
     state.display.online_tries = 0;
     state.display.poll_ctr = 0;
     crate::observe::fail(format!(
         "display_shared_state_setup index={index} gpa={:#x} reinit={reinit} ch={}",
-        state.display.shared_gpa,
+        gpa,
         channel.map_or_else(|| "root".to_string(), |c| c.to_string())
     ));
     // Archive apple_pv_gpu_display_setup: fill descriptor + modes
     // before completion so createDisplayAttributes sees TimingElements.
     // Do **not** pulse ONLINE here — enable() has not set +0x104 yet
     // (archive poll waits for mask bit 2, then pending+IRQ).
-    fill_display_descriptor(host, state.display.shared_gpa, index, state.page_size());
+    fill_display_descriptor(host, gpa, index, state.page_size());
 }
 
 fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
@@ -4305,37 +4306,31 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
 }
 
 /// Sample cursor x/y/show from the display shared-state page (GPA +0xe00).
-fn sample_cursor_position<M: HostMemory>(state: &mut DeviceState, mem: &M) {
-    if state.display.shared_gpa == 0 {
+fn sample_cursor_position<M: HostMemory>(control: &mut DisplayControl, mem: &M) {
+    if control.shared_gpa == 0 {
         return;
     }
     let mut pos = [0u8; 4];
     if mem
-        .read_gpa(
-            state.display.shared_gpa + DISPLAY_SHARED_CURSOR_POS,
-            &mut pos,
-        )
+        .read_gpa(control.shared_gpa + DISPLAY_SHARED_CURSOR_POS, &mut pos)
         .is_err()
     {
         return;
     }
     let packed = ld32(&pos);
     if packed == 0xffff_ffff {
-        state.cursor.show = false;
+        control.cursor.show = false;
         return;
     }
-    state.cursor.x = (packed & 0xffff) as u16;
-    state.cursor.y = ((packed >> 16) & 0xffff) as u16;
+    control.cursor.x = (packed & 0xffff) as u16;
+    control.cursor.y = ((packed >> 16) & 0xffff) as u16;
     let mut show = [0u8; 4];
     if mem
-        .read_gpa(
-            state.display.shared_gpa + DISPLAY_SHARED_CURSOR_SHOW,
-            &mut show,
-        )
+        .read_gpa(control.shared_gpa + DISPLAY_SHARED_CURSOR_SHOW, &mut show)
         .is_ok()
     {
         // Guest may only write a byte; treat non-zero low byte as show.
-        state.cursor.show = show[0] != 0 || ld32(&show) != 0;
+        control.cursor.show = show[0] != 0 || ld32(&show) != 0;
     }
 }
 
@@ -4465,9 +4460,9 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
     state.cursor.height = height as u16;
     state.cursor.hot_x = hot_x as u16;
     state.cursor.hot_y = hot_y as u16;
-    state.cursor.pixels = pixels;
+    state.cursor.pixels = std::sync::Arc::new(pixels);
     state.cursor.glyph_ready = true;
-    sample_cursor_position(state, host);
+    sample_cursor_position(&mut state.display.control.lock(), host);
     true
 }
 
@@ -6132,19 +6127,21 @@ fn process_child_packet<H: HostMemory + HostOps>(
         }
         CHILD_OP_CURSOR_SHOW => match crate::protocol::fifo::decode_cursor_show(&packet.payload) {
             Ok(show) => {
-                state.cursor.show = show;
-                sample_cursor_position(state, host);
-                host.enqueue(HostAction::cursor(state.cursor.x, state.cursor.y, show));
+                let mut control = state.display.control.lock();
+                control.cursor.show = show;
+                sample_cursor_position(&mut control, host);
+                host.enqueue(HostAction::cursor(control.cursor.x, control.cursor.y, show));
             }
             Err(short) => note_short_payload("cursor_show", Some(channel_id), &short),
         },
         CHILD_OP_CURSOR_GLYPH => {
             if load_cursor_glyph(state, host, packet) {
                 host.enqueue(HostAction::cursor_glyph());
+                let control = state.display.control.lock();
                 host.enqueue(HostAction::cursor(
-                    state.cursor.x,
-                    state.cursor.y,
-                    state.cursor.show,
+                    control.cursor.x,
+                    control.cursor.y,
+                    control.cursor.show,
                 ));
             }
         }
@@ -6911,7 +6908,7 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
 ) {
-    let gpa = state.display.shared_gpa;
+    let gpa = state.display.control.lock().shared_gpa;
     if gpa == 0 {
         note_display_present_signal(DISPLAY_PRESENT_NO_GPA);
         return;
@@ -7413,14 +7410,15 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
     // whole milliseconds; the census windows in milliseconds so its `t=` stays
     // on the same scale as every other always-on line.
     let now_ms = now_us / 1_000;
-    if state.display.shared_gpa == 0 || !state.display.online_acked {
+    let gpa = state.display.control.lock().shared_gpa;
+    if gpa == 0 || !state.display.online_acked {
         note_vbl(VBL_NOT_ONLINE, now_ms);
         return;
     }
     let page_size = state.page_size() as usize;
     signal_display_refresh_classes(
         host,
-        state.display.shared_gpa,
+        gpa,
         state.display.display_index,
         &state.gfx.interrupt_status_disp,
         page_size,
@@ -7436,7 +7434,8 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
 /// `enable()` sets `+0x104` bit 2 — earlier IRQs wedge an unregistered display.
 /// createDisplayAttributes then consumes TimingElements (incl. 1440 mode).
 pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    if state.display.shared_gpa == 0 || state.display.online_acked {
+    let gpa = state.display.control.lock().shared_gpa;
+    if gpa == 0 || state.display.online_acked {
         return;
     }
     if state.display.online_tries >= DISPLAY_ONLINE_MAX_TRIES {
@@ -7510,7 +7509,6 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
     // term in it.
     let ctr = state.display.poll_ctr.wrapping_add(1);
     state.display.poll_ctr = ctr;
-    let gpa = state.display.shared_gpa;
     let mut mask_le = [0u8; 4];
     if host
         .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)

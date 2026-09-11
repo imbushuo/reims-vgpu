@@ -264,7 +264,7 @@ typedef struct ReimsVgpuHostOps {
     int (*read_gpa)(void *ctx, uint64_t gpa, uint8_t *buf, size_t len);
     int (*write_gpa)(void *ctx, uint64_t gpa, const uint8_t *buf, size_t len);
     uint64_t (*mono_ns)(void *ctx);
-    /* Safe from any thread; schedules a oneshot main-loop BH. */
+    /* Safe from any thread; wakes the ordered GPU drain worker. */
     void (*schedule_bh)(void *ctx);
     /* Guest kernel VA read (cpu_memory_rw_debug). 0 = success. */
     int (*read_kva)(void *ctx, uint64_t kva, uint8_t *buf, size_t len);
@@ -477,7 +477,8 @@ int reims_vgpu_qemu_iosfc_read(uint64_t handle, uint64_t offset, uint32_t size,
 int reims_vgpu_qemu_iosfc_write(uint64_t handle, uint64_t offset, uint64_t data,
                          uint32_t size);
 
-/* BH body: drain pending FIFOs (uses HostOps GPA). Then pop actions. */
+/* Worker body, without BQL: drain pending FIFOs using HostOps GPA.
+ * Pop and apply completed actions separately on the QEMU main loop. */
 int reims_vgpu_qemu_device_drain(uint64_t handle);
 /* gfx_update tick: re-drive display ONLINE after guest enable() (pending+IRQ). */
 int reims_vgpu_qemu_device_poll(uint64_t handle);
@@ -557,7 +558,12 @@ typedef struct ReimsVgpuCursorGlyphInfo {
     uint32_t pixel_count;
 } ReimsVgpuCursorGlyphInfo;
 
-/* Glyph ready in Rust; C builds QEMUCursor. EMPTY when no glyph. */
+/*
+ * Owned snapshot of the last popped CursorGlyph action; C builds QEMUCursor.
+ * Stable across worker progress until the next glyph pop or device reset.
+ * The caller must serialize pop/info/copy with those operations.
+ * EMPTY when no glyph has been popped since create/reset.
+ */
 int reims_vgpu_qemu_cursor_glyph_info(uint64_t handle, ReimsVgpuCursorGlyphInfo *out);
 /* out_argb: QEMUCursor 0xAARRGGBB, capacity count pixels. */
 int reims_vgpu_qemu_cursor_glyph_copy(uint64_t handle, uint32_t *out_argb,

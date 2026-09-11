@@ -27,6 +27,72 @@ use crate::protocol::fifo::{
 const TAHOE: DeviceInfoForm = DeviceInfoForm::WithKeyLimit;
 const MONTEREY: DeviceInfoForm = DeviceInfoForm::WithoutKeyLimit;
 
+#[test]
+fn cursor_show_commands_and_doorbells_share_live_controls() {
+    use crate::protocol::fifo::{CURSOR_SHOW_FLAG, CURSOR_SHOW_LEN};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x4000;
+    state.display.control.lock().shared_gpa = gpa;
+
+    for (show, x, y) in [(false, 17u16, 29u16), (true, 31, 37)] {
+        host.write_gpa(
+            gpa + DISPLAY_SHARED_CURSOR_POS,
+            &((u32::from(y) << 16) | u32::from(x)).to_le_bytes(),
+        )
+        .expect("cursor position");
+        host.write_gpa(
+            gpa + DISPLAY_SHARED_CURSOR_SHOW,
+            &u32::from(show).to_le_bytes(),
+        )
+        .expect("cursor visibility");
+        let mut payload = vec![0; CURSOR_SHOW_LEN];
+        payload[CURSOR_SHOW_FLAG..CURSOR_SHOW_FLAG + 4]
+            .copy_from_slice(&u32::from(show).to_le_bytes());
+        process_child_packet(
+            &mut state,
+            &mut host,
+            4,
+            &Packet {
+                opcode: CHILD_OP_CURSOR_SHOW,
+                stamp_waits: Vec::new(),
+                total_size: PACKET_HEADER_LEN + CURSOR_SHOW_LEN as u32,
+                completion_stamp: 0,
+                payload,
+                next_head: 0,
+            },
+        );
+        let action = host.actions.last().expect("show command cursor action");
+        assert_eq!(
+            action.kind,
+            crate::runtime::host::HostActionKind::CursorUpdate
+        );
+        assert_eq!(
+            (action.a0, action.a1, action.a2),
+            (u64::from(x), u64::from(y), u64::from(show))
+        );
+
+        host.write_gpa(
+            gpa + DISPLAY_SHARED_CURSOR_POS,
+            &((u32::from(y + 1) << 16) | u32::from(x + 1)).to_le_bytes(),
+        )
+        .expect("next cursor position");
+        crate::runtime::mmio::gfx_write(
+            &mut state,
+            &mut host,
+            GFX_REG_EFI_DISPLAY_IRQ,
+            0,
+            MMIO_U32,
+        );
+        let action = &host.actions[host.actions.len() - 2];
+        assert_eq!(
+            (action.a0, action.a1, action.a2),
+            (u64::from(x + 1), u64::from(y + 1), u64::from(show))
+        );
+    }
+}
+
 /// I2's carve-out, asserted rather than trusted: a partial packet is the
 /// normal state of a ring whose producer is mid-write, so it must not reach
 /// the always-on log. A bad size or a desync must.
@@ -1877,7 +1943,7 @@ fn display_swap_signals_present_complete_on_shared_page() {
     // a stale ONLINE pending bit must survive the present OR.
     let shared = 0x9000_0000u64;
     host.map_range(shared, 0x1000, 0);
-    state.display.shared_gpa = shared;
+    state.display.control.lock().shared_gpa = shared;
     state.display.display_index = 0;
     host.put_u32(
         shared + DISPLAY_SHARED_ENABLE_MASK,
@@ -1954,7 +2020,7 @@ fn display_swap_signals_present_complete_on_shared_page() {
     // An unreadable enable mask must not be read as permission. The guest
     // published this page's address itself, so a read of it the host cannot
     // perform is not a reason to start signalling classes nobody asked for.
-    state.display.shared_gpa = 0xdead_0000_0000;
+    state.display.control.lock().shared_gpa = 0xdead_0000_0000;
     signal_display_present_complete(&mut state, &mut host);
     assert_eq!(
         state
@@ -2573,7 +2639,7 @@ fn display_online_waits_for_enable_mask_then_signals() {
     let mut host = FakeHost::new();
     let gpa = 0x7b000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
+    state.display.control.lock().shared_gpa = gpa;
     state.display.display_index = 0;
     // No enable mask yet — even after divisor ticks, no IRQ.
     state.display.poll_ctr = DISPLAY_ONLINE_POLL_DIVISOR - 1;
@@ -2622,7 +2688,7 @@ fn the_first_online_pulse_does_not_wait_out_the_reassert_cadence() {
     let mut host = FakeHost::new();
     let gpa = 0x7b000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
+    state.display.control.lock().shared_gpa = gpa;
     state.display.display_index = 0;
     let mut m = [0u8; 4];
     st32(&mut m, DISPLAY_ONLINE_EVENT_MASK);
@@ -2758,7 +2824,7 @@ fn the_two_ways_online_gives_up_are_both_fail_visible() {
         let mut host = FakeHost::new();
         let gpa = 0x7c000000u64;
         host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-        state.display.shared_gpa = gpa;
+        state.display.control.lock().shared_gpa = gpa;
         state.display.display_index = index;
         state.display.online_tries = DISPLAY_ONLINE_MAX_TRIES;
         try_display_online(&mut state, &mut host);
@@ -2780,7 +2846,7 @@ fn the_two_ways_online_gives_up_are_both_fail_visible() {
     {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
-        state.display.shared_gpa = unreadable;
+        state.display.control.lock().shared_gpa = unreadable;
         state.display.display_index = index;
         state.display.poll_ctr = DISPLAY_ONLINE_POLL_DIVISOR - 1;
         try_display_online(&mut state, &mut host);
@@ -2834,7 +2900,7 @@ fn a_guest_that_never_enables_cannot_reach_the_online_cap() {
     // bit clear is exactly the state under test, and an *unmapped* page would
     // take the unreadable arm instead.
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
+    state.display.control.lock().shared_gpa = gpa;
     state.display.display_index = index;
 
     // Past the reporting bound, so the next acted poll is the one that reports.
@@ -3696,7 +3762,7 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
     let last_ms = std::sync::atomic::AtomicU64::new(0);
     let gpa = 0x7c000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
+    state.display.control.lock().shared_gpa = gpa;
     state.display.display_index = 0;
     state.display.online_acked = true;
     // This test is about the limiter, so it models a guest that asked for VBL.
@@ -3777,7 +3843,7 @@ fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
     let last_ms = std::sync::atomic::AtomicU64::new(0);
     let gpa = 0x7c000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
+    state.display.control.lock().shared_gpa = gpa;
     state.display.display_index = 0;
     state.display.online_acked = true;
 
@@ -3948,7 +4014,7 @@ fn one_shot_display() -> (DeviceState, FakeHost, u64) {
     let mut host = FakeHost::new();
     let gpa = 0x7c000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
+    state.display.control.lock().shared_gpa = gpa;
     state.display.display_index = 0;
     state.display.online_acked = true;
     (state, host, gpa)
@@ -4137,7 +4203,7 @@ fn acked_stale_online_bit_is_suppressed_not_redelivered() {
     let mut host = FakeHost::new();
     let gpa = 0x7d00_0000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
+    state.display.control.lock().shared_gpa = gpa;
     state.display.display_index = 0;
     state.display.online_acked = true;
     host.put_u32(
@@ -5460,7 +5526,8 @@ fn every_short_control_packet_names_itself() {
         process_child_packet(&mut state, &mut host, 4, &short(opcode, need - 1));
     }
     assert_eq!(
-        state.display.shared_gpa, 0,
+        state.display.control.lock().shared_gpa,
+        0,
         "a short SETUP_SHARED_STATE must not latch a display page"
     );
 
@@ -5530,7 +5597,7 @@ fn root_opcode_one_sets_up_the_display_shared_state() {
 
     assert_eq!(state.display.display_index, 2, "the pipe index latched");
     assert_eq!(
-        state.display.shared_gpa,
+        state.display.control.lock().shared_gpa,
         state.pfn_gpa(0x40),
         "and the shared-state page, from the same payload the child arm reads"
     );
@@ -5578,7 +5645,7 @@ fn a_pipe_index_that_looks_like_an_opcode_is_still_a_pipe_index() {
         "the word is a pipe index and latched as one"
     );
     assert_eq!(
-        state.display.shared_gpa,
+        state.display.control.lock().shared_gpa,
         state.pfn_gpa(3),
         "and the second word is the page, not a task id"
     );
@@ -7227,7 +7294,7 @@ fn no_display_signal_path_sets_a_bit_the_guest_did_not_enable() {
         let mut host = FakeHost::new();
         let gpa = 0x7c000000u64;
         host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-        state.display.shared_gpa = gpa;
+        state.display.control.lock().shared_gpa = gpa;
         state.display.display_index = 0;
         state.display.online_acked = true;
         host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, mask);
@@ -7266,7 +7333,7 @@ fn display_offline_is_never_signalled_even_when_the_guest_arms_it() {
     let mut host = FakeHost::new();
     let gpa = 0x7c000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
+    state.display.control.lock().shared_gpa = gpa;
     state.display.display_index = 0;
     state.display.online_acked = true;
     // Everything armed, including offline: the most permissive guest there is.
@@ -7306,7 +7373,7 @@ fn the_refresh_tick_signals_the_transaction_class_when_that_is_what_the_guest_ar
     let mut host = FakeHost::new();
     let gpa = 0x7c000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
+    state.display.control.lock().shared_gpa = gpa;
     state.display.display_index = 0;
     state.display.online_acked = true;
     // Exactly what a macOS 11 guest publishes: transaction + online + offline,
@@ -7351,7 +7418,7 @@ fn a_refresh_tick_that_signals_both_classes_raises_one_interrupt() {
     let mut host = FakeHost::new();
     let gpa = 0x7c000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
+    state.display.control.lock().shared_gpa = gpa;
     state.display.display_index = 0;
     state.display.online_acked = true;
     host.put_u32(

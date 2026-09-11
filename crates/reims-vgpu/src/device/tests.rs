@@ -196,6 +196,201 @@ fn intr_status_write_clears_mask_while_device_lock_held() {
     assert!(device_destroy(id));
 }
 
+#[test]
+fn cursor_doorbells_publish_moves_and_irqs_while_render_state_is_locked() {
+    use crate::model::{DISPLAY_SHARED_CURSOR_POS, GFX_REG_EFI_DISPLAY_IRQ};
+    use crate::runtime::host::HostActionKind;
+    use std::ffi::c_void;
+
+    struct CursorMemory {
+        address: AtomicU64,
+        packed: AtomicU32,
+        notifications: AtomicU32,
+    }
+
+    unsafe extern "C" fn read(ctx: *mut c_void, gpa: u64, buf: *mut u8, len: usize) -> i32 {
+        // SAFETY: the fixture and callback destination outlive every access.
+        let memory = unsafe { &*ctx.cast::<CursorMemory>() };
+        if len != 4 || gpa != memory.address.load(Ordering::Acquire) {
+            return -1;
+        }
+        let bytes = memory.packed.load(Ordering::Acquire).to_le_bytes();
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len()) };
+        0
+    }
+
+    unsafe extern "C" fn notify(ctx: *mut c_void) {
+        // SAFETY: the fixture outlives the device.
+        let memory = unsafe { &*ctx.cast::<CursorMemory>() };
+        memory.notifications.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let mut memory = CursorMemory {
+        address: AtomicU64::new(0x4000 + DISPLAY_SHARED_CURSOR_POS),
+        packed: AtomicU32::new((11 << 16) | 7),
+        notifications: AtomicU32::new(0),
+    };
+    let mut ops = ReimsVgpuHostOps::null();
+    ops.ctx = std::ptr::from_mut(&mut memory).cast();
+    ops.read_gpa = Some(read);
+    ops.notify_actions = Some(notify);
+    let id = device_create(Some(ops), PAGE_SHIFT_ARM64E).expect("create");
+    let slot = device_slot(id).expect("slot");
+    let drain = slot.inner.lock();
+    let control = &drain.device.state.display.control;
+    assert!(Arc::ptr_eq(control, &slot.display_control));
+    control.lock().shared_gpa = 0x4000;
+
+    for packed in [(11 << 16) | 7, (23 << 16) | 19] {
+        memory.packed.store(packed, Ordering::Release);
+        assert!(device_gfx_write(id, GFX_REG_EFI_DISPLAY_IRQ, 1, 4));
+    }
+    assert!(slot.gfx_ingress.lock().is_empty());
+    assert_eq!(slot.intr_disp.load(Ordering::Acquire), 2);
+    assert_eq!(memory.notifications.load(Ordering::Relaxed), 4);
+    let actions: Vec<_> = std::iter::from_fn(|| device_pop_action(id)).collect();
+    assert_eq!(actions.len(), 2, "moves and IRQs still coalesce");
+    let cursor = actions
+        .iter()
+        .find(|a| a.kind == HostActionKind::CursorUpdate)
+        .expect("prompt cursor action");
+    assert_eq!((cursor.a0, cursor.a1, cursor.a2), (19, 23, 1));
+    assert!(actions
+        .iter()
+        .any(|a| a.kind == HostActionKind::IrqGfxPulse));
+
+    // Worker-side page replacement and hide are immediately visible to ingress.
+    {
+        let mut control = control.lock();
+        control.shared_gpa = 0x8000;
+        control.cursor.show = false;
+    }
+    memory
+        .address
+        .store(0x8000 + DISPLAY_SHARED_CURSOR_POS, Ordering::Release);
+    memory.packed.store((37 << 16) | 31, Ordering::Release);
+    assert!(device_gfx_write(id, GFX_REG_EFI_DISPLAY_IRQ, 1, 4));
+    let cursor = device_pop_action(id).expect("hidden cursor move");
+    assert_eq!(cursor.kind, HostActionKind::CursorUpdate);
+    assert_eq!((cursor.a0, cursor.a1, cursor.a2), (31, 37, 0));
+    {
+        let control = control.lock();
+        assert_eq!((control.cursor.x, control.cursor.y), (31, 37));
+    }
+    drop(drain);
+    assert!(device_destroy(id));
+}
+
+#[test]
+fn reset_clears_cursor_controls_without_disconnect_from_ingress() {
+    let id = device_create(Some(ReimsVgpuHostOps::null()), PAGE_SHIFT_ARM64E).expect("create");
+    let slot = device_slot(id).expect("slot");
+    {
+        let mut control = slot.display_control.lock();
+        control.shared_gpa = 0x4000;
+        control.cursor.x = 17;
+        control.cursor.y = 29;
+        control.cursor.show = false;
+    }
+    slot.prompt_actions
+        .lock()
+        .push_back(HostAction::cursor(17, 29, false));
+    assert!(device_reset(id));
+    let drain = slot.inner.lock();
+    assert!(Arc::ptr_eq(
+        &slot.display_control,
+        &drain.device.state.display.control
+    ));
+    {
+        let control = slot.display_control.lock();
+        assert_eq!(control.shared_gpa, 0);
+        assert_eq!(
+            (control.cursor.x, control.cursor.y, control.cursor.show),
+            (0, 0, true)
+        );
+    }
+    assert!(slot.prompt_actions.lock().is_empty());
+    assert!(device_gfx_write(
+        id,
+        crate::model::GFX_REG_EFI_DISPLAY_IRQ,
+        3,
+        4
+    ));
+    assert_eq!(slot.intr_disp.load(Ordering::Acquire), 8);
+    assert_eq!(
+        device_pop_action(id).expect("display IRQ").kind,
+        crate::runtime::host::HostActionKind::IrqGfxPulse
+    );
+    assert!(
+        device_pop_action(id).is_none(),
+        "no stale pre-reset cursor page"
+    );
+    drop(drain);
+    assert!(device_destroy(id));
+}
+
+#[test]
+fn popped_cursor_glyph_survives_worker_progress_between_info_and_copy() {
+    let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
+    let slot = device_slot(id).expect("slot");
+    let pixels = Arc::new(vec![0xff000001, 0xff000002, 0xff000003, 0xff000004]);
+    {
+        let mut inner = slot.inner.lock();
+        let glyph = &mut inner.device.state.cursor;
+        glyph.width = 2;
+        glyph.height = 2;
+        glyph.hot_x = 1;
+        glyph.pixels = Arc::clone(&pixels);
+        glyph.glyph_ready = true;
+        inner.actions.push_back(HostAction::cursor_glyph());
+    }
+    assert!(device_cursor_glyph_info(id).is_none());
+    assert_eq!(
+        device_pop_action(id).expect("glyph action").kind,
+        crate::runtime::host::HostActionKind::CursorGlyph
+    );
+    assert!(Arc::ptr_eq(
+        &slot.published_cursor_glyph.lock().pixels,
+        &pixels
+    ));
+
+    let info = device_cursor_glyph_info(id).expect("popped glyph metadata");
+    assert_eq!(
+        (info.width, info.height, info.hot_x, info.pixel_count),
+        (2, 2, 1, 4)
+    );
+    let mut worker = slot.inner.lock();
+    let next = &mut worker.device.state.cursor;
+    next.width = 1;
+    next.height = 1;
+    next.hot_x = 0;
+    next.pixels = Arc::new(vec![0xff123456]);
+    worker.actions.push_back(HostAction::cursor_glyph());
+
+    let info = device_cursor_glyph_info(id).expect("metadata survives render lock");
+    assert_eq!(
+        (info.width, info.height, info.hot_x, info.pixel_count),
+        (2, 2, 1, 4)
+    );
+    let mut copied = [0; 4];
+    assert_eq!(device_cursor_glyph_copy(id, &mut copied), Some(4));
+    assert_eq!(&copied, pixels.as_slice());
+    drop(worker);
+
+    assert_eq!(
+        device_pop_action(id).expect("next glyph action").kind,
+        crate::runtime::host::HostActionKind::CursorGlyph
+    );
+    let info = device_cursor_glyph_info(id).expect("new glyph metadata");
+    assert_eq!((info.width, info.height, info.pixel_count), (1, 1, 1));
+    assert_eq!(device_cursor_glyph_copy(id, &mut copied), Some(1));
+    assert_eq!(copied[0], 0xff123456);
+    assert!(device_reset(id));
+    assert!(device_cursor_glyph_info(id).is_none());
+    assert!(device_cursor_glyph_copy(id, &mut copied).is_none());
+    assert!(device_destroy(id));
+}
+
 /// Prompt actions (IRQ pulses) pop without the device lock so the BH can
 /// deliver MSIs mid-drain; lock-owning actions still wait for the lock.
 #[test]

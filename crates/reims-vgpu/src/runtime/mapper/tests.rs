@@ -682,8 +682,25 @@ fn capture_validates_identity_and_ring() {
     let cap = capture_at_producer(&state, &host, 1).expect("capture");
     assert_eq!(cap.producer, 1);
     assert_eq!(cap.mapping_internal, internal);
-    assert!(apply_capture(&mut state, &cap, 7));
+
+    // The handoff must be captured and consumed before the asynchronous GPU
+    // worker wakes: only this publishing vCPU can supply the kernel-VA reads.
+    crate::runtime::mmio::iosfc_write(
+        &mut state,
+        &mut host,
+        crate::model::IOSFC_REG_PRODUCER,
+        1,
+        4,
+    );
     assert_eq!(state.mappings.get(&7).unwrap().mapping_internal, internal);
+    assert_eq!(state.iosfc.consumer, 1);
+    assert!(!state.pending.iosfc);
+    assert!(state.mapper_capture.is_none());
+    assert!(host.bh_scheduled);
+    assert!(host
+        .actions
+        .iter()
+        .any(|action| action.kind == crate::runtime::host::HostActionKind::IrqIosfcPulse));
 }
 
 #[test]

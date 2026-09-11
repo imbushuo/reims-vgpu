@@ -83,6 +83,12 @@ struct BoundDevice {
     /// so the BH delivers them while the drain worker still owns the device
     /// lock. Scanout/glyph actions stay in `DeviceInner::actions`.
     prompt_actions: Mutex<VecDeque<HostAction>>,
+    /// The model's cursor/page owner, shared rather than cached so cursor
+    /// doorbells never queue behind rendering or observe stale show/hide state.
+    display_control: Arc<Mutex<crate::model::DisplayControl>>,
+    /// Owned payload of the last popped CursorGlyph. Only the serialized action
+    /// consumer replaces it, so worker progress cannot invalidate info/copy.
+    published_cursor_glyph: Mutex<crate::model::CursorState>,
     /// Lock-free clones of the read-to-clear interrupt-status registers
     /// (`state.gfx.interrupt_status_disp` / `_gpu`): the guest ISR read at
     /// 0x1014/0x1018 must observe live bits mid-drain, never a stale cache.
@@ -231,6 +237,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
+    let display_control = Arc::clone(&dev.state.display.control);
     DEVICES.lock().insert(
         id,
         Arc::new(BoundDevice {
@@ -242,6 +249,8 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             gfx_read_cache: Mutex::new(HashMap::new()),
             gfx_read_busy_logged: AtomicBool::new(false),
             prompt_actions: Mutex::new(VecDeque::new()),
+            display_control,
+            published_cursor_glyph: Mutex::new(crate::model::CursorState::default()),
             intr_disp,
             intr_gpu,
             child_doorbell_rung,
@@ -334,6 +343,7 @@ pub fn device_reset(id: u64) -> bool {
         ));
         d.actions.clear();
         slot.prompt_actions.lock().clear();
+        *slot.published_cursor_glyph.lock() = crate::model::CursorState::default();
         slot.gfx_read_cache.lock().clear();
         slot.present_action_pending.store(false, Ordering::Release);
         slot.present_boundary_seen.store(false, Ordering::Release);
@@ -407,15 +417,29 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             slot.intr_gpu.fetch_and(!(data as u32), Ordering::AcqRel);
             return true;
         }
-        // The child doorbell, which measurement says is the *entire* queueing
-        // stall on this pathway: `gfx_doorbell_delay` reads `offsets=1` on
-        // every window that queued anything, ~100 rings a second applied up to
-        // 45 ms late, and that delay is the drain tranche the write could not
-        // take the lock through.
-        //
-        // It is the one register that can be served this way, because it
-        // carries no state the decode depends on — its effect is to say a
-        // channel has work. `fold_rung_child_doorbells` turns the bit into
+        if offset == crate::model::GFX_REG_EFI_DISPLAY_IRQ {
+            crate::runtime::drain::note_doorbell_direct();
+            if let Some(ops) = slot.ops {
+                let mut scratch = VecDeque::new();
+                let mut host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
+                crate::runtime::mmio::display_doorbell(
+                    &slot.display_control,
+                    &slot.intr_disp,
+                    &mut host,
+                    data as u32,
+                );
+            } else {
+                crate::runtime::mmio::display_doorbell(
+                    &slot.display_control,
+                    &slot.intr_disp,
+                    &mut NullHost,
+                    data as u32,
+                );
+            }
+            return true;
+        }
+        // A child doorbell carries no decode state: it says a channel has
+        // work. `fold_rung_child_doorbells` turns the bit into
         // the open-domain set / `pending.child_mask`, which is exactly what the
         // locked handler in `crate::runtime::mmio` does for the same register.
         //
@@ -699,8 +723,10 @@ pub fn device_poll(id: u64) -> bool {
     // Republish the lock-free VBL snapshot for the contended fast path above.
     // These change only at online-ack/reinit, but publishing every poll keeps
     // the snapshot fresh with no extra synchronization on the rare-change path.
-    slot.vbl_shared_gpa
-        .store(device.state.display.shared_gpa, Ordering::Release);
+    slot.vbl_shared_gpa.store(
+        device.state.display.control.lock().shared_gpa,
+        Ordering::Release,
+    );
     slot.vbl_display_index
         .store(device.state.display.display_index, Ordering::Release);
     slot.vbl_online
@@ -780,7 +806,9 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
 ///
 /// Prompt actions (IRQ pulses, cursor moves) pop without the device lock so
 /// they deliver mid-drain; lock-owning actions (scanout, cursor glyph) keep
-/// their after-drain semantics behind `try_lock`.
+/// their after-drain semantics behind `try_lock`. Popping a glyph retains its
+/// immutable payload until the next glyph pop or reset; the QEMU action consumer
+/// must serialize pop/info/copy with those operations.
 pub fn device_pop_action(id: u64) -> Option<HostAction> {
     let slot = device_slot(id)?;
     {
@@ -797,7 +825,11 @@ pub fn device_pop_action(id: u64) -> Option<HostAction> {
         }
     }
     let mut d = slot.inner.try_lock()?;
-    d.actions.pop_front()
+    let action = d.actions.pop_front()?;
+    if action.kind == crate::runtime::host::HostActionKind::CursorGlyph {
+        *slot.published_cursor_glyph.lock() = d.device.state.cursor.clone();
+    }
+    Some(action)
 }
 
 /// What the process's backend calls itself, for QEMU's realize trace.
