@@ -1340,7 +1340,7 @@ fn bind_sampled_images(
                     return Status::args("metal_render_sampled_binding_invalid")
                         .field("binding", *binding);
                 };
-                let texture = match super::planar::upload(device, image) {
+                let texture = match image.texture(device) {
                     Ok(texture) => texture,
                     Err(status) => {
                         set_err(err, format!("planar render texture: {status:?}"));

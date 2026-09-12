@@ -323,8 +323,29 @@ impl RailStage for VulkanStage {
         _texture_ref: u32,
         description: crate::protocol::planar::TextureDescription,
         layout: crate::protocol::planar::Layout,
-        planes: [Vec<u8>; 2],
+        fill: impl FnOnce([&mut dyn reims_vgpu_memory::ReadDestination; 2])
+            -> Result<(), ComputeStatus>,
     ) -> Result<Self, ComputeStatus> {
+        use reims_vgpu_memory::{ReadBuffer, ReadDestination};
+        let [first_len, second_len] = layout.planes.map(|plane| {
+            host_alloc_len(plane.size).ok_or(ComputeStatus::Unsupported("planar_host_length"))
+        });
+        let mut planes = [
+            Box::<[u8]>::new_uninit_slice(first_len?),
+            Box::<[u8]>::new_uninit_slice(second_len?),
+        ];
+        {
+            let [first, second] = &mut planes;
+            let mut destinations = [ReadBuffer::new(first), ReadBuffer::new(second)];
+            let [first, second] = &mut destinations;
+            fill([first, second])?;
+            if !destinations.iter().all(ReadDestination::is_complete) {
+                return Err(ComputeStatus::GuestIo("planar_plane_incomplete"));
+            }
+        }
+        // SAFETY: the retained destination owners certified every byte in both
+        // allocations; a callback cannot replace those owners or forge completion.
+        let planes = planes.map(|plane| unsafe { plane.assume_init().into_vec() });
         let image = crate::backend::vulkan::planar::Image::expand(description, layout, planes)
             .map_err(|error| ComputeStatus::Unsupported(error.slug()))?;
         Ok(Self { planar: Some(image), descriptor_count: 1, ..Self::default() })

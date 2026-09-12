@@ -59,7 +59,87 @@ pub(crate) fn image(format: SampleFormat, backing: BackingFormat) -> SampledImag
         pair[..2].copy_from_slice(&(640u16 << 6).to_le_bytes());
         pair[2..].copy_from_slice(&(768u16 << 6).to_le_bytes());
     }
-    SampledImage::new(description, layout, planes).unwrap()
+    let device = super::super::runtime::system_device().expect("native Metal device");
+    SampledImage::fill(device, description, layout, |destinations| {
+        for (destination, source) in destinations.into_iter().zip(&planes) {
+            destination.copy_from_slice(source).unwrap();
+        }
+        Ok::<_, ()>(())
+    }).unwrap()
+}
+
+#[test]
+fn planar_reader_fills_the_final_native_planes_once() {
+    let device = super::super::runtime::system_device().expect("native Metal device");
+    let layout = Layout::decode(&device_descriptor(BackingFormat::VideoRange), 8, 4).unwrap();
+    let description = TextureDescription::decode(
+        &texture_descriptor(SampleFormat::Rgb10_420TwoPlane), 11,
+    ).unwrap();
+    let mut addresses = [0; 2];
+    let mut calls = 0;
+    let image = SampledImage::fill(device, description, layout, |destinations| {
+        calls += 1;
+        for (index, destination) in destinations.into_iter().enumerate() {
+            assert_eq!(destination.len(), 1024);
+            assert!(destination.initialized().is_none());
+            destination.copy_from_slice(&[0x41 + index as u8; 1024]).unwrap();
+            addresses[index] = destination.initialized().unwrap().as_ptr() as usize;
+        }
+        Ok::<_, ()>(())
+    }).unwrap();
+    assert_eq!(calls, 1);
+    for (index, address) in addresses.into_iter().enumerate() {
+        assert_eq!(image.plane_bytes(index).as_ptr() as usize, address);
+        assert_eq!(image.plane_bytes(index), vec![0x41 + index as u8; 1024]);
+    }
+    let first = image.texture(device).unwrap();
+    let second = image.texture(device).unwrap();
+    assert_eq!(first.as_ptr(), second.as_ptr(), "binding must not upload again");
+}
+
+#[test]
+fn planar_reader_failure_does_not_publish_a_partial_image() {
+    let device = super::super::runtime::system_device().expect("native Metal device");
+    let layout = Layout::decode(&device_descriptor(BackingFormat::VideoRange), 8, 4).unwrap();
+    let description = TextureDescription::decode(
+        &texture_descriptor(SampleFormat::Rgb10_420TwoPlane), 11,
+    ).unwrap();
+    let result = SampledImage::fill(device, description, layout, |[first, _]| {
+        first.copy_from_slice(&[0x41; 1024]).unwrap();
+        Err("source read failed")
+    });
+    assert!(matches!(result, Err(FillError::Source("source read failed"))));
+}
+
+#[test]
+fn planar_reader_cannot_claim_success_with_unwritten_planes() {
+    let device = super::super::runtime::system_device().expect("native Metal device");
+    let layout = Layout::decode(&device_descriptor(BackingFormat::VideoRange), 8, 4).unwrap();
+    let description = TextureDescription::decode(
+        &texture_descriptor(SampleFormat::Rgb10_420TwoPlane), 11,
+    ).unwrap();
+    for write_first in [false, true] {
+        let result = SampledImage::fill(device, description, layout.clone(), |[first, _]| {
+            if write_first {
+                first.copy_from_slice(&[0x41; 1024]).unwrap();
+            }
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(result, Err(FillError::Layout(Refusal::ImageBytes))));
+    }
+}
+
+#[test]
+fn planar_destination_ranges_preserve_order_and_refuse_overlap_or_overflow() {
+    let mut layout = Layout::decode(&device_descriptor(BackingFormat::VideoRange), 8, 4).unwrap();
+    assert_eq!(plane_ranges(4096, &layout).unwrap(), [0..1024, 2048..3072]);
+    layout.planes.swap(0, 1);
+    assert_eq!(plane_ranges(4096, &layout).unwrap(), [2048..3072, 0..1024]);
+    assert_eq!(plane_ranges(3000, &layout), Err(Refusal::ImageBytes));
+    layout.planes[1].base = 2304;
+    assert_eq!(plane_ranges(4096, &layout), Err(Refusal::PlaneOverlap));
+    layout.planes[1].base = u64::MAX;
+    assert_eq!(plane_ranges(4096, &layout), Err(Refusal::ImageBytes));
 }
 
 #[test]
@@ -77,7 +157,8 @@ fn planar_native_samples_both_private_formats_and_ranges() {
         for format in [SampleFormat::Ycbcr10_420TwoPlane, SampleFormat::Rgb10_420TwoPlane] {
             for backing in [BackingFormat::VideoRange, BackingFormat::FullRange] {
                 let image = image(format, backing);
-                let texture = upload(&device, &image).unwrap();
+                let texture = image.texture(&device).unwrap();
+                drop(image);
                 let ordinal: u64 = unsafe { msg_send![texture, pixelFormat] };
                 assert_eq!(ordinal, u64::from(format.word()));
                 let output = device.new_buffer(8 * 4 * 16, MTLResourceOptions::StorageModeShared);
@@ -114,16 +195,17 @@ fn planar_native_samples_both_private_formats_and_ranges() {
 }
 
 #[test]
-fn planar_texture_retains_iosurface_beyond_upload_pool() {
+fn planar_texture_retains_iosurface_beyond_staging() {
     objc::rc::autoreleasepool(|| {
         let device = metal::Device::system_default().expect("native Metal device");
         let image = image(SampleFormat::Rgb10_420TwoPlane, BackingFormat::VideoRange);
-        let texture = upload(&device, &image).unwrap();
+        let texture = image.texture(&device).unwrap();
         let surface: *mut Object = unsafe { msg_send![texture, iosurface] };
         assert!(!surface.is_null());
         // SAFETY: the texture's native IOSurface getter returns its live object.
         let weak = unsafe { WeakPtr::new(surface) };
-        assert!(!weak.load().is_null(), "the upload pool and creator reference have drained");
+        drop(image);
+        assert!(!weak.load().is_null(), "the staging owner and creator reference have drained");
         drop(texture);
         assert!(weak.load().is_null(), "no autoreleased texture may keep the surface alive");
     });

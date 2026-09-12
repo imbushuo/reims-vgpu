@@ -468,7 +468,7 @@ pub(crate) fn bind_compute_sampled_images(
                         .field("binding", *binding);
                 }
                 seen[index] = true;
-                let texture = match super::planar::upload(device, image) {
+                let texture = match image.texture(device) {
                     Ok(texture) => texture,
                     Err(status) => {
                         set_err(err, format!("planar compute texture: {status:?}"));

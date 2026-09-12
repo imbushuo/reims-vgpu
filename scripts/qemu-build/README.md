@@ -113,6 +113,19 @@ reads cannot produce a sealed input. No guest alias or persistent CPU view escap
 Stage-in bindings and draws with texture, query, depth, or stencil participants
 retain the existing CPU-vector route.
 
+Composite P010 sampled textures fill plane regions in a private IOSurface directly
+through the checked mapping reader. An initialization-aware destination owns the
+written-prefix proof: the producer receives a writer capability, not an ordinary
+mutable byte slice or a replaceable initialization flag. No texture is published
+until both complete planes have been written, so no preliminary zero-fill is
+needed. Whole-plane leading, row, and extended padding and the
+mapping-generation check are preserved.
+The staged image owns the immutable native texture; fragment and compute binds
+retain that texture rather than copying the planes into another allocation.
+No guest memory is aliased, and independent staging operations still take
+independent snapshots. Vulkan retains owned-plane staging and expansion, using
+the same completion proof before treating its allocated planes as initialized.
+
 Queries, writable/native resource bindings, attachment changes, and dependencies
 that need CPU-visible results complete outstanding work synchronously. Unknown or
 overlapping input footprints conservatively materialize prior output.
@@ -136,6 +149,14 @@ between observations; do not difference or sum current levels or lifetime maxima
 such as `completed_peak_*`. Logical ownership is not physical residency.
 Recycling reduces allocation/destruction; direct filling additionally removes the
 eligible CPU-snapshot-to-Metal copy, not the guest read or native destination write.
+
+The `store_routes` fields `metal_planar_direct_fills` and
+`metal_planar_direct_fill_bytes` count successfully prepared planar snapshots.
+The earlier `metal_planar_initialized_bytes` counter measured preliminary
+zero-filling, which the initialization-aware destination removes; it must not be
+reinterpreted as guest bytes read. Planar allocation and filling now occur
+in the sampled-staging phase rather than during encoder binding, so compare
+whole-worker cost as well as individual phase counters.
 
 Scanout keeps its initialized scratch buffer between captures, avoiding redundant
 zero-filling at unchanged dimensions. Existing frame-push coalescing and display

@@ -68,9 +68,19 @@
 //! every offset bind and retired with the reference or its mappings. Importing
 //! the alias is optional; a driver may refuse it and the existing gather remains
 //! the correctness path. It is never attempted per draw.
+//!
+//! # Checked copy destinations
+//!
+//! [`ReadBuffer`] owns the initialization proof for a private destination.
+//! Its producer receives a [`ReadDestination`] writer capability, not access to
+//! replace the owner or assert completion. Only actual copies advance the known
+//! initialized prefix; a partial read cannot expose the buffer as readable bytes.
 
 use reims_vgpu_observe::{Decline, Emit};
 use reims_vgpu_protocol::checked::align_up_u64;
+
+mod read_buffer;
+pub use read_buffer::{DestinationSize, ReadBuffer, ReadDestination};
 
 /// Exact physical footprint retained with one imported guest allocation.
 ///

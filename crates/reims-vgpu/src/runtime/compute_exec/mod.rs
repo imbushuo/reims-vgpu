@@ -1390,7 +1390,8 @@ pub(crate) trait RailStage: Sized {
         _texture_ref: u32,
         _description: crate::protocol::planar::TextureDescription,
         _layout: crate::protocol::planar::Layout,
-        _planes: [Vec<u8>; 2],
+        _fill: impl FnOnce([&mut dyn reims_vgpu_memory::ReadDestination; 2])
+            -> Result<(), ComputeStatus>,
     ) -> Result<Self, ComputeStatus> {
         Err(ComputeStatus::Unsupported("planar_sampling_metal_only"))
     }
@@ -2435,20 +2436,28 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         if host_alloc_len(layout.allocation_size).is_none() {
             return Err(ComputeStatus::Unsupported("planar_host_length"));
         }
-        let mut planes = [Vec::new(), Vec::new()];
-        for (plane, bytes) in layout.planes.iter().zip(&mut planes) {
-            let len = host_alloc_len(plane.size)
-                .ok_or(ComputeStatus::Unsupported("planar_host_length"))?;
-            bytes.resize(len, 0);
-            // The byte-reader owns guest import bounds and settling outstanding
-            // GPU writeback. Read the whole declared plane, including extensions.
-            if !mapper::read_mapping_bytes(state, host, mapping_id, plane.base, bytes) {
-                return Err(ComputeStatus::GuestIo("planar_mapping_read"));
+        for plane in &layout.planes {
+            if host_alloc_len(plane.size).is_none() {
+                return Err(ComputeStatus::Unsupported("planar_host_length"));
             }
         }
-        if state.mappings.get(&mapping_id).map(|m| m.map_generation) != Some(generation) {
-            return Err(ComputeStatus::GuestIo("planar_mapping_changed"));
-        }
+        let plane_specs = layout.planes;
+        let rail = R::stage_planar(texture_ref, description, layout, |planes| {
+            for (plane, bytes) in plane_specs.iter().zip(planes) {
+                if bytes.len() as u64 != plane.size {
+                    return Err(ComputeStatus::GuestIo("planar_plane_destination"));
+                }
+                // This reader owns guest import bounds and pending GPU writeback.
+                // Fill the whole plane, including leading, row and extended padding.
+                if !mapper::read_mapping_into(state, host, mapping_id, plane.base, bytes) {
+                    return Err(ComputeStatus::GuestIo("planar_mapping_read"));
+                }
+            }
+            if state.mappings.get(&mapping_id).map(|m| m.map_generation) != Some(generation) {
+                return Err(ComputeStatus::GuestIo("planar_mapping_changed"));
+            }
+            Ok(())
+        })?;
         Ok(StagedTexture {
             binding,
             pixel_format: description.format.word(),
@@ -2459,7 +2468,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             bytes: Vec::new(),
             is_storage: false,
             writeback: TextureWriteback::None,
-            rail: R::stage_planar(texture_ref, description, layout, planes)?,
+            rail,
         })
     }
 

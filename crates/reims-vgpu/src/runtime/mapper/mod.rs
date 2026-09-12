@@ -2184,6 +2184,7 @@ impl RectStride {
 pub(crate) enum RunCopy<'a> {
     Write(&'a [u8]),
     Read(&'a mut [u8]),
+    ReadDestination(&'a mut dyn reims_vgpu_memory::ReadDestination),
     /// A packed buffer into a strided guest rectangle.
     WriteRect(&'a [u8], RectStride),
     /// A strided guest rectangle into a packed buffer.
@@ -2212,6 +2213,7 @@ impl RunCopy<'_> {
         match self {
             Self::Write(buf) => buf.len(),
             Self::Read(buf) => buf.len(),
+            Self::ReadDestination(buf) => buf.len(),
             Self::WriteRect(_, rect) | Self::ReadRect(_, rect) => rect.span(),
         }
     }
@@ -2255,6 +2257,9 @@ impl RunCopy<'_> {
                     buf.as_mut_ptr().add(buf_off),
                     n,
                 );
+            },
+            Self::ReadDestination(buf) => unsafe {
+                buf.copy_from_raw(buf_off, (host_ptr as *const u8).add(host_off), n);
             },
             Self::WriteRect(buf, rect) => {
                 rect.for_each_piece(buf_off, host_off, n, |packed_off, host_at, len| unsafe {
@@ -2357,6 +2362,7 @@ pub(crate) fn selected_within(
 enum MappingCopy<'a> {
     Write(&'a [u8], &'a PagesVouched),
     Read(&'a mut [u8]),
+    ReadDestination(&'a mut dyn reims_vgpu_memory::ReadDestination),
     ReadRect(&'a mut [u8], RectStride),
 }
 
@@ -2397,6 +2403,7 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     let (mut copy, vouched) = match copy {
         MappingCopy::Write(buf, vouched) => (RunCopy::Write(buf), Some(vouched)),
         MappingCopy::Read(buf) => (RunCopy::Read(buf), None),
+        MappingCopy::ReadDestination(buf) => (RunCopy::ReadDestination(buf), None),
         MappingCopy::ReadRect(buf, rect) => (RunCopy::ReadRect(buf, rect), None),
     };
     if copy.is_write() {
@@ -2647,12 +2654,7 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     // an unnameable set (`None`) settles exactly as before. The page set comes
     // from the same `mapping_reach_pages` the writeback's own destination is
     // named with, so both ends of the comparison are one rule.
-    crate::runtime::writeback_debt::settle_for_mapping(
-        state,
-        host,
-        mapping_id,
-        crate::runtime::render_writeback::SettleSite::MappingBytesRead,
-    );
+    settle_mapping_read(state, host, mapping_id);
     copy_mapping_runs(
         state,
         host,
@@ -2662,6 +2664,55 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
         None,
         "mapping_read",
     )
+}
+
+fn settle_mapping_read<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) {
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
+        crate::runtime::render_writeback::SettleSite::MappingBytesRead,
+    );
+}
+
+/// Read the whole destination through the same settling, mapping, and bounds
+/// checks as `read_mapping_bytes`, certifying initialization only after copying.
+pub(crate) fn read_mapping_into<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    destination: &mut dyn reims_vgpu_memory::ReadDestination,
+) -> bool {
+    if destination.is_empty() {
+        return destination.is_complete();
+    }
+    settle_mapping_read(state, host, mapping_id);
+    if !copy_mapping_runs(
+        state,
+        host,
+        mapping_id,
+        off,
+        MappingCopy::ReadDestination(destination),
+        None,
+        "mapping_read",
+    ) {
+        return false;
+    }
+    if !destination.is_complete() {
+        crate::observe::fail(format!(
+            "mapping_read fail reason=incomplete_destination mid={mapping_id} \
+             initialized={} len={}",
+            destination.initialized_len(),
+            destination.len()
+        ));
+        return false;
+    }
+    true
 }
 
 /// Read a strided rectangle starting at mapping-linear `off` into a packed `dst`.

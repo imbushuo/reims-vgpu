@@ -72,13 +72,15 @@ mod planar_staging {
         use crate::protocol::planar::{BackingFormat, SampleFormat};
         use crate::runtime::compute_exec::metal::{try_stage_planar_sampled, MetalStage};
 
+        const BACKING_PFN: u32 = 0x20;
+
         fn fixture(format: SampleFormat) -> (DeviceState, FakeHost) {
             use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
             let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
             let mut host = FakeHost::new();
             gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
             assert!(state.set_object_list(1, 0, 32));
-            let pfn = 0x20u32;
+            let pfn = BACKING_PFN;
             host.map_range(u64::from(pfn) << PAGE_SHIFT_ARM64E, 1 << PAGE_SHIFT_ARM64E, 0x5a);
             assert!(state.map_surface(5));
             {
@@ -109,9 +111,9 @@ mod planar_staging {
             for format in [SampleFormat::Ycbcr10_420TwoPlane, SampleFormat::Rgb10_420TwoPlane] {
                 let (mut state, mut host) = fixture(format);
                 let image = try_stage_planar_sampled(&mut state, &mut host, 1, 11).unwrap().unwrap();
-                assert_eq!(image.description.format, format);
-                assert_eq!(image.layout.planes[0].offset, 128);
-                assert_eq!(image.layout.planes[1].offset, 2176);
+                assert_eq!(image.description().format, format);
+                assert_eq!(image.layout().planes[0].offset, 128);
+                assert_eq!(image.layout().planes[1].offset, 2176);
                 for p in 0..2 {
                     assert_eq!(image.plane_bytes(p), &[0x5a; 1024], "includes leading/row/extended padding");
                 }
@@ -119,7 +121,22 @@ mod planar_staging {
                     .ok().expect("compute stages the same composite image");
                 assert!(staged.storage_selector.is_none());
                 assert!(staged.bytes.is_empty(), "no fabricated packed image");
-                assert_eq!(staged.rail.planar.unwrap().description.format, format);
+                assert_eq!(staged.rail.planar.unwrap().description().format, format);
+            }
+        }
+
+        #[test]
+        fn planar_staging_snapshots_do_not_alias_guest_pages() {
+            let (mut state, mut host) = fixture(SampleFormat::Rgb10_420TwoPlane);
+            let before = try_stage_planar_sampled(&mut state, &mut host, 1, 11).unwrap().unwrap();
+            host.write_gpa(
+                u64::from(BACKING_PFN) << PAGE_SHIFT_ARM64E,
+                &vec![0x6b; 1 << PAGE_SHIFT_ARM64E],
+            ).unwrap();
+            let after = try_stage_planar_sampled(&mut state, &mut host, 1, 11).unwrap().unwrap();
+            for plane in 0..2 {
+                assert_eq!(before.plane_bytes(plane), &[0x5a; 1024]);
+                assert_eq!(after.plane_bytes(plane), &[0x6b; 1024]);
             }
         }
 

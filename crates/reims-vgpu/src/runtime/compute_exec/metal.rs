@@ -33,10 +33,19 @@ impl RailStage for MetalStage {
         texture_ref: u32,
         description: crate::protocol::planar::TextureDescription,
         layout: crate::protocol::planar::Layout,
-        planes: [Vec<u8>; 2],
+        fill: impl FnOnce([&mut dyn reims_vgpu_memory::ReadDestination; 2])
+            -> Result<(), ComputeStatus>,
     ) -> Result<Self, ComputeStatus> {
-        let image = crate::backend::metal::planar::SampledImage::new(description, layout, planes)
-            .map_err(|reason| ComputeStatus::Unsupported(reason.slug()))?;
+        use crate::backend::metal::planar::{FillError, SampledImage};
+        let device = crate::backend::metal::runtime::system_device()
+            .ok_or(ComputeStatus::NoMetal("metal_planar_device_unavailable"))?;
+        let image = SampledImage::fill(device, description, layout, fill).map_err(|error| {
+            match error {
+                FillError::Layout(reason) => ComputeStatus::Unsupported(reason.slug()),
+                FillError::Native(reason) => ComputeStatus::RailRefused(reason),
+                FillError::Source(reason) => reason,
+            }
+        })?;
         Ok(Self { texture_ref, planar: Some(std::sync::Arc::new(image)) })
     }
 

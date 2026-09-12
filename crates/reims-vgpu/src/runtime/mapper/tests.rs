@@ -1004,9 +1004,68 @@ fn unchanged_pixels_cannot_publish_a_page_plan_refreshed_after_vouch() {
     }
 }
 
+#[test]
+fn mapping_read_certifies_full_packed_and_fragmented_destinations() {
+    use reims_vgpu_memory::{ReadBuffer, ReadDestination};
+    use std::mem::MaybeUninit;
+    for shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        let page_size = 1usize << shift;
+        for packed in [false, true] {
+            for cached in [false, true] {
+                let (mut state, mut host, _, pages) =
+                    replaced_plan_fixture(shift, packed, cached);
+                host.write_gpa(pages[2], &vec![0x63; page_size]).unwrap();
+                host.write_gpa(pages[3], &vec![0x64; page_size]).unwrap();
+                let mut storage = vec![MaybeUninit::uninit(); 2 * page_size - 6];
+                let mut destination = ReadBuffer::new(&mut storage);
+                assert!(read_mapping_into(&mut state, &mut host, 3, 3, &mut destination));
+                let bytes = destination.initialized().unwrap();
+                assert_eq!(&bytes[..page_size - 3], vec![0x63; page_size - 3]);
+                assert_eq!(&bytes[page_size - 3..], vec![0x64; page_size - 3]);
+            }
+        }
+    }
+}
+
+#[test]
+fn mapping_read_failure_cannot_certify_a_partial_destination() {
+    use reims_vgpu_memory::{ReadBuffer, ReadDestination};
+    use std::mem::MaybeUninit;
+    for shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        let page_size = 1usize << shift;
+        let (mut state, inner, _, pages) = replaced_plan_fixture(shift, false, false);
+        let mut host = RefuseAndRebindHost {
+            inner,
+            replacement_entry: None,
+            refused_gpa: Some(pages[3]),
+        };
+        let mut storage = vec![MaybeUninit::uninit(); 2 * page_size];
+        let mut destination = ReadBuffer::new(&mut storage);
+        assert!(!read_mapping_into(&mut state, &mut host, 3, 0, &mut destination));
+        assert_eq!(destination.initialized_len(), page_size);
+        assert!(destination.initialized().is_none());
+    }
+}
+
+#[test]
+fn mapping_read_rejects_short_backing_before_certifying_destination() {
+    use reims_vgpu_memory::{ReadBuffer, ReadDestination};
+    use std::mem::MaybeUninit;
+    for shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        let page_size = 1usize << shift;
+        let (mut state, mut host, _) = span_fixture_with_shift(0x6150, shift, 1);
+        let mut storage = vec![MaybeUninit::uninit(); page_size + 1];
+        let mut destination = ReadBuffer::new(&mut storage);
+        assert!(!read_mapping_into(&mut state, &mut host, 3, 0, &mut destination));
+        assert_eq!(destination.initialized_len(), 0);
+        assert!(destination.initialized().is_none());
+    }
+}
+
 struct RefuseAndRebindHost {
     inner: FakeHost,
     replacement_entry: Option<u32>,
+    refused_gpa: Option<u64>,
 }
 
 impl HostMemory for RefuseAndRebindHost {
@@ -1033,6 +1092,9 @@ impl HostOps for RefuseAndRebindHost {
     }
 
     fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
+        if self.refused_gpa.is_some_and(|gpa| gpas.contains(&gpa)) {
+            return None;
+        }
         if let Some(entry) = self.replacement_entry.take() {
             self.inner
                 .write_gpa(TABLE_GPA, &entry.to_le_bytes())
@@ -1065,6 +1127,7 @@ fn mapping_copy_refuses_page_plan_refreshed_after_contig_refusal() {
         let mut host = RefuseAndRebindHost {
             inner,
             replacement_entry: Some((new_pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID),
+            refused_gpa: None,
         };
         let capture = crate::observe::sink::FailCapture::start();
         assert!(!write_mapping_bytes(

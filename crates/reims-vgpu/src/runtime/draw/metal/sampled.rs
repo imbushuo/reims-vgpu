@@ -25,7 +25,7 @@ impl SampledUpload {
     pub fn byte_len(&self) -> u64 {
         match self {
             Self::Packed { bytes, .. } => bytes.len() as u64,
-            Self::Planar(image) => image.layout.planes.iter().map(|plane| plane.size).sum(),
+            Self::Planar(image) => image.layout().planes.iter().map(|plane| plane.size).sum(),
         }
     }
 
@@ -172,9 +172,9 @@ mod tests {
                 panic!("whole-surface samples must not become packed RGBA8");
             };
             assert_eq!(*slot, REIMS_VGPU_BINDING_TEXTURE_BASE + 5);
-            assert_eq!(image.description.format, format);
-            assert_eq!(image.layout.planes[0].offset, 128);
-            assert_eq!(image.layout.planes[1].offset, 2176);
+            assert_eq!(image.description().format, format);
+            assert_eq!(image.layout().planes[0].offset, 128);
+            assert_eq!(image.layout().planes[1].offset, 2176);
             assert!(lifetime.upgrade().is_some());
             drop(binding);
             assert!(lifetime.upgrade().is_none());
