@@ -55,6 +55,46 @@ and stops the host window before destroying the backend and its notification tar
 The shared worker's scheduling, reset, and teardown tests are in QEMU's
 `tests/unit/test-reims-vgpu-worker.c`.
 
+IOSurface-mapper register reads use independent authoritative atomics rather than
+the render-state mutex. MMIO writes enter a FIFO admission queue; only the
+metadata-only availability wait releases BQL. Capture, KVA access, mapping
+application, consumer advancement, and IRQ publication still execute synchronously
+on the originating vCPU with BQL held. Queued writes have priority over later GPU
+tranches, and the final admission rearms a worker whose earlier wake was consumed.
+The vCPU wait counters now include these BQL-free admission waits; they are not
+measurements of how long BQL was blocked.
+
+The IOSFC region uses lockless-I/O enrollment with explicit BQL scoping and
+Rust-owned reentry refusal. Waiting tickets retain neither the backend nor its
+HostOps context. Reset and destruction cancel tickets without waiting for vCPUs
+to reacquire BQL; the C callback retains the QOM allocation through that interval.
+This admission interface is ABI **v21**: rebuild the Rust static library and QEMU
+shim together.
+
+## Metal render passes and redraws
+
+Compatible color draws retain ordinary and MRT attachments in the render-pass
+owner and share a Metal command buffer and render encoder. Intermediate draws do
+not read color pixels back to the CPU or upload them again for the next draw.
+Staged inputs retain their own contents through GPU completion; keeping a Metal
+object alive alone does not protect its contents from later CPU writes.
+
+Queries, writable/native resource bindings, attachment changes, and dependencies
+that need CPU-visible results complete outstanding work synchronously. Unknown or
+overlapping input footprints conservatively materialize prior output.
+Depth/stencil draws retain the synchronous fallback and carry intermediate
+contents forward. These are semantic boundaries, not frame-time or draw-count
+caps. Retained input memory therefore scales with the contents of a batch.
+
+The `metal_submissions`, `metal_batch_encoder_reuse`,
+`metal_batch_deferred_draws`, and `metal_seed_from_pass` census counters distinguish
+actual batching from attachment reuse alone. Readback and dependency counters
+identify remaining materialization costs.
+
+Scanout keeps its initialized scratch buffer between captures, avoiding redundant
+zero-filling at unchanged dimensions. Existing frame-push coalescing and display
+refresh scheduling are unchanged.
+
 ## Run
 
 ```sh

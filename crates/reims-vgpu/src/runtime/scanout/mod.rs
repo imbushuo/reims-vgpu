@@ -230,18 +230,13 @@ pub fn capture_present_frame(
     }
     state.present.full_captures = state.present.full_captures.wrapping_add(1);
     maybe_log_capture_sampling(state);
-    // Attribute this capture's lock hold to the tranche `capture_us` bucket (it
-    // runs on the present drain, not a render draw). Every real return below
-    // notes the elapsed time so a capture-bound hitch stops hiding in `other_us`.
     // Recycle the warm double-buffered scratch instead of a fresh `vec![0u8;
     // need]` per present (which zeroes 8 MiB and faults fresh anon pages every
-    // time, only to overwrite them). `resize` is a no-op at steady geometry;
-    // every byte in `[0, need)` is fully written below (host_cache
-    // `copy_from_slice`, `paint_mapping` row fill, or the reuse-store copy), so
-    // no pre-zero is needed. On failure `buf` returns to `capture_scratch`
-    // unchanged, leaving the prior `frame_bgra` retain intact (keep-prior).
+    // time, only to overwrite them). Keep its initialized length: `resize` is
+    // then a no-op at steady geometry. Both capture sources replace the whole
+    // frame, so clearing first only adds a full-frame zero fill. On failure
+    // the prior `frame_bgra` retain stays intact (keep-prior).
     let mut buf = std::mem::take(&mut state.present.capture_scratch);
-    buf.clear();
     buf.resize(need, 0);
     // Prefer host render-cache when encode/clear wrote it (Linux discrete GPU
     // path — kb tahoe-x86-host-reims_vgpu §8.5); otherwise the resident below.

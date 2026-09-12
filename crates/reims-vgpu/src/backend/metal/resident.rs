@@ -494,6 +494,13 @@ pub fn published(key: &ResidentColorKey, content_gen: u64) {
     REGISTRY.lock().publish(key, content_gen);
 }
 
+/// Reinstall the pass owner's completed texture before publishing its Store.
+/// CPU-materialization hazards can invalidate the allocation cache mid-pass;
+/// that never revokes the guest encoder's separate ownership of its contents.
+pub(crate) fn retain_completed(key: ResidentColorKey, texture: &Texture) {
+    REGISTRY.lock().admit(key, texture.clone(), key.bytes(4));
+}
+
 /// Drop every retained target for `mapping_id`.
 ///
 /// For a surface the guest has unmapped or this device has retired: the pixels

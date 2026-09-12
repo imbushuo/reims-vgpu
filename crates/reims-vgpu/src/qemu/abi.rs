@@ -94,8 +94,9 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-/// v20 gives `map_pages` a structured per-call failure output.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 20;
+/// v21 replaces IOSFC writes with ordered begin/try/wait/finish admission.
+/// Only wait may run without BQL; tickets retain no HostOps context.
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 21;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -120,6 +121,9 @@ pub const REIMS_VGPU_QEMU_ERR_STATE: c_int = 2;
 pub const REIMS_VGPU_QEMU_ERR_PANIC: c_int = 3;
 /// pop_action: queue empty (not a hard failure).
 pub const REIMS_VGPU_QEMU_EMPTY: c_int = 4;
+pub const REIMS_VGPU_QEMU_BUSY: c_int = 5;
+pub const REIMS_VGPU_QEMU_CANCELLED: c_int = 6;
+pub const REIMS_VGPU_QEMU_REENTRANT: c_int = 7;
 
 /// Why `guest_ram_regions` refused, when it did. Negative so one return carries
 /// both a span count and a named refusal.
@@ -458,27 +462,72 @@ pub unsafe extern "C" fn reims_vgpu_qemu_iosfc_read(
     )
 }
 
-/// Iosfc MMIO write (may schedule QEMU BH via HostOps).
+fn iosfc_status(status: crate::device::IosfcAdmissionStatus) -> c_int {
+    use crate::device::IosfcAdmissionStatus as S;
+    match status {
+        S::Ready => REIMS_VGPU_QEMU_OK,
+        S::Busy => REIMS_VGPU_QEMU_BUSY,
+        S::Cancelled => REIMS_VGPU_QEMU_CANCELLED,
+        S::Reentrant => REIMS_VGPU_QEMU_REENTRANT,
+        S::WrongThread => REIMS_VGPU_QEMU_ERR_STATE,
+    }
+}
+
+/// Begin an ordered synchronous write on its originating vCPU, with BQL held.
 #[no_mangle]
-pub unsafe extern "C" fn reims_vgpu_qemu_iosfc_write(
+pub unsafe extern "C" fn reims_vgpu_qemu_iosfc_begin_write(
     handle: u64,
     offset: u64,
     data: u64,
     size: u32,
+    out_ticket: *mut u64,
 ) -> c_int {
     unwind_safe(
-        "reims_vgpu_qemu_iosfc_write",
+        "reims_vgpu_qemu_iosfc_begin_write",
         || {
-            if handle == 0 {
+            if handle == 0 || out_ticket.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
             }
-            if device_iosfc_write(handle, offset, data, size) {
-                REIMS_VGPU_QEMU_OK
-            } else {
-                REIMS_VGPU_QEMU_ERR_STATE
+            unsafe { *out_ticket = 0 };
+            match crate::device::device_iosfc_begin(handle, offset, data, size) {
+                Ok(ticket) => {
+                    unsafe { *out_ticket = ticket };
+                    REIMS_VGPU_QEMU_OK
+                }
+                Err(status) => iosfc_status(status),
             }
         },
         REIMS_VGPU_QEMU_ERR_PANIC,
+    )
+}
+
+/// Try the ticket with BQL held. Busy makes no protocol or HostOps changes.
+#[no_mangle]
+pub extern "C" fn reims_vgpu_qemu_iosfc_write(ticket: u64) -> c_int {
+    unwind_safe(
+        "reims_vgpu_qemu_iosfc_write",
+        || iosfc_status(device_iosfc_write(ticket)),
+        REIMS_VGPU_QEMU_ERR_PANIC,
+    )
+}
+
+/// Wait without BQL, on the originating thread. No HostOps or device retention.
+#[no_mangle]
+pub extern "C" fn reims_vgpu_qemu_iosfc_wait(ticket: u64) -> c_int {
+    unwind_safe(
+        "reims_vgpu_qemu_iosfc_wait",
+        || iosfc_status(crate::device::device_iosfc_wait(ticket)),
+        REIMS_VGPU_QEMU_ERR_PANIC,
+    )
+}
+
+/// Release every begun ticket, including cancellation/errors, with BQL held.
+#[no_mangle]
+pub extern "C" fn reims_vgpu_qemu_iosfc_finish(ticket: u64) {
+    unwind_safe(
+        "reims_vgpu_qemu_iosfc_finish",
+        || crate::device::device_iosfc_finish(ticket),
+        (),
     )
 }
 
@@ -947,6 +996,9 @@ mod tests {
             ("REIMS_VGPU_QEMU_ERR_STATE", REIMS_VGPU_QEMU_ERR_STATE),
             ("REIMS_VGPU_QEMU_ERR_PANIC", REIMS_VGPU_QEMU_ERR_PANIC),
             ("REIMS_VGPU_QEMU_EMPTY", REIMS_VGPU_QEMU_EMPTY),
+            ("REIMS_VGPU_QEMU_BUSY", REIMS_VGPU_QEMU_BUSY),
+            ("REIMS_VGPU_QEMU_CANCELLED", REIMS_VGPU_QEMU_CANCELLED),
+            ("REIMS_VGPU_QEMU_REENTRANT", REIMS_VGPU_QEMU_REENTRANT),
         ] {
             assert_eq!(
                 header_define_i32(name),

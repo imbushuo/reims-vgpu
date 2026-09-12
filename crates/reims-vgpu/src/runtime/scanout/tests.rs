@@ -526,6 +526,8 @@ fn capture_recycles_scratch_and_keeps_prior_retain_on_failure() {
         16,
         "prior retain recycled as warm scratch of the frame size"
     );
+    assert_eq!(state.present.capture_scratch.as_slice(), &frame_a);
+    let scratch_ptr = state.present.capture_scratch.as_ptr();
 
     // Capture failure (unmapped surface) must return the scratch untouched
     // and leave the frame_b retain intact.
@@ -540,9 +542,22 @@ fn capture_recycles_scratch_and_keeps_prior_retain_on_failure() {
         "failed capture must not disturb the prior retain"
     );
     assert_eq!(
-        state.present.capture_scratch.len(),
-        16,
-        "failed capture recycles its (untouched) scratch"
+        state.present.capture_scratch.as_slice(),
+        &frame_a,
+        "a same-size failed capture must not zero the warm scratch"
+    );
+    assert_eq!(state.present.capture_scratch.as_ptr(), scratch_ptr);
+
+    assert!(capture_present_frame(&mut state, mid, 2, 2, gen_b));
+    assert_eq!(
+        state.present.frame_bgra.as_ptr(),
+        scratch_ptr,
+        "the next successful capture reuses the initialized allocation"
+    );
+    assert_eq!(
+        state.present.frame_bgra.as_slice(),
+        &frame_b,
+        "the capture overwrites every byte of the prior scratch contents"
     );
 }
 

@@ -6796,22 +6796,22 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
 /// with `cpu_memory_rw_debug(first_cpu)` deadlocks against MMIO holding
 /// `DEVICES` (see reims-vgpu-mmio.c `read_kva`).
 pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    let producer = state.iosfc.producer;
-    let mut consumer = state.iosfc.consumer;
+    let producer = state.iosfc.producer();
+    let mut consumer = state.iosfc.consumer();
     if producer == consumer {
         state.pending.iosfc = false;
         return;
     }
 
     // Process requests between consumer and producer when ring is programmed.
-    if state.iosfc.ring_base != 0 && producer > consumer {
+    if state.iosfc.ring_base() != 0 && producer > consumer {
         let start = consumer;
         let end = producer;
         for idx in start..end {
             let entry_off = (idx as u64) * MAPPER_REQUEST_ENTRY_LEN as u64;
             let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
             if host
-                .read_gpa(state.iosfc.ring_base + entry_off, &mut e)
+                .read_gpa(state.iosfc.ring_base() + entry_off, &mut e)
                 .is_err()
             {
                 break;
@@ -6879,8 +6879,8 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
         consumer = producer;
     }
 
-    state.iosfc.consumer = consumer;
-    if state.iosfc.consumer == state.iosfc.producer {
+    state.iosfc.set_consumer(consumer);
+    if state.iosfc.consumer() == state.iosfc.producer() {
         host.enqueue(HostAction::irq_iosfc());
     }
     state.pending.iosfc = false;
@@ -7741,7 +7741,7 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
             published = true;
         }
     }
-    if state.iosfc.consumer != state.iosfc.producer {
+    if state.iosfc.consumer() != state.iosfc.producer() {
         state.pending.iosfc = true;
         published = true;
     }

@@ -116,7 +116,7 @@ impl From<StencilAttachment> for HostAttachment {
 
 /// A host-side depth or stencil attachment buffer: the bytes Metal loads, and
 /// where a STORE puts them back.
-pub(super) struct HostDepthStencil {
+pub(crate) struct HostDepthStencil {
     pub(super) data: Vec<u8>,
     /// Mapper-ref-texture mapping behind the attachment's texture, or 0 when the texture
     /// resolved to none — a STORE has nowhere to go in that case.

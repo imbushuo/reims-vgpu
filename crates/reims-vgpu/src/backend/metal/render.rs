@@ -14,7 +14,7 @@ use crate::backend::metal::mtl_enum;
 use crate::backend::metal::raw_metal::{
     command_buffer_error_description, render_reflection_sampler_mask,
 };
-use crate::backend::metal::runtime::{new_buffer_from_host, system_device, thread_queue};
+use crate::backend::metal::runtime::{system_device, thread_queue};
 use crate::backend::metal::samplers::{make_default_sampler, make_explicit_sampler};
 use crate::backend::metal::util::{
     bytes_of, clear_err, sampler_index, set_err, texture_index, valid_buffer_binding, ErrOut,
@@ -23,10 +23,147 @@ use crate::backend::metal::util::{
 use crate::backend::render_pso_key::{RenderPsoKey, RenderPsoLookup};
 use crate::protocol::vertex_step::{step_rate_in_contract, MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE};
 use crate::runtime::decode::resource::MTL_COLOR_WRITE_MASK_ALL;
-use foreign_types::ForeignType;
+use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::*;
 use reims_vgpu_protocol::extent::tight_image_bytes;
 use std::ptr;
+
+// Draw staging vectors disappear before a deferred batch is submitted. Copy
+// even page-aligned inputs; retaining a no-copy MTLBuffer would retain only the
+// pointer, not the caller's allocation or its contents.
+fn new_buffer_from_host(device: &Device, data: *const u8, len: usize) -> Option<Buffer> {
+    if data.is_null() || len == 0 {
+        return None;
+    }
+    unsafe {
+        super::raw_metal::new_buffer_with_data(
+            device, data.cast(), len as u64, MTLResourceOptions::StorageModeShared,
+        )
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RenderBatch {
+    command: Option<CommandBuffer>,
+    encoder: Option<RenderCommandEncoder>,
+    buffers: Vec<Buffer>,
+    textures: Vec<Texture>,
+    vertex_buffer_slots: Vec<u64>,
+    fragment_buffer_slots: Vec<u64>,
+    vertex_texture_slots: Vec<u64>,
+    fragment_texture_slots: Vec<u64>,
+    attachments: Vec<(u64, usize)>,
+    failed: bool,
+    #[cfg(test)]
+    pub(crate) submissions: usize,
+    #[cfg(test)]
+    pub(crate) readbacks: usize,
+}
+
+impl RenderBatch {
+    pub(crate) fn pending(&self) -> bool {
+        self.command.is_some()
+    }
+
+    pub(crate) fn encoder(
+        &mut self, device: &Device, pass: &RenderPassDescriptorRef,
+    ) -> Result<RenderCommandEncoder, Status> {
+        let attachments: Vec<_> = (0..REIMS_VGPU_METAL_MAX_COLOR_RTS as u64)
+            .filter_map(|slot| {
+                pass.color_attachments().object_at(slot)?.texture()
+                    .map(|texture| (slot, texture.as_ptr() as usize))
+            }).collect();
+        let reload = attachments.iter().any(|&(slot, _)| {
+            pass.color_attachments().object_at(slot).unwrap().load_action() as u64 != MTLLoadAction::Load as u64
+        });
+        if self.pending() && (self.attachments != attachments || reload) {
+            crate::runtime::drain::note_store_route("metal_batch_attachment_boundary");
+            self.finish((ptr::null_mut(), 0))?;
+        }
+        if let Some(encoder) = &self.encoder {
+            crate::runtime::drain::note_store_route("metal_batch_encoder_reuse");
+            return Ok(encoder.clone());
+        }
+        let command = super::raw_metal::new_command_buffer(&thread_queue(device))
+            .ok_or_else(|| Status::execute("metal_render_command_buffer_unavailable"))?
+            .to_owned();
+        let encoder = super::raw_metal::new_render_command_encoder(&command, pass)
+            .ok_or_else(|| Status::execute("metal_render_encoder_unavailable"))?
+            .to_owned();
+        self.command = Some(command);
+        self.encoder = Some(encoder.clone());
+        self.attachments = attachments;
+        crate::runtime::drain::note_store_route("metal_batch_encoder_begin");
+        Ok(encoder)
+    }
+
+    fn end_encoding(&mut self) {
+        if let Some(encoder) = self.encoder.take() {
+            encoder.end_encoding();
+        }
+    }
+
+    pub(crate) fn finish(&mut self, err: ErrOut<'_>) -> Result<(), Status> {
+        if self.failed {
+            return Err(Status::execute("metal_render_command_buffer_failed"));
+        }
+        self.end_encoding();
+        let Some(command) = self.command.take() else { return Ok(()); };
+        let _span = crate::runtime::chain_phase::CostSpan::new("metal_commit_us");
+        crate::runtime::drain::note_store_route("metal_submissions");
+        #[cfg(test)]
+        { self.submissions += 1; }
+        command.commit();
+        command.wait_until_completed();
+        self.buffers.clear();
+        self.textures.clear();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            self.failed = true;
+            set_err(err, format!("Metal command buffer failed: {}",
+                command_buffer_error_description(&command)));
+            return Err(Status::execute("metal_render_command_buffer_failed"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RenderBatch {
+    fn drop(&mut self) {
+        if self.pending() {
+            if let Err(status) = self.finish((ptr::null_mut(), 0)) {
+                crate::observe::Emit::refusal("metal_render_batch_drop", &status).unwrap().fail();
+            }
+        }
+    }
+}
+
+fn reset_draw_state(encoder: &RenderCommandEncoderRef, batch: &mut RenderBatch) {
+    encoder.set_cull_mode(MTLCullMode::None);
+    encoder.set_front_facing_winding(MTLWinding::Clockwise);
+    encoder.set_triangle_fill_mode(MTLTriangleFillMode::Fill);
+    encoder.set_depth_clip_mode(MTLDepthClipMode::Clip);
+    encoder.set_depth_bias(0.0, 0.0, 0.0);
+    encoder.set_blend_color(0.0, 0.0, 0.0, 0.0);
+    // metal-rs's setter cannot spell Metal's documented nil reset.
+    unsafe {
+        use objc::{msg_send, sel, sel_impl};
+        let _: () = msg_send![encoder, setDepthStencilState: ptr::null_mut::<objc::runtime::Object>()];
+    }
+    encoder.set_stencil_reference_value(0);
+    encoder.set_visibility_result_mode(MTLVisibilityResultMode::Disabled, 0);
+    for index in batch.vertex_buffer_slots.drain(..) {
+        encoder.set_vertex_buffer(index, None, 0);
+    }
+    for index in batch.fragment_buffer_slots.drain(..) {
+        encoder.set_fragment_buffer(index, None, 0);
+    }
+    for index in batch.vertex_texture_slots.drain(..) {
+        encoder.set_vertex_texture(index, None);
+    }
+    for index in batch.fragment_texture_slots.drain(..) {
+        encoder.set_fragment_texture(index, None);
+    }
+}
 
 #[cfg(test)]
 #[path = "render_texture_tests.rs"]
@@ -1673,38 +1810,12 @@ fn configure_stencil_attachment(
     Ok(Some(texture))
 }
 
-/// How one colour attachment's texture is obtained, for an attachment this rail
-/// retains across draws.
-///
-/// Three states and no fourth, because the pair this replaces — a texture
-/// handle beside a "does it hold the prior content" flag — could say
-/// "no texture, and it holds the prior content", which is a pass loading
-/// whatever an uninitialised allocation contains.
-pub enum RetainedColorTexture {
-    /// The registry held none. One is created here and registered under the key,
-    /// and `seed_rgba8` is uploaded into it.
-    Absent,
-    /// The registry's texture, whose pixels are *not* this pass's prior content.
-    /// The allocation is reused and `seed_rgba8` is uploaded into it.
-    Allocation(Texture),
-    /// The registry's texture, already holding this pass's prior content.
-    /// Nothing is allocated and nothing is uploaded — which is the whole point
-    /// of retaining it.
-    Prior(Texture),
-}
-
-/// This rail's retention of one colour attachment's texture across draws.
-pub struct RetainedColorTarget {
-    /// Where the texture is put back, so the next draw into this attachment can
-    /// find it.
-    pub key: crate::backend::metal::resident::ResidentColorKey,
-    pub texture: RetainedColorTexture,
-}
-
 /// The owner of an MRT attachment's native storage.
 pub enum ColorTarget<'a> {
-    Guest(Option<RetainedColorTarget>),
+    #[cfg(test)]
+    Transient,
     Memoryless(&'a super::render_pass::PassLocalColorTarget),
+    PassLocal(&'a super::render_pass::PassLocalColorTarget),
 }
 
 /// One color render target for MRT encode (host RGBA8 seed/readback by default).
@@ -1777,19 +1888,16 @@ impl ColorRt<'_> {
     /// silently degrade to a clear.
     fn prior_content_present(&self) -> bool {
         match &self.target {
-            ColorTarget::Memoryless(target) => target.initialized(),
-            ColorTarget::Guest(retained) => self.seed_rgba8.is_some()
-            || matches!(retained,
-                Some(RetainedColorTarget {
-                    texture: RetainedColorTexture::Prior(_),
-                    ..
-                })
-            ),
+            ColorTarget::Memoryless(target) | ColorTarget::PassLocal(target) =>
+                target.initialized() || self.seed_rgba8.is_some()
+                    || target.resident.as_ref().is_some_and(|plan| plan.holds_prior),
+            #[cfg(test)]
+            ColorTarget::Transient => self.seed_rgba8.is_some(),
         }
     }
 }
 
-pub(super) fn new_color_target(
+pub(crate) fn new_color_target(
     device: &DeviceRef,
     format: MTLPixelFormat,
     width: u32,
@@ -2000,94 +2108,16 @@ mod attachment_decline_tests {
     }
 }
 
-/// Multi-render-target encode: one Metal pass with color attachments at given slots.
+/// Encode one draw into its guest pass's native batch.
 ///
-/// # This encodes, submits and **blocks**, once per draw
-///
-/// Read the tail of this function before proposing anything about the arm64
-/// pathway's throughput. One call is one `MTLCommandBuffer`, one
-/// `MTLRenderCommandEncoder`, one `commit`, and one `waitUntilCompleted` — and
-/// [`crate::runtime::draw`] calls it once per decoded draw. So a guest frame of
-/// N draws is N GPU round trips with the drain thread stopped inside each one,
-/// and no draw's encoding overlaps any other draw's execution.
-///
-/// The Vulkan arm decoding the same guest stream does none of those three. It
-/// batches: a driven macos-13 sustained-animation boot reads
-/// `engine_delta batch_flush_draws / batch_flushes` = **14.6 draws per command
-/// buffer**, submitted once, with no wait at all on the recording thread (its
-/// `draw_phase wait_us` is 0). It still opens a render pass per draw, which is
-/// its own known cost — see `PassObstacles` in
-/// `crate::backend::vulkan::engine::exec` — but that is one of the three gaps
-/// here and the smallest.
-///
-/// # The bar is divided now, and the ranking it had was wrong
-///
-/// This paragraph used to say the three costs could not be sized because "this
-/// repository has no Apple host to boot", and ranked them by argument:
-/// `waitUntilCompleted` first, the per-draw command buffer second, the per-draw
-/// pass third. The six [`crate::runtime::chain_phase::CostSpan`]s below divide
-/// the bar, and on a driven macos-13 Metal boot (2 480 chains, pointer-driven at
-/// the login window) they read:
-///
-/// ```text
-/// engine_us                    5413 us/draw   (chain_phase)
-///   metal_rt_seed_us           1670 us/draw   31 %   replace_region, whole attachment
-///   metal_commit_us            1424 us/draw   26 %   commit + waitUntilCompleted
-///   metal_readback_us          1041 us/draw   19 %   getBytes, whole attachment
-///   metal_encode_us             769 us/draw   14 %   encoder open → endEncoding
-///   metal_pso_us                323 us/draw    6 %   both functions + PSO lookup
-///   metal_rt_alloc_us            72 us/draw    1 %   the fresh MTLTexture itself
-///   metal_pass_us                 5 us/draw    0 %
-/// ```
-///
-/// The six sum to 98 % of `engine_us`; the remainder is the argument validation
-/// above them and the depth/stencil readback below. Check that sum before
-/// believing any single bar.
-///
-/// **The round trip is not the largest cost — moving the attachment across the
-/// CPU/GPU boundary is.** `metal_rt_seed_us` + `metal_readback_us` +
-/// `metal_rt_alloc_us` is 2 783 us a draw, 51 % of the bar, and all three exist
-/// for one reason: the colour target is *fresh every draw*, so its prior
-/// contents must be uploaded into it and its result read back out. A resident
-/// target keyed on the attachment's identity removes all three at once, and it
-/// removes most of `store_us` (3 620 us a draw in the same boot) with them,
-/// because that is the CPU writeback of the same pixels. The seams for it are
-/// already cut: [`crate::backend::Backend`]'s `gva_resident`,
-/// `gva_witness_key`, `pay_gva_writeback`, `pay_surface_writeback` and
-/// `abandon_resident`, driven by the neutral
-/// [`crate::runtime::writeback_debt`] ledger, which the Vulkan rail already
-/// uses and this one does not implement.
-///
-/// So the order to attack them in is:
-///
-/// 1. **The fresh target.** Measured at 51 % of this bar plus most of the Store
-///    phase, and it is a change to what this rail *retains*, not to when it
-///    submits.
-/// 2. **The `waitUntilCompleted`.** 26 %. A round trip is latency the CPU
-///    cannot fill, and it serialises the whole device: nothing else in this
-///    process is encoding while it blocks. Removing it means the callers that
-///    read a result out of the pass — the visibility query below, and the
-///    writeback [`crate::runtime::draw`] performs on the strength of this having
-///    completed — need a completion handler or a fence instead of a return
-///    value, which is the real work. Note that a resident target removes the
-///    readback that is *why* this wait exists, so item 1 is also what makes
-///    item 2 reachable.
-/// 3. **The per-draw command buffer.** Metal's own guidance is tens to hundreds
-///    of encodes per buffer; one draw per buffer pays the driver's per-commit
-///    cost at draw rate. Part of `metal_commit_us` and part of
-///    `metal_encode_us`; the two are not separated because the fix is the same
-///    change.
-/// 4. **The per-draw pass.** `metal_pass_us` is 5 us a draw of *descriptor*
-///    work, which is not the cost — Apple Silicon is a tile-based deferred
-///    renderer, so each pass loads the attachment into tile memory and stores it
-///    back out at `endEncoding` whatever the draw touched, and that lands inside
-///    `metal_encode_us` and `metal_commit_us` rather than in a bar of its own.
-///
-/// None of the three is a decode or contract change. The guest stream is the
-/// same; only when this device chooses to end an encoder and hand it to the GPU
-/// would move.
+/// Deferred calls copy staging inputs and retain native allocations, but return
+/// no CPU results. Compatible calls reuse the encoder and command buffer.
+/// Queries, depth/stencil's CPU fallback, native borrowed/writable bindings and
+/// final Store complete synchronously before reading or publishing results.
+/// The existing phase clocks and `metal_submissions`/readback census measure
+/// actual work, including dependency materializations outside this function.
 #[allow(clippy::too_many_arguments)]
-pub fn render_core_mrt(
+pub(crate) fn render_core_mrt(
     vert_mtlb: &[u8],
     frag_mtlb: &[u8],
     width: u32,
@@ -2114,6 +2144,8 @@ pub fn render_core_mrt(
     colors: &mut [ColorRt<'_>],
     visibility: Option<&mut VisibilityQuery>,
     err: ErrOut<'_>,
+    batch: &mut RenderBatch,
+    defer: bool,
 ) -> Status {
     use crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_COLOR_RTS;
     // Widened here rather than at the call, so the `as usize` on each of these
@@ -2334,6 +2366,15 @@ pub fn render_core_mrt(
             return status;
         }
     }
+    let immediate = visibility.is_some() || depth_attachment.is_some() || stencil_attachment.is_some()
+        || vertex_images.iter().chain(images).any(|image| matches!(image, ReimsVgpuSampledImage::Native { .. }))
+        || texture_usages.vertex.iter().chain(&texture_usages.fragment).any(|usage| usage.access.writes());
+    if immediate {
+        if let Err(status) = batch.finish(err) {
+            return status;
+        }
+    }
+    let defer = defer && !immediate && !colors.iter().any(|color| color.out_rgba8.is_some());
     drop(span_pso);
 
     let mut retained_tex: Vec<Texture> = Vec::new();
@@ -2348,8 +2389,12 @@ pub fn render_core_mrt(
         // [`crate::backend::metal::resident`] for the one claim that makes
         // loading from a retained one safe.
         let (target, holds_prior) = match &c.target {
-            ColorTarget::Memoryless(target) => (target.texture().clone(), target.initialized()),
-            ColorTarget::Guest(None) => {
+            ColorTarget::Memoryless(target) | ColorTarget::PassLocal(target) => (
+                target.texture().clone(),
+                target.initialized() || target.resident.as_ref().is_some_and(|p| p.holds_prior),
+            ),
+            #[cfg(test)]
+            ColorTarget::Transient => {
                 let Some(target) = new_color_target(device, mtl_fmt, width, height, MTLStorageMode::Shared)
                 else {
                     return Status::execute("metal_render_color_target_alloc_failed")
@@ -2359,25 +2404,12 @@ pub fn render_core_mrt(
                 };
                 (target, false)
             }
-            ColorTarget::Guest(Some(retained)) => match &retained.texture {
-                RetainedColorTexture::Prior(texture) => (texture.clone(), true),
-                RetainedColorTexture::Allocation(texture) => (texture.clone(), false),
-                RetainedColorTexture::Absent => {
-                    let Some(target) = crate::backend::metal::resident::create(
-                        device,
-                        &retained.key,
-                        mtl_fmt,
-                        bpp,
-                    ) else {
-                        return Status::execute("metal_render_color_target_alloc_failed")
-                            .field("slot", slot)
-                            .field("width", width)
-                            .field("height", height);
-                    };
-                    (target, false)
-                }
-            },
         };
+        if target.width() != u64::from(width) || target.height() != u64::from(height)
+            || target.pixel_format() != mtl_fmt
+        {
+            return Status::args("metal_render_pass_target_geometry").field("slot", slot);
+        }
         drop(span_alloc);
         // Archive reims_vgpu_backend_metal: upload target_rgba8 before Load
         // (fresh RT every job; NULL seed → Clear invent below).
@@ -2505,16 +2537,26 @@ pub fn render_core_mrt(
     drop(span_pass);
 
     let span_encode = crate::runtime::chain_phase::CostSpan::new("metal_encode_us");
-    let queue = thread_queue(device);
-    let Some(command_buffer) = crate::backend::metal::raw_metal::new_command_buffer(&queue) else {
-        return Status::execute("metal_render_command_buffer_unavailable");
+    let encoder_owner = match batch.encoder(device, pass) {
+        Ok(encoder) => encoder,
+        Err(status) => return status,
     };
-    let command_buffer = command_buffer.to_owned();
-    let Some(encoder) =
-        crate::backend::metal::raw_metal::new_render_command_encoder(&command_buffer, pass)
-    else {
-        return Status::execute("metal_render_encoder_unavailable");
-    };
+    // Error arms below end this draw's encoder. Only successful deferred draws
+    // return an open encoder to the batch; refusal then submits the closed one.
+    batch.encoder.take();
+    let encoder = &*encoder_owner;
+    // A fresh encoder used to supply these defaults implicitly. Reusing it must
+    // not leak bindings or optional raster state from an earlier record.
+    reset_draw_state(encoder, batch);
+    batch.vertex_buffer_slots.extend(attr_slots.iter().map(|slot| slot.index));
+    batch.vertex_buffer_slots.extend(buffers.iter().map(|buffer| u64::from(buffer.binding)));
+    batch.fragment_buffer_slots.extend(frag_buffers.iter().map(|buffer| u64::from(buffer.binding)));
+    batch.vertex_texture_slots.extend(vertex_images.iter().filter_map(|image| {
+        texture_index(image.binding()).map(|index| index as u64)
+    }));
+    batch.fragment_texture_slots.extend(images.iter().filter_map(|image| {
+        texture_index(image.binding()).map(|index| index as u64)
+    }));
     encoder.set_render_pipeline_state(&pso);
     if let Some(mode) = visibility_mode {
         encoder.set_visibility_result_mode(mode, 0);
@@ -2777,21 +2819,19 @@ pub fn render_core_mrt(
         encoder.draw_primitives(prim, first_vertex as u64, vertex_count as u64);
     }
 
+    batch.buffers.extend(attr_slots.into_iter().map(|slot| slot.buffer));
+    batch.buffers.extend(retained_buf);
+    batch.textures.extend(retained_tex);
+    if defer {
+        batch.encoder = Some(encoder_owner);
+        crate::runtime::drain::note_store_route("metal_batch_deferred_draws");
+        return Status::OK;
+    }
     encoder.end_encoding();
     drop(span_encode);
 
-    // One command buffer, one pass, one blocking round trip, per decoded draw.
-    // Item 1 of the ranking in this function's own doc, and the only one of the
-    // three whose cost is a latency the CPU cannot fill rather than work it
-    // could do faster.
-    let span_commit = crate::runtime::chain_phase::CostSpan::new("metal_commit_us");
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
-    drop(span_commit);
-    if command_buffer.status() == MTLCommandBufferStatus::Error {
-        let detail = command_buffer_error_description(&command_buffer);
-        set_err(err, format!("Metal command buffer failed: {detail}"));
-        return Status::execute("metal_render_command_buffer_failed");
+    if let Err(status) = batch.finish(err) {
+        return status;
     }
 
     // Read after the completion check, not before it: a command buffer that
@@ -2808,6 +2848,8 @@ pub fn render_core_mrt(
             if out.is_empty() {
                 continue;
             }
+            #[cfg(test)]
+            { batch.readbacks += 1; }
             let (slot, target, bpp) = &color_textures[i];
             let _ = slot;
             let target_len = (width as usize)
@@ -2913,6 +2955,9 @@ pub fn render_core_mrt(
                     region,
                     0,
                 );
+                crate::runtime::drain::note_store_route("metal_depth_readbacks");
+                crate::runtime::drain::note_store_route_n("metal_depth_readback_bytes",
+                    u64::from(width) * u64::from(height) * 4);
             }
         }
     }
@@ -2928,10 +2973,12 @@ pub fn render_core_mrt(
                     },
                 };
                 tex.get_bytes(stencil.data as *mut _, width as u64, region, 0);
+                crate::runtime::drain::note_store_route("metal_stencil_readbacks");
+                crate::runtime::drain::note_store_route_n("metal_stencil_readback_bytes",
+                    u64::from(width) * u64::from(height));
             }
         }
     }
     clear_err(err);
-    let _ = retained_buf;
     Status::OK
 }

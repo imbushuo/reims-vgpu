@@ -15,7 +15,6 @@
 
 use super::*;
 
-use crate::backend::metal::render::{RetainedColorTarget, RetainedColorTexture};
 use crate::runtime::chain_phase;
 use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
 
@@ -27,8 +26,12 @@ pub use icb::*;
 // parts, so they are not re-exported.
 mod depth_stencil;
 use depth_stencil::{seed_host_depth_stencil, DepthStencilAspect, HostAttachment};
+pub(crate) use depth_stencil::HostDepthStencil;
 mod sampled;
 mod storage;
+mod hazards;
+pub(crate) use hazards::PassDependencies;
+pub(crate) use hazards::land_before_refusal;
 
 /// This rail's retention decision for one colour attachment, made before the
 /// seed is built and spent by the encode and then by the Store.
@@ -38,7 +41,7 @@ mod storage;
 /// which cache frame the Store must publish it as. Asked separately they drift —
 /// the hazard is a pass that skips the seed on one answer and publishes against
 /// another.
-struct ResidentPlan {
+pub(crate) struct ResidentPlan {
     key: crate::backend::metal::resident::ResidentColorKey,
     /// The retained texture, when this rail still held one. `None` is the first
     /// draw into a surface, or one whose target the byte budget evicted.
@@ -49,7 +52,7 @@ struct ResidentPlan {
     /// Only ever true when [`crate::runtime::draw::published_surface_frame`]
     /// answered and the registry's generation matched it. Taking the texture
     /// retired that claim, so this is the one and only reading of it.
-    holds_prior: bool,
+    pub(crate) holds_prior: bool,
     /// The cache generation this plan was made against, and the comparison the
     /// Store publishes on: a writeback that leaves this generation in place did
     /// not refresh the cache, so the target's new pixels correspond to no frame
@@ -160,8 +163,8 @@ fn null_apv_buffer() -> crate::backend::metal::abi::ReimsVgpuBuffer {
     }
 }
 
-/// Encode one draw; optionally store to guest. Returns color0 tight RGBA8 for
-/// multi-draw chaining (archive DrawJob threads output → next initial content).
+/// Synchronous single-draw adapter for tests. Product multi-draw work is owned
+/// by `MetalRenderPass`, which carries native attachments between records.
 ///
 /// `force_full_store`: when true, ignore scissor-local store even if Load+partial
 /// scissor (required for multi-draw final writeback after in-process chaining).
@@ -189,7 +192,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     req: &mut DrawEncodeRequest,
     writeback_guest: bool,
     force_full_store: bool,
-    pass: &crate::backend::metal::render_pass::MetalRenderPass,
+    pass: &mut crate::backend::metal::render_pass::MetalRenderPass,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
     use crate::backend::metal::abi::{
         ReimsVgpuBlendState, ReimsVgpuBuffer, ReimsVgpuDepthAttachment, ReimsVgpuDepthBiasState,
@@ -241,6 +244,22 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             bind.resource_ref
         ));
         return (EncodeStatus::BadArgs("draw_mtl_bind_slot_past_table"), None);
+    }
+    let boundary = if req.visibility.is_some() {
+        Some("metal_batch_visibility_boundary")
+    } else if req.depth_attach.is_some() || req.stencil_attach.is_some() {
+        Some("metal_batch_depth_stencil_fallback")
+    } else {
+        None
+    };
+    if let Some(reason) = boundary {
+        crate::runtime::drain::note_store_route(reason);
+        if let Err(status) = pass.flush("metal_batch_dependency_flush") {
+            return (EncodeStatus::RailRefused(status), None);
+        }
+    }
+    if let Err(status) = hazards::materialize_inputs(state, host, req, pass) {
+        return (status, None);
     }
     // Move multi-MiB Load seeds out **before** cloning color metadata so multi-draw
     // chain frames are not duplicated (clone of empty Option is cheap).
@@ -700,7 +719,9 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     chain_phase::enter(chain_phase::Phase::Assemble);
     let mut depth_attach_api: Option<ReimsVgpuDepthAttachment> = None;
     let depth_storage = req.depth_attach.as_ref().and_then(|da| {
-        let mut seeded = seed_host_depth_stencil(
+        let prior = pass.depth.take();
+        let continuing = prior.is_some();
+        let mut seeded = prior.or_else(|| seed_host_depth_stencil(
             state,
             host,
             req,
@@ -709,11 +730,13 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             },
             HostAttachment::from(*da),
             (width, height),
-        )?;
+        ))?;
         depth_attach_api = Some(ReimsVgpuDepthAttachment {
             pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
-            load_action: map_load_action(req.pipeline_ref, da.load_action),
-            store_action: map_store_action(req.pipeline_ref, da.store_action),
+            load_action: map_load_action(req.pipeline_ref,
+                if continuing { MTL_LOAD_ACTION_LOAD } else { da.load_action }),
+            store_action: map_store_action(req.pipeline_ref,
+                if req.render_pass_continues { MTL_STORE_ACTION_STORE } else { da.store_action }),
             clear_depth: da.clear_depth,
             data: seeded.data.as_mut_ptr(),
             len: seeded.data.len(),
@@ -723,7 +746,9 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
 
     let mut stencil_attach_api: Option<ReimsVgpuStencilAttachment> = None;
     let stencil_storage = req.stencil_attach.as_ref().and_then(|sa| {
-        let mut seeded = seed_host_depth_stencil(
+        let prior = pass.stencil.take();
+        let continuing = prior.is_some();
+        let mut seeded = prior.or_else(|| seed_host_depth_stencil(
             state,
             host,
             req,
@@ -732,11 +757,13 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             },
             HostAttachment::from(*sa),
             (width, height),
-        )?;
+        ))?;
         stencil_attach_api = Some(ReimsVgpuStencilAttachment {
             pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8,
-            load_action: map_load_action(req.pipeline_ref, sa.load_action),
-            store_action: map_store_action(req.pipeline_ref, sa.store_action),
+            load_action: map_load_action(req.pipeline_ref,
+                if continuing { MTL_LOAD_ACTION_LOAD } else { sa.load_action }),
+            store_action: map_store_action(req.pipeline_ref,
+                if req.render_pass_continues { MTL_STORE_ACTION_STORE } else { sa.store_action }),
             clear_stencil: sa.clear_stencil,
             data: seeded.data.as_mut_ptr(),
             len: seeded.data.len(),
@@ -795,9 +822,14 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     // boots; see [`chain_phase::CostSpan`].
     let mut color_outs: Vec<Vec<u8>> = {
         let _outs = chain_phase::CostSpan::new("metal_seed_outs_us");
-        color_list.iter().map(|c| match c.storage {
-            ColorStorage::GuestBacked => vec![0u8; need],
-            ColorStorage::Memoryless => Vec::new(),
+        color_list.iter().map(|c| {
+            if writeback_guest && c.storage == ColorStorage::GuestBacked
+                && c.store_action != MTL_STORE_ACTION_DONT_CARE
+            {
+                vec![0u8; need]
+            } else {
+                Vec::new()
+            }
         }).collect()
     };
 
@@ -821,12 +853,19 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     // render target for whose pixels are the frame the cache would have handed
     // over. See [`crate::backend::metal::resident`]: that is not a new claim
     // about content, it is "do not copy bytes into a texture that holds them".
-    let mut resident_plan: Vec<Option<ResidentPlan>> =
-        (0..color_list.len()).map(|_| None).collect();
     {
         let _seed_span = chain_phase::CostSpan::new("metal_seed_load_us");
         for (i, c) in color_list.iter().enumerate() {
-            if c.mapping_id == 0 {
+            if c.storage == ColorStorage::Memoryless {
+                continue;
+            }
+            let target = match pass.target_mut(c) {
+                Ok(target) => target,
+                Err(reason) => return (EncodeStatus::BadArgs(reason), None),
+            };
+            if target.initialized() {
+                color_seeds[i] = None;
+                crate::runtime::drain::note_store_route("metal_seed_from_pass");
                 continue;
             }
             // Asked for every attachment with a mapping, not only the ones that
@@ -834,27 +873,43 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             // target is what makes the *next* pass's Load free. The generation
             // is read whatever the load action, because it is also what the
             // Store publishes against.
-            resident_plan[i] = Some(plan_resident_target(
-                state,
-                host,
-                req.task_id,
-                c,
-                width,
-                height,
-            ));
+            if target.texture.is_none() {
+                target.resident = (c.mapping_id != 0).then(|| {
+                    plan_resident_target(state, host, req.task_id, c, width, height)
+                });
+                let Some(device) = crate::backend::metal::runtime::system_device() else {
+                    return (EncodeStatus::NoMetal("draw_mtl_render_pass_device"), None);
+                };
+                target.texture = match target.resident.as_mut() {
+                    Some(plan) => plan.texture.take().or_else(|| {
+                        crate::backend::metal::resident::create(
+                            device, &plan.key, ::metal::MTLPixelFormat::RGBA8Unorm, 4,
+                        )
+                    }),
+                    None => crate::backend::metal::render::new_color_target(
+                        device, ::metal::MTLPixelFormat::RGBA8Unorm, width, height,
+                        ::metal::MTLStorageMode::Shared,
+                    ),
+                };
+                if target.texture.is_none() {
+                    return (EncodeStatus::MetalFailed("draw_mtl_render_pass_allocation"), None);
+                }
+            }
             if c.load_action != MTL_LOAD_ACTION_LOAD || color_seeds[i].is_some() {
                 continue;
             }
-            if resident_plan[i]
+            if target.resident
                 .as_ref()
                 .is_some_and(|plan| plan.holds_prior)
             {
                 crate::runtime::drain::note_store_route("metal_seed_from_resident");
                 continue;
             }
+            if c.mapping_id == 0 {
+                continue;
+            }
             crate::runtime::drain::note_store_route("metal_seed_load_asked");
-            color_seeds[i] =
-                seed_color_load(state, host, req.task_id, c.texture_ref, 0, width, height);
+            color_seeds[i] = seed_color_load(state, host, req.task_id, c.texture_ref, 0, width, height);
             if color_seeds[i].is_none() {
                 crate::observe::fail(format!(
                     "metal_draw guest_attachment_fallback_seed fail \
@@ -938,10 +993,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
                 ColorStorage::Memoryless => u32::from(c.format),
             },
             seed_rgba8: color_seeds[i].as_deref(),
-            out_rgba8: match c.storage {
-                ColorStorage::GuestBacked => Some(out),
-                ColorStorage::Memoryless => None,
-            },
+            out_rgba8: if out.is_empty() { None } else { Some(out) },
             clear_r: c.clear_color[0],
             clear_g: c.clear_color[1],
             clear_b: c.clear_color[2],
@@ -960,29 +1012,17 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
                 .map(|a| a.write_mask)
                 .unwrap_or_default()
                 .bits(),
-            // Moved out of the plan rather than borrowed: the backend takes
-            // ownership of the handle for the pass, and a plan left behind
-            // holding a second one would keep an evicted texture alive past the
-            // registry that stopped counting its bytes.
-            // The handle moves and the plan stays: the Store below needs the
-            // key and the generation this plan was made against, and a second
-            // live handle here would keep an evicted texture alive past the
-            // registry that stopped counting its bytes.
+            // Pass ownership, not cache publication, establishes continuation
+            // contents. The final Store alone restores cross-pass publication.
             target: match c.storage {
                 ColorStorage::Memoryless => match pass.target(c) {
                     Ok(target) => ColorTarget::Memoryless(target),
                     Err(reason) => return (EncodeStatus::BadArgs(reason), None),
                 },
-                ColorStorage::GuestBacked => ColorTarget::Guest(
-                    resident_plan[i].as_mut().map(|plan| RetainedColorTarget {
-                        key: plan.key,
-                        texture: match (plan.texture.take(), plan.holds_prior) {
-                            (None, _) => RetainedColorTexture::Absent,
-                            (Some(texture), true) => RetainedColorTexture::Prior(texture),
-                            (Some(texture), false) => RetainedColorTexture::Allocation(texture),
-                        },
-                    }),
-                ),
+                ColorStorage::GuestBacked => match pass.target(c) {
+                    Ok(target) => ColorTarget::PassLocal(target),
+                    Err(reason) => return (EncodeStatus::BadArgs(reason), None),
+                },
             },
         });
     }
@@ -1001,6 +1041,14 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         Err(reason) => return (EncodeStatus::RailRefused(reason), None),
     };
     let mut writable = storage::StorageTextures::default();
+    if texture_usages.vertex.iter().chain(&texture_usages.fragment)
+        .any(|usage| usage.access.writes())
+    {
+        crate::runtime::drain::note_store_route("metal_batch_storage_boundary");
+        if let Err(status) = pass.flush("metal_batch_dependency_flush") {
+            return (EncodeStatus::RailRefused(status), None);
+        }
+    }
     for (usages, binds) in [
         (&texture_usages.vertex, &req.vertex_textures),
         (&texture_usages.fragment, &req.fragment_textures),
@@ -1013,6 +1061,9 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             };
             let Some(bind) = binds.iter().find(|bind| bind.index == index && bind.texture_ref != 0)
                 else { return (EncodeStatus::BadArgs("draw_mtl_storage_unbound"), None) };
+            if !pass.dependencies.borrow_mut().aliases(state, host, req, bind.texture_ref).is_empty() {
+                return (EncodeStatus::Unsupported("draw_mtl_storage_attachment_alias"), None);
+            }
             if let Err(reason) = writable.add(state, host, req, bind.texture_ref, index) {
                 return (reason, None);
             }
@@ -1060,6 +1111,13 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         samples: None,
     });
     chain_phase::enter(chain_phase::Phase::Engine);
+    let defer = req.render_pass_continues
+        && !writeback_guest
+        && visibility.is_none()
+        && depth_attach_api.is_none()
+        && stencil_attach_api.is_none()
+        && !texture_usages.vertex.iter().chain(&texture_usages.fragment)
+            .any(|usage| usage.access.writes());
     let st = render_core_mrt(
         &vert,
         &frag,
@@ -1093,6 +1151,8 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         &mut color_rts,
         visibility.as_mut(),
         err,
+        &mut pass.batch.borrow_mut(),
+        defer,
     );
     chain_phase::enter(chain_phase::Phase::Store);
     // Read before the status is matched, the way `runtime::exec` reads the
@@ -1126,13 +1186,14 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     // Multi-draw intermediate records skip guest store (archive one writeback).
     let mut any_write = false;
     if !writeback_guest {
-        // Still log + early paint latch only when storing; chain returns RGBA.
-        // Moved out rather than cloned: `color_outs` is this call's own storage
-        // and dies with the frame, so a clone was a second full-frame
-        // allocation and copy for a buffer nothing else would read.
+        // Native colour stays in the pass. The depth/stencil fallback carries
+        // its completed CPU payload rather than re-clearing or re-reading guest
+        // bytes on the next record.
+        pass.depth = depth_storage;
+        pass.stencil = stencil_storage;
         return (
             EncodeStatus::Ok,
-            std::mem::take(&mut color_outs).into_iter().next(),
+            None,
         );
     }
     for (i, c) in color_list.iter().enumerate() {
@@ -1140,6 +1201,11 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             continue;
         }
         let out_rgba = &color_outs[i];
+        if let Ok(target) = pass.target(c) {
+            if let Some(plan) = &target.resident {
+                crate::backend::metal::resident::retain_completed(plan.key, target.texture());
+            }
+        }
         // normal-texture GVA keeps archive image_changed via store_seed_policy.
         let load_seed = color_seeds.get(i).and_then(|s| s.as_deref());
         let seed_for_store = store_seed_policy(force_full_store, c.load_action, load_seed);
@@ -1200,7 +1266,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
                     seed_for_store,
                     width,
                     height,
-                    if resident_plan.get(i).is_some_and(Option::is_some) {
+                    if pass.target(c).is_ok_and(|target| target.resident.is_some()) {
                         mapping_write::FramePublication::RailResident
                     } else {
                         mapping_write::FramePublication::HostCache
@@ -1252,7 +1318,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         };
         if wrote {
             any_write = true;
-            if let Some(plan) = resident_plan.get(i).and_then(|p| p.as_ref()) {
+            if let Some(plan) = pass.target(c).ok().and_then(|target| target.resident.as_ref()) {
                 publish_resident_target(state, plan);
             }
             // Early-boot logo+pill: paint mapper-ref-texture front before first DisplaySwap.

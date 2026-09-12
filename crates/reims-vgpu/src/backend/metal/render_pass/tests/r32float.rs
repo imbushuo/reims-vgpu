@@ -20,7 +20,7 @@ const SOURCE: &str = r#"
     }
 "#;
 
-fn source_over() -> ReimsVgpuBlendState {
+pub(super) fn source_over() -> ReimsVgpuBlendState {
     ReimsVgpuBlendState {
         enable: 1,
         src_rgb: MTLBlendFactor::One as u32,
@@ -54,12 +54,12 @@ fn color(slot: u32, format: MTLPixelFormat, target: ColorTarget<'_>) -> ColorRt<
 #[test]
 fn memoryless_secondary_blending_is_independent_of_color_zero() {
     let blend = source_over();
-    let secondary = color(1, MTLPixelFormat::R32Float, ColorTarget::Guest(None));
+    let secondary = color(1, MTLPixelFormat::R32Float, ColorTarget::Transient);
     let key = fill_render_pso_key(&[], Some(&blend),
         &[secondary.pipeline_key(secondary.pixel_format)], 0, 0);
     assert_eq!(key.color_blend_enable[0], 0,
         "a secondary coverage attachment must not inherit colour0's blend state");
-    let mut primary = color(0, MTLPixelFormat::RGBA32Float, ColorTarget::Guest(None));
+    let mut primary = color(0, MTLPixelFormat::RGBA32Float, ColorTarget::Transient);
     let key = fill_render_pso_key(&[], Some(&blend),
         &[primary.pipeline_key(primary.pixel_format)], 0, 0);
     assert_eq!(key.color_blend_enable[0], 1, "legacy colour0 fallback is preserved");
@@ -174,7 +174,7 @@ fn memoryless_r32float_native_clear_fetch_and_blend_match_one_encoder() {
                     let mut tile = color(1, MTLPixelFormat::R32Float, ColorTarget::Memoryless(target));
                     tile.load_action = u32::from(req.colors[0].load_action);
                     tile.blend = blend_tile.then_some(blend);
-                    let primary = color(0, MTLPixelFormat::RGBA32Float, ColorTarget::Guest(None));
+                    let primary = color(0, MTLPixelFormat::RGBA32Float, ColorTarget::Transient);
                     let key = fill_render_pso_key(&[], Some(&blend), &[
                         primary.pipeline_key(primary.pixel_format), tile.pipeline_key(tile.pixel_format),
                     ], 0, 0);

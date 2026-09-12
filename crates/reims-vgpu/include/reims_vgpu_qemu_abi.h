@@ -21,7 +21,8 @@
 extern "C" {
 #endif
 
-/* v20: map_pages fills ReimsVgpuMapPagesFailure when it refuses a view.
+/* v21: IOSFC begin/try/wait/finish admission; only wait runs without BQL.
+ * v20: map_pages fills ReimsVgpuMapPagesFailure when it refuses a view.
  * v19: ReimsVgpuHostOps.page_alias_census reports the packed page views the
  *      shim currently owns and their cumulative lifetime totals.
  * v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
@@ -94,7 +95,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 20u
+#define REIMS_VGPU_QEMU_ABI_VERSION 21u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -106,6 +107,9 @@ extern "C" {
 #define REIMS_VGPU_QEMU_ERR_STATE 2
 #define REIMS_VGPU_QEMU_ERR_PANIC 3
 #define REIMS_VGPU_QEMU_EMPTY 4
+#define REIMS_VGPU_QEMU_BUSY 5
+#define REIMS_VGPU_QEMU_CANCELLED 6
+#define REIMS_VGPU_QEMU_REENTRANT 7
 
 /*
  * Why guest_ram_regions refused, when it did. Negative so one return value
@@ -474,8 +478,20 @@ int reims_vgpu_qemu_gfx_write(uint64_t handle, uint64_t offset, uint64_t data,
                        uint32_t size);
 int reims_vgpu_qemu_iosfc_read(uint64_t handle, uint64_t offset, uint32_t size,
                         uint64_t *out_val);
-int reims_vgpu_qemu_iosfc_write(uint64_t handle, uint64_t offset, uint64_t data,
-                         uint32_t size);
+/*
+ * begin/write/finish run on the publishing vCPU with BQL held. write returns
+ * BUSY without side effects; release BQL, wait, restore BQL, then retry.
+ * wait retains only admission metadata, never the device or HostOps ctx.
+ * Every successful begin owes finish, including after cancellation or error.
+ * The QOM callback must retain its object across the BQL-free wait; cancellation
+ * permits teardown of its backend/HostOps without waiting for that callback.
+ */
+int reims_vgpu_qemu_iosfc_begin_write(uint64_t handle, uint64_t offset,
+                               uint64_t data, uint32_t size,
+                               uint64_t *out_ticket);
+int reims_vgpu_qemu_iosfc_write(uint64_t ticket);
+int reims_vgpu_qemu_iosfc_wait(uint64_t ticket);
+void reims_vgpu_qemu_iosfc_finish(uint64_t ticket);
 
 /* Worker body, without BQL: drain pending FIFOs using HostOps GPA.
  * Pop and apply completed actions separately on the QEMU main loop. */

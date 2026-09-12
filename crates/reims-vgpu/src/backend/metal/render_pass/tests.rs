@@ -3,6 +3,7 @@ use crate::backend::metal::render::{ColorRt, ColorTarget};
 use metal::*;
 
 mod r32float;
+mod batching;
 
 fn weak_texture(texture: &Texture) -> objc::rc::WeakPtr {
     use foreign_types::ForeignType;
@@ -254,13 +255,8 @@ fn memoryless_multi_draw_framebuffer_fetch_matches_one_native_encoder() {
             }.attach(&descriptor, target.texture());
             assert_eq!(descriptor.color_attachments().object_at(1).unwrap().load_action() as u64,
                 if initial { MTLLoadAction::Clear as u64 } else { MTLLoadAction::Load as u64 });
-            let command = queue.new_command_buffer();
-            let encoder = command.new_render_command_encoder(&descriptor);
-            draw(encoder, index);
-            encoder.end_encoding();
-            command.commit();
-            command.wait_until_completed();
-            assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+            let encoder = pass.batch.borrow_mut().encoder(device, &descriptor).unwrap();
+            draw(&encoder, index);
             (EncodeStatus::Ok, None)
         });
         assert!(matches!(result.0, EncodeStatus::Ok));
@@ -270,4 +266,5 @@ fn memoryless_multi_draw_framebuffer_fetch_matches_one_native_encoder() {
     assert_eq!(read_output(&output), expected, "split passes must preserve every half-float texel");
     assert!(guest_pass.targets.is_empty(), "no texture survives the guest pass");
     assert_eq!(guest_pass.phase, Phase::Finished);
+    assert_eq!(guest_pass.batch.borrow().submissions, 1);
 }

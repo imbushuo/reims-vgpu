@@ -17,12 +17,12 @@ pub(crate) use regs::*;
 pub use state::{
     Acted, BackingWalk, ChannelRing, ComputeStorageResidencyKey, CursorState, Declaration,
     DeviceId, DeviceState, DisplayControl, ExecFault, FailEvent, GfxRegs, GuestLinearMemo,
-    GvaBacking, GvaEvictionWitness, GvaHostView, HostLinearTexture, HostSurface, MapperCapture,
-    MappingEntry, PacketFault, PresentBacking, PresentState, RailDeviceState, RailResourceState,
-    RenderFlushWitness, ResourceValidity, StampPublication, StorageIncarnation, SurfaceWriteKind,
-    TaskEntry, TaskReferenceStates, TaskResource, TaskResourceLifetimeRef, TaskSamplerState,
-    TaskTable, UnimplementedCommand, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
-    FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
+    GvaBacking, GvaEvictionWitness, GvaHostView, HostLinearTexture, HostSurface, IosfcRegs,
+    MapperCapture, MappingEntry, PacketFault, PresentBacking, PresentState, RailDeviceState,
+    RailResourceState, RenderFlushWitness, ResourceValidity, StampPublication, StorageIncarnation,
+    SurfaceWriteKind, TaskEntry, TaskReferenceStates, TaskResource, TaskResourceLifetimeRef,
+    TaskSamplerState, TaskTable, UnimplementedCommand, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
+    FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
 };
 
 use crate::backend::Backend;
@@ -686,7 +686,7 @@ mod tests {
         assert!(
             d.state.mappings.contains_key(&7)
                 || !d.fails().is_empty()
-                || d.state.iosfc.consumer > 0
+                || d.state.iosfc.consumer() > 0
                 || h.bh_scheduled
         );
     }

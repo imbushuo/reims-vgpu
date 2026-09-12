@@ -33,7 +33,9 @@ fn mmio_hooks() {
     let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
     assert!(device_gfx_write(id, 0x1034, 0x3e, 4));
     assert_eq!(device_gfx_read(id, 0x1034, 4), Some(0x3e));
-    assert!(device_iosfc_write(id, 0x1008, 0x400, 4));
+    let ticket = device_iosfc_begin(id, 0x1008, 0x400, 4).expect("admission");
+    assert_eq!(device_iosfc_write(ticket), IosfcAdmissionStatus::Ready);
+    device_iosfc_finish(ticket);
     assert_eq!(device_iosfc_read(id, 0x1008, 4), Some(0x400));
     assert!(device_destroy(id));
 }

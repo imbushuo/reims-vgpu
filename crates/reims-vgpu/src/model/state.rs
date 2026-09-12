@@ -9,7 +9,7 @@ use reims_vgpu_core::identity::{ObjectListRef, ResourceId};
 use reims_vgpu_core::namespace::Teardown;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Opaque device instance id (QEMU handle).
@@ -447,13 +447,65 @@ impl GfxRegs {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+/// Authoritative registers shared with MMIO ingress. The renderer never owns
+/// their read path; in particular a polling guest sees each consumer advance.
+#[derive(Debug, Default)]
 pub struct IosfcRegs {
-    pub ring_base: u64,
-    pub capacity: u32,
-    pub desc_table: u64,
-    pub producer: u32,
-    pub consumer: u32,
+    ring_base: AtomicU64,
+    capacity: AtomicU32,
+    desc_table: AtomicU64,
+    producer: AtomicU32,
+    consumer: AtomicU32,
+}
+
+impl IosfcRegs {
+    pub fn ring_base(&self) -> u64 {
+        self.ring_base.load(Ordering::Acquire)
+    }
+
+    pub fn set_ring_base(&self, value: u64) {
+        self.ring_base.store(value, Ordering::Release);
+    }
+
+    pub fn capacity(&self) -> u32 {
+        self.capacity.load(Ordering::Acquire)
+    }
+
+    pub fn set_capacity(&self, value: u32) {
+        self.capacity.store(value, Ordering::Release);
+    }
+
+    pub fn desc_table(&self) -> u64 {
+        self.desc_table.load(Ordering::Acquire)
+    }
+
+    pub fn set_desc_table(&self, value: u64) {
+        self.desc_table.store(value, Ordering::Release);
+    }
+
+    pub fn producer(&self) -> u32 {
+        self.producer.load(Ordering::Acquire)
+    }
+
+    pub fn set_producer(&self, value: u32) {
+        self.producer.store(value, Ordering::Release);
+    }
+
+    pub fn consumer(&self) -> u32 {
+        self.consumer.load(Ordering::Acquire)
+    }
+
+    pub fn set_consumer(&self, value: u32) {
+        self.consumer.store(value, Ordering::Release);
+    }
+
+    fn reset(&self) {
+        self.set_ring_base(0);
+        self.set_capacity(0);
+        self.set_desc_table(0);
+        self.set_producer(0);
+        self.set_consumer(0);
+    }
 }
 
 /// Per-channel child ring cache (page list decoded from base_pfn).
@@ -2999,7 +3051,7 @@ pub struct DeviceState {
     /// Guest page shift for PFN↔GPA wire math (12 = x86, 14 = arm64e).
     pub page_shift: u32,
     pub gfx: GfxRegs,
-    pub iosfc: IosfcRegs,
+    pub iosfc: Arc<IosfcRegs>,
     /// The semantic model's ordering plane, and the owner of which child
     /// domains are open.
     ///
@@ -3558,7 +3610,7 @@ impl DeviceState {
             id,
             page_shift,
             gfx: GfxRegs::default(),
-            iosfc: IosfcRegs::default(),
+            iosfc: Arc::new(IosfcRegs::default()),
             gva_store_witness: Default::default(),
             session: Mutex::new(reims_vgpu_core::session::SessionModel::new(
                 reims_vgpu_core::identity::SessionId(id.0 as u32),
@@ -3981,6 +4033,7 @@ impl DeviceState {
         let fifo_read = Arc::clone(&self.gfx.fifo_read);
         let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
         let display_control = Arc::clone(&self.display.control);
+        let iosfc = Arc::clone(&self.iosfc);
         intr_disp.store(0, Ordering::Release);
         intr_gpu.store(0, Ordering::Release);
         intr_fault.store(0, Ordering::Release);
@@ -3989,7 +4042,9 @@ impl DeviceState {
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
         *display_control.lock() = DisplayControl::default();
+        iosfc.reset();
         *self = Self::new(id, page_shift);
+        self.iosfc = iosfc;
         self.gfx.interrupt_status_disp = intr_disp;
         self.gfx.interrupt_status_gpu = intr_gpu;
         self.gfx.interrupt_fault = intr_fault;

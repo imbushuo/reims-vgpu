@@ -258,12 +258,16 @@ pub(crate) fn display_doorbell<H: HostMemory + HostOps>(
 
 /// Iosfc MMIO read.
 pub fn iosfc_read(state: &DeviceState, offset: u64, size: u32) -> u64 {
+    iosfc_regs_read(&state.iosfc, offset, size)
+}
+
+pub(crate) fn iosfc_regs_read(regs: &IosfcRegs, offset: u64, size: u32) -> u64 {
     let mut val = match offset {
-        IOSFC_REG_RING_BASE => state.iosfc.ring_base,
-        IOSFC_REG_CAPACITY => state.iosfc.capacity as u64,
-        IOSFC_REG_DESC_TABLE => state.iosfc.desc_table,
-        IOSFC_REG_PRODUCER => state.iosfc.producer as u64,
-        IOSFC_REG_CONSUMER => state.iosfc.consumer as u64,
+        IOSFC_REG_RING_BASE => regs.ring_base(),
+        IOSFC_REG_CAPACITY => regs.capacity() as u64,
+        IOSFC_REG_DESC_TABLE => regs.desc_table(),
+        IOSFC_REG_PRODUCER => regs.producer() as u64,
+        IOSFC_REG_CONSUMER => regs.consumer() as u64,
         _ => 0,
     };
     if size < MMIO_U64 && size > 0 {
@@ -288,13 +292,13 @@ pub fn iosfc_write<H: HostMemory + HostOps>(
     _size: u32,
 ) {
     match offset {
-        IOSFC_REG_RING_BASE => state.iosfc.ring_base = data,
-        IOSFC_REG_CAPACITY => state.iosfc.capacity = data as u32,
-        IOSFC_REG_DESC_TABLE => state.iosfc.desc_table = data,
+        IOSFC_REG_RING_BASE => state.iosfc.set_ring_base(data),
+        IOSFC_REG_CAPACITY => state.iosfc.set_capacity(data as u32),
+        IOSFC_REG_DESC_TABLE => state.iosfc.set_desc_table(data),
         IOSFC_REG_PRODUCER => {
             let producer = data as u32;
-            state.iosfc.producer = producer;
-            if state.iosfc.consumer != producer {
+            state.iosfc.set_producer(producer);
+            if state.iosfc.consumer() != producer {
                 // Capture MappingInternal* while x19/x21/x22 still hold the
                 // publishing vCPU's directed handoff.
                 if let Some(cap) = mapper::capture_at_producer(state, host, producer) {
@@ -308,7 +312,7 @@ pub fn iosfc_write<H: HostMemory + HostOps>(
                 host.schedule_bh();
             }
         }
-        IOSFC_REG_CONSUMER => state.iosfc.consumer = data as u32,
+        IOSFC_REG_CONSUMER => state.iosfc.set_consumer(data as u32),
         _ => {}
     }
 }

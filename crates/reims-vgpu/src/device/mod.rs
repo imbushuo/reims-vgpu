@@ -5,9 +5,8 @@
 //! holds, plus the twelve functions that shim calls: create/reset/destroy, the
 //! two MMIO windows, drain, poll, the action queue, and the backend name. The
 //! locking policy lives here too, because it is a property of this map rather
-//! than of any one device — `lock_for_drain` and `lock_device_for_vcpu` are two
-//! answers to "who may block whom" and are chosen per caller. (Named in prose:
-//! a bare name in a `//!` doc resolves to nothing whatever it names.)
+//! than of any one device. IOSFC admission gives the publishing vCPU priority
+//! after a GPU tranche, without keeping BQL or device state while it waits.
 //!
 //! Split out of the crate root, which was 800 lines of which 690 were this. The
 //! root is the module table and the three-arm guards now, and the two sibling
@@ -27,6 +26,9 @@ pub(crate) use window_publish::{
 /// The display half of the QEMU ABI surface: console-feed ownership, scanout
 /// and EFI-console copies, and the cursor glyph.
 mod display_surface;
+mod iosfc_admission;
+#[cfg(test)]
+mod iosfc_tests;
 #[cfg(any(test, feature = "host-window"))]
 pub(crate) use display_surface::host_console_uses_bar1;
 pub(crate) use display_surface::{
@@ -34,6 +36,7 @@ pub(crate) use display_surface::{
     device_efi_console_copy, device_scanout_copy, device_scanout_may_paint, ConsoleFeed,
     CursorGlyphInfo,
 };
+pub(crate) use iosfc_admission::Status as IosfcAdmissionStatus;
 
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -75,7 +78,9 @@ struct QueuedGfxWrite {
 /// One live device. Registry lookup and MMIO ingress remain short even while
 /// `inner` is owned by the ordered render worker.
 struct BoundDevice {
-    inner: Mutex<DeviceInner>,
+    inner: iosfc_admission::StateMutex<DeviceInner>,
+    iosfc_admission: Arc<iosfc_admission::Admission>,
+    iosfc_regs: Arc<crate::model::IosfcRegs>,
     gfx_ingress: Mutex<VecDeque<QueuedGfxWrite>>,
     gfx_read_cache: Mutex<HashMap<(u64, u32), u64>>,
     gfx_read_busy_logged: AtomicBool,
@@ -150,6 +155,9 @@ type DeviceMap = HashMap<u64, Arc<BoundDevice>>;
 
 static DEVICES: Lazy<Mutex<DeviceMap>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static NEXT_ID: Lazy<Mutex<u64>> = Lazy::new(|| Mutex::new(1));
+static IOSFC_TICKETS: Lazy<Mutex<HashMap<u64, Arc<iosfc_admission::Ticket>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static NEXT_IOSFC_TICKET: AtomicU64 = AtomicU64::new(1);
 
 fn device_slot(id: u64) -> Option<Arc<BoundDevice>> {
     DEVICES.lock().get(&id).cloned()
@@ -174,6 +182,13 @@ fn publish_present_boundary(slot: &BoundDevice, frame_flush_seen: bool) {
 }
 
 fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfxWrite) {
+    let _execution = match iosfc_admission::Execution::enter(inner.device.state.id.0) {
+        Ok(execution) => execution,
+        Err(status) => {
+            iosfc_admission::report_refusal(status, inner.device.state.id.0);
+            return;
+        }
+    };
     match write.queued_at {
         Some(at) => crate::runtime::drain::note_doorbell_queued(
             write.offset,
@@ -197,7 +212,7 @@ fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfx
 /// Apply queued MMIO writes in publication order. Lock order is ingress then
 /// inner everywhere; producers use `try_lock` for inner and therefore never
 /// wait behind shader translation/GPU work.
-fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner> {
+fn lock_for_drain(slot: &BoundDevice) -> iosfc_admission::StateGuard<'_, DeviceInner> {
     let mut ingress = slot.gfx_ingress.lock();
     let mut inner = slot.inner.lock();
     while let Some(write) = ingress.pop_front() {
@@ -238,13 +253,20 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
     let display_control = Arc::clone(&dev.state.display.control);
+    let iosfc_regs = Arc::clone(&dev.state.iosfc);
+    let iosfc_admission = iosfc_admission::Admission::new();
     DEVICES.lock().insert(
         id,
         Arc::new(BoundDevice {
-            inner: Mutex::new(DeviceInner {
-                device: dev,
-                actions: VecDeque::new(),
-            }),
+            inner: iosfc_admission::StateMutex::new(
+                DeviceInner {
+                    device: dev,
+                    actions: VecDeque::new(),
+                },
+                Arc::clone(&iosfc_admission),
+            ),
+            iosfc_admission,
+            iosfc_regs,
             gfx_ingress: Mutex::new(VecDeque::new()),
             gfx_read_cache: Mutex::new(HashMap::new()),
             gfx_read_busy_logged: AtomicBool::new(false),
@@ -316,6 +338,7 @@ fn announce_stamp_interrupt(id: u64, index: u32) {
 
 pub fn device_reset(id: u64) -> bool {
     if let Some(slot) = device_slot(id) {
+        slot.iosfc_admission.close(id, iosfc_admission::End::Reset);
         let mut d = lock_for_drain(&slot);
         let seq = slot.reset_count.fetch_add(1, Ordering::Relaxed) + 1;
         let state = &d.device.state;
@@ -348,6 +371,8 @@ pub fn device_reset(id: u64) -> bool {
         slot.present_action_pending.store(false, Ordering::Release);
         slot.present_boundary_seen.store(false, Ordering::Release);
         crate::runtime::census::present_proxy::reset_for_device();
+        drop(d);
+        slot.iosfc_admission.reopen();
         true
     } else {
         false
@@ -355,10 +380,21 @@ pub fn device_reset(id: u64) -> bool {
 }
 
 pub fn device_destroy(id: u64) -> bool {
-    DEVICES.lock().remove(&id).is_some()
+    let Some(slot) = DEVICES.lock().remove(&id) else {
+        return false;
+    };
+    slot.iosfc_admission
+        .close(id, iosfc_admission::End::Destroy);
+    // The C lifecycle caller holds BQL and has stopped the worker. Actual
+    // IOSFC execution therefore cannot overlap this removal; BQL-free waiters
+    // retain only the cancelled admission owner, never this slot or HostOps.
+    true
 }
 
 pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
+    if refuse_reentrant_io(id) {
+        return None;
+    }
     use crate::model::{
         GFX_REG_FIFO_READ, GFX_REG_INTR_FAULT, GFX_REG_INTR_STATUS_DISP, GFX_REG_INTR_STATUS_GPU,
     };
@@ -402,6 +438,9 @@ pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
 }
 
 pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
+    if refuse_reentrant_io(id) {
+        return false;
+    }
     use crate::model::{GFX_REG_INTR_STATUS_DISP, GFX_REG_INTR_STATUS_GPU};
     let Some(slot) = device_slot(id) else {
         return false;
@@ -484,38 +523,91 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
     true
 }
 
-/// Take the device lock from the vCPU thread, measuring the wait.
-///
-/// The guest's MMIO access is stopped for exactly as long as this blocks, and
-/// the drain worker holds this same lock across a full-surface readback. Every
-/// other figure about that stall is taken from the holder's side, which makes
-/// the step to "the guest missed a frame" an inference; this measures it where
-/// it is actually paid.
-///
-/// The uncontended path takes `try_lock` and never reads the clock, so a fast
-/// access pays nothing for the instrument.
-fn lock_device_for_vcpu(slot: &BoundDevice) -> impl std::ops::DerefMut<Target = DeviceInner> + '_ {
-    if let Some(guard) = slot.inner.try_lock() {
-        crate::runtime::drain::note_vcpu_lock_free();
-        return guard;
+fn refuse_reentrant_io(id: u64) -> bool {
+    if iosfc_admission::reentrant(id) {
+        iosfc_admission::report_refusal(IosfcAdmissionStatus::Reentrant, id);
+        true
+    } else {
+        false
     }
-    let waited = std::time::Instant::now();
-    let guard = slot.inner.lock();
-    crate::runtime::drain::note_vcpu_lock_wait(waited.elapsed().as_micros() as u64);
-    guard
 }
 
 pub fn device_iosfc_read(id: u64, offset: u64, size: u32) -> Option<u64> {
+    if refuse_reentrant_io(id) {
+        return None;
+    }
     let slot = device_slot(id)?;
-    let d = lock_device_for_vcpu(&slot);
-    Some(d.device.iosfc_read(offset, size))
+    Some(crate::runtime::mmio::iosfc_regs_read(
+        &slot.iosfc_regs,
+        offset,
+        size,
+    ))
 }
 
-pub fn device_iosfc_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
+/// Register the immutable write while QEMU still holds BQL. The returned
+/// ticket owns neither device state nor HostOps and may wait without BQL.
+pub(crate) fn device_iosfc_begin(
+    id: u64,
+    offset: u64,
+    data: u64,
+    size: u32,
+) -> Result<u64, IosfcAdmissionStatus> {
+    if refuse_reentrant_io(id) {
+        return Err(IosfcAdmissionStatus::Reentrant);
+    }
     let Some(slot) = device_slot(id) else {
-        return false;
+        return Err(IosfcAdmissionStatus::Cancelled);
     };
-    let mut d = lock_device_for_vcpu(&slot);
+    let ticket_id = NEXT_IOSFC_TICKET
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("IOSFC ticket identity exhausted");
+    let ticket = slot
+        .iosfc_admission
+        .issue(ticket_id, id, iosfc_admission::Write { offset, data, size })
+        .map_err(|status| {
+            iosfc_admission::report_refusal(status, id);
+            status
+        })?;
+    IOSFC_TICKETS.lock().insert(ticket_id, Arc::new(ticket));
+    Ok(ticket_id)
+}
+
+/// Side-effect-free on Busy. QEMU calls this only with BQL held, on the
+/// publishing vCPU, so all handoff/KVA reads keep their established context.
+pub fn device_iosfc_write(ticket_id: u64) -> IosfcAdmissionStatus {
+    let Some(ticket) = IOSFC_TICKETS.lock().get(&ticket_id).cloned() else {
+        return IosfcAdmissionStatus::Cancelled;
+    };
+    if refuse_reentrant_io(ticket.device) {
+        return IosfcAdmissionStatus::Reentrant;
+    }
+    let status = ticket.poll();
+    if status != IosfcAdmissionStatus::Ready {
+        iosfc_admission::report_refusal(status, ticket.device);
+        return status;
+    }
+    if ticket.completed() {
+        return IosfcAdmissionStatus::Ready;
+    }
+    let Some(slot) = device_slot(ticket.device) else {
+        return IosfcAdmissionStatus::Cancelled;
+    };
+    if !Arc::ptr_eq(&slot.iosfc_admission, &ticket.owner) {
+        return IosfcAdmissionStatus::Cancelled;
+    }
+    let Some(mut d) = slot.inner.try_lock() else {
+        return IosfcAdmissionStatus::Busy;
+    };
+    // Reset/destroy may have cancelled the ticket between lookup and lock.
+    let status = ticket.poll();
+    if status != IosfcAdmissionStatus::Ready {
+        return status;
+    }
+    let _execution = match iosfc_admission::Execution::enter(ticket.device) {
+        Ok(execution) => execution,
+        Err(status) => return status,
+    };
+    let iosfc_admission::Write { offset, data, size } = ticket.write;
     if let Some(ops) = slot.ops {
         let DeviceInner { device, actions } = &mut *d;
         let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
@@ -524,7 +616,33 @@ pub fn device_iosfc_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
         let mut host = NullHost;
         d.device.iosfc_write(&mut host, offset, data, size);
     }
-    true
+    ticket.complete();
+    IosfcAdmissionStatus::Ready
+}
+
+pub(crate) fn device_iosfc_wait(ticket_id: u64) -> IosfcAdmissionStatus {
+    let Some(ticket) = IOSFC_TICKETS.lock().get(&ticket_id).cloned() else {
+        return IosfcAdmissionStatus::Cancelled;
+    };
+    let started = std::time::Instant::now();
+    let status = ticket.wait();
+    crate::runtime::drain::note_vcpu_lock_wait(started.elapsed().as_micros() as u64);
+    iosfc_admission::report_refusal(status, ticket.device);
+    status
+}
+
+/// Called after BQL has been restored, including on cancellation/error.
+pub(crate) fn device_iosfc_finish(ticket_id: u64) {
+    let Some(ticket) = IOSFC_TICKETS.lock().remove(&ticket_id) else {
+        return;
+    };
+    if ticket.finish() {
+        if let Some(slot) = device_slot(ticket.device) {
+            if Arc::ptr_eq(&slot.iosfc_admission, &ticket.owner) {
+                schedule_device(&slot);
+            }
+        }
+    }
 }
 
 /// Worker body: drain pending FIFOs using QEMU GPA callbacks; enqueue HostActions.
@@ -545,6 +663,11 @@ pub fn device_drain(id: u64) -> bool {
         crate::runtime::drain::note_drain_exit(entry_us, true);
         return true;
     }
+    let Some(_worker) = slot.iosfc_admission.worker() else {
+        crate::runtime::drain::note_drain_skipped();
+        crate::runtime::drain::note_drain_exit(entry_us, true);
+        return true;
+    };
     let mut d = lock_for_drain(&slot);
     crate::runtime::drain::note_drain_lock_wait(
         crate::observe::elapsed_us().saturating_sub(entry_us),

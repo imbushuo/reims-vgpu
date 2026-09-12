@@ -655,7 +655,7 @@ fn capture_validates_identity_and_ring() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let ring = 0x7000_0000u64;
-    state.iosfc.ring_base = ring;
+    state.iosfc.set_ring_base(ring);
 
     // producer=1 → entry 0: MAP mapping_id=7
     let mut entry = [0u8; 16];
@@ -693,7 +693,7 @@ fn capture_validates_identity_and_ring() {
         4,
     );
     assert_eq!(state.mappings.get(&7).unwrap().mapping_internal, internal);
-    assert_eq!(state.iosfc.consumer, 1);
+    assert_eq!(state.iosfc.consumer(), 1);
     assert!(!state.pending.iosfc);
     assert!(state.mapper_capture.is_none());
     assert!(host.bh_scheduled);
@@ -709,10 +709,10 @@ fn capture_handoff_mismatch_is_fail_visible_and_latched() {
     // the ring (wrong request-type in the xreg) is a genuine capture miss:
     // the mapping never attaches → downstream black. It must return None,
     // latch its reason once (no per-publish flood), and re-arm on clear.
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let ring = 0x7100_0000u64;
-    state.iosfc.ring_base = ring;
+    state.iosfc.set_ring_base(ring);
 
     // producer=1 → entry 0: MAP mapping_id=9
     let mut entry = [0u8; 16];
@@ -1360,7 +1360,7 @@ fn a_surface_colliding_with_several_control_structures_names_the_first() {
     let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
     state.gfx.root_page = 0x120;
     state.gfx.fifo_base_page = 0x220;
-    state.iosfc.ring_base = 0x300_000;
+    state.iosfc.set_ring_base(0x300_000);
     state.child_rings[2].page_gpas = vec![0x330_000];
     state.define_task(1, 0x4000_0000, 0x440);
     state.define_task(2, 0x4000_0000, 0x660);
@@ -1382,7 +1382,7 @@ fn a_surface_colliding_with_several_control_structures_names_the_first() {
         first_control_page_collision(&state, &all),
         Some((0x300_000, "iosfc_ring"))
     );
-    state.iosfc.ring_base = 0;
+    state.iosfc.set_ring_base(0);
     assert_eq!(
         first_control_page_collision(&state, &all),
         Some((0x330_000, "child_fifo"))
