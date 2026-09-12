@@ -55,6 +55,12 @@ and stops the host window before destroying the backend and its notification tar
 The shared worker's scheduling, reset, and teardown tests are in QEMU's
 `tests/unit/test-reims-vgpu-worker.c`.
 
+Bounded child-channel refills skip channels already served in the current tranche,
+but retain their newly rung bits for the next scheduled worker entry. A guest can
+publish another packet after that channel's drain observed an empty ring; keeping
+the worker wake without its channel bit would strand the packet until another
+doorbell or poll rescue.
+
 IOSurface-mapper register reads use independent authoritative atomics rather than
 the render-state mutex. MMIO writes enter a FIFO admission queue; only the
 metadata-only availability wait releases BQL. Capture, KVA access, mapping
@@ -63,6 +69,15 @@ on the originating vCPU with BQL held. Queued writes have priority over later GP
 tranches, and the final admission rearms a worker whose earlier wake was consumed.
 The vCPU wait counters now include these BQL-free admission waits; they are not
 measurements of how long BQL was blocked.
+
+`drain_checkpoints` observes post-transaction model quiescence and mapper demand
+without changing scheduling. Nonblocking snapshots report contention as unknown.
+Its `eligible_with_demand` count additionally requires a later packet to start in
+the same tranche; terminal checkpoints are counted separately. That retrospective
+observation neither proves the later packet was already published nor certifies
+GPU idleness. Remaining-tranche times are wall-time attribution, not predicted
+latency savings. Reports aggregate completed tranches by device/admission epoch,
+with explicitly named sums and maxima.
 
 The IOSFC region uses lockless-I/O enrollment with explicit BQL scoping and
 Rust-owned reentry refusal. Waiting tickets retain neither the backend nor its
@@ -79,6 +94,25 @@ not read color pixels back to the CPU or upload them again for the next draw.
 Staged inputs retain their own contents through GPU completion; keeping a Metal
 object alive alone does not protect its contents from later CPU writes.
 
+The thread's Metal command-queue owner recycles completed input allocations with
+exactly matching lengths and zero binding offsets. Every input is fully filled;
+sealed allocations cannot return to the idle inventory before their own command
+buffer completes. Small and empty completions preserve useful idle allocations.
+Both idle bytes and buffer count are bounded by the queue's maximum actual
+completed-submission demand, with oldest available allocations evicted first.
+Live GPU work is never evicted by this policy. Query and writable output resources
+are not part of this input inventory.
+
+Eligible plain vertex/fragment bindings fill owned native storage directly through
+the checked guest-memory reader instead of allocating a CPU vector and copying it
+again into Metal. They preserve the complete allocation-size-minus-binding-offset
+suffix; reflection is not used to shrink it. Reference debt and aliases are
+settled before the read. Fresh storage is initialized before exposing a mutable
+slice, the callback holds no pool or thread-queue borrow, and partial or failed
+reads cannot produce a sealed input. No guest alias or persistent CPU view escapes.
+Stage-in bindings and draws with texture, query, depth, or stencil participants
+retain the existing CPU-vector route.
+
 Queries, writable/native resource bindings, attachment changes, and dependencies
 that need CPU-visible results complete outstanding work synchronously. Unknown or
 overlapping input footprints conservatively materialize prior output.
@@ -90,6 +124,18 @@ The `metal_submissions`, `metal_batch_encoder_reuse`,
 `metal_batch_deferred_draws`, and `metal_seed_from_pass` census counters distinguish
 actual batching from attachment reuse alone. Readback and dependency counters
 identify remaining materialization costs.
+
+`metal_input_buffers` reports per-class cumulative allocation, reuse, host-copy,
+direct-fill, miss, and discard counts/bytes, plus current ownership levels and
+lifetime maxima. Direct-fill success, explicitly reported partial bytes, and
+fresh-storage zeroing are separate counters. An absent matching length is not
+proof of length churn: earlier eviction or still-live inputs can affect reuse.
+`metal_input_inventory` reports the queue's completed-demand bounds, current
+available inventory, and bounded lookup metadata. Difference cumulative fields
+between observations; do not difference or sum current levels or lifetime maxima
+such as `completed_peak_*`. Logical ownership is not physical residency.
+Recycling reduces allocation/destruction; direct filling additionally removes the
+eligible CPU-snapshot-to-Metal copy, not the guest read or native destination write.
 
 Scanout keeps its initialized scratch buffer between captures, avoiding redundant
 zero-filling at unchanged dimensions. Existing frame-push coalescing and display

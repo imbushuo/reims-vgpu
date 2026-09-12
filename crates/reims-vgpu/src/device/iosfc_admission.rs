@@ -149,7 +149,10 @@ impl Admission {
             return None;
         }
         state.worker = true;
-        Some(Worker(Arc::clone(self)))
+        Some(Worker {
+            owner: Arc::clone(self),
+            epoch: state.epoch,
+        })
     }
 
     fn state_released(&self) {
@@ -235,13 +238,47 @@ impl Ticket {
     }
 }
 
-pub(crate) struct Worker(Arc<Admission>);
+impl crate::runtime::drain::census::checkpoints::DemandSource for Admission {
+    fn checkpoint_demand(&self, epoch: u64) -> crate::runtime::drain::census::checkpoints::Demand {
+        use crate::runtime::drain::census::checkpoints::Demand;
+        let Some(state) = self.state.try_lock() else {
+            return Demand::Contended;
+        };
+        if !state.live || state.epoch != epoch {
+            Demand::Closed
+        } else if state.queue.is_empty() {
+            Demand::Absent
+        } else {
+            Demand::Waiting
+        }
+    }
+}
+
+pub(crate) struct Worker {
+    owner: Arc<Admission>,
+    epoch: u64,
+}
+
+impl Worker {
+    pub fn observe_tranche(
+        &self,
+        device: u64,
+        started_us: u64,
+    ) -> crate::runtime::drain::census::checkpoints::Scope {
+        crate::runtime::drain::census::checkpoints::Scope::start(
+            device,
+            self.epoch,
+            self.owner.clone(),
+            started_us,
+        )
+    }
+}
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock();
+        let mut state = self.owner.state.lock();
         state.worker = false;
-        self.0.notify(&mut state);
+        self.owner.notify(&mut state);
     }
 }
 
@@ -349,6 +386,41 @@ mod tests {
             data: 1,
             size: 4,
         }
+    }
+
+    #[test]
+    fn checkpoint_snapshot_is_nonblocking_and_does_not_mutate_admission() {
+        use crate::runtime::drain::census::checkpoints::{Demand, DemandSource};
+        let owner = Admission::new();
+        let worker = owner.worker().unwrap();
+        assert_eq!(owner.checkpoint_demand(worker.epoch), Demand::Absent);
+        let ticket = owner.issue(1, 7, write()).unwrap();
+        let held = owner.state.lock();
+        let revision = held.revision;
+        assert_eq!(owner.checkpoint_demand(worker.epoch), Demand::Contended);
+        drop(held);
+        assert_eq!(owner.checkpoint_demand(worker.epoch), Demand::Waiting);
+        assert_eq!(owner.state.lock().revision, revision);
+        assert_eq!(ticket.poll(), Status::Busy);
+        drop(worker);
+        assert_eq!(ticket.poll(), Status::Ready);
+        assert!(ticket.finish());
+    }
+
+    #[test]
+    fn checkpoint_snapshot_rejects_a_reopened_admission_epoch() {
+        use crate::runtime::drain::census::checkpoints::{Demand, DemandSource};
+        let owner = Admission::new();
+        let worker = owner.worker().unwrap();
+        let epoch = worker.epoch;
+        owner.close(7, End::Reset);
+        assert_eq!(owner.checkpoint_demand(epoch), Demand::Closed);
+        drop(worker);
+        owner.reopen();
+        let ticket = owner.issue(1, 7, write()).unwrap();
+        assert_eq!(owner.checkpoint_demand(epoch), Demand::Closed);
+        assert_eq!(owner.checkpoint_demand(ticket.epoch), Demand::Waiting);
+        assert!(ticket.finish());
     }
 
     #[test]

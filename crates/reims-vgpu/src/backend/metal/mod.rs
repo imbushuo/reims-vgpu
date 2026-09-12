@@ -28,11 +28,13 @@ pub(crate) mod format;
 #[cfg(target_os = "macos")]
 mod function;
 #[cfg(target_os = "macos")]
+pub(crate) mod input;
+#[cfg(target_os = "macos")]
 pub(crate) mod mipmap;
 #[cfg(target_os = "macos")]
-pub(crate) mod planar;
-#[cfg(target_os = "macos")]
 pub(crate) mod mtl_enum;
+#[cfg(target_os = "macos")]
+pub(crate) mod planar;
 #[cfg(target_os = "macos")]
 pub(crate) mod raw_metal;
 #[cfg(target_os = "macos")]

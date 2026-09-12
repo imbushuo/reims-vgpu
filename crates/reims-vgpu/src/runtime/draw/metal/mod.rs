@@ -25,13 +25,14 @@ pub use icb::*;
 // The host-side depth/stencil attachment buffers — this rail's own working
 // parts, so they are not re-exported.
 mod depth_stencil;
-use depth_stencil::{seed_host_depth_stencil, DepthStencilAspect, HostAttachment};
 pub(crate) use depth_stencil::HostDepthStencil;
+use depth_stencil::{seed_host_depth_stencil, DepthStencilAspect, HostAttachment};
+mod hazards;
+pub(crate) mod inputs;
 mod sampled;
 mod storage;
-mod hazards;
-pub(crate) use hazards::PassDependencies;
 pub(crate) use hazards::land_before_refusal;
+pub(crate) use hazards::PassDependencies;
 
 /// This rail's retention decision for one colour attachment, made before the
 /// seed is built and spent by the encode and then by the Store.
@@ -180,10 +181,18 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     force_full_store: bool,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
     if req.continues_render_pass || req.render_pass_continues {
-        return (EncodeStatus::BadArgs("draw_mtl_render_pass_owner_required"), None);
+        return (
+            EncodeStatus::BadArgs("draw_mtl_render_pass_owner_required"),
+            None,
+        );
     }
-    crate::backend::metal::render_pass::MetalRenderPass::default()
-        .encode_draw(state, host, req, writeback_guest, force_full_store)
+    crate::backend::metal::render_pass::MetalRenderPass::default().encode_draw(
+        state,
+        host,
+        req,
+        writeback_guest,
+        force_full_store,
+    )
 }
 
 pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
@@ -201,8 +210,12 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         ReimsVgpuViewport, REIMS_VGPU_BINDING_SAMPLER_BASE,
         REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT, REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8,
     };
-    use crate::backend::metal::render::{render_core_mrt, ColorRt, ColorTarget, VisibilityQuery};
+    use crate::backend::metal::input::Class as InputClass;
+    use crate::backend::metal::render::{
+        render_core_mrt_inputs, ColorRt, ColorTarget, RenderBuffers, VisibilityQuery,
+    };
     use crate::backend::metal::util::ErrOut;
+    use inputs::PreparedInput;
 
     // Opened before the first refusal check, so a chain that declines is charged
     // to whichever phase was open rather than vanishing from the division. See
@@ -275,11 +288,11 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         return (EncodeStatus::BadArgs("draw_mtl_zero_geom"), None);
     }
     // Metal pass requires matching RT dimensions.
-    if color_list
-        .iter()
-        .any(|c| c.width != width || c.height != height
-            || (c.storage == ColorStorage::GuestBacked && c.mapping_id == 0 && c.target_gva == 0))
-    {
+    if color_list.iter().any(|c| {
+        c.width != width
+            || c.height != height
+            || (c.storage == ColorStorage::GuestBacked && c.mapping_id == 0 && c.target_gva == 0)
+    }) {
         return (EncodeStatus::BadArgs("draw_mtl_mrt_geom_mismatch"), None);
     }
     // Pages each attachment's GVA Store may reach, resolved here rather than at
@@ -316,9 +329,15 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         );
     };
     if pipeline.raster_sample_count > 1
-        && req.colors.iter().any(|c| c.storage == ColorStorage::Memoryless)
+        && req
+            .colors
+            .iter()
+            .any(|c| c.storage == ColorStorage::Memoryless)
     {
-        return (EncodeStatus::BadArgs("draw_mtl_memoryless_multisample"), None);
+        return (
+            EncodeStatus::BadArgs("draw_mtl_memoryless_multisample"),
+            None,
+        );
     }
     // `load_render_pipeline` declared it; this rail is about to turn the
     // guest's shader form into the host's. Unlike the Vulkan rail this one
@@ -388,49 +407,71 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         crate::runtime::draw::advance_pipeline(state, host, req.task_id, req.pipeline_ref, step);
     }
 
-    // Materialize buffer backs (storage first, then ReimsVgpuBuffer views).
+    // Capture buffers before constructing CPU views or sealing native inputs.
     // Archive apple-pv-gpu-exec: a non-zero bound buffer that does not resolve
     // sets all_binds_ok=false and gates the draw (never feeds garbage geometry).
     chain_phase::enter(chain_phase::Phase::Binds);
+    let input_plan = inputs::InputPlan::new(req, &pipeline);
+    let direct_inputs = input_plan.native_plain;
     let mut vtx_storage: Vec<Vec<u8>> = Vec::new();
     let mut frag_storage: Vec<Vec<u8>> = Vec::new();
+    let mut native_vtx = Vec::new();
+    let mut native_frag = Vec::new();
     let mut vtx_bind_idx: Vec<u32> = Vec::new();
     let mut frag_bind_idx: Vec<u32> = Vec::new();
     for b in req.vertex_buffers.iter() {
         if b.buffer_ref == 0 {
             continue;
         }
-        let Some(bytes) = load_buffer_bytes(state, host, req.task_id, b.buffer_ref, b.offset)
-        else {
-            crate::observe::fail(format!(
-                "metal_draw gate: vertex buffer miss ref={} idx={} off={}",
-                b.buffer_ref, b.index, b.offset
-            ));
-            return (
-                EncodeStatus::MetalFailed("draw_mtl_vertex_buffer_miss"),
-                None,
-            );
-        };
-        vtx_bind_idx.push(b.index);
-        vtx_storage.push(bytes);
+        match inputs::prepare(
+            state,
+            host,
+            req.task_id,
+            b,
+            InputClass::Vertex,
+            input_plan.native_vertex(b.index),
+            "draw_mtl_vertex_buffer_miss",
+        ) {
+            Ok(PreparedInput::Native(buffer)) => native_vtx.push(buffer),
+            Ok(PreparedInput::Cpu(bytes)) => {
+                vtx_bind_idx.push(b.index);
+                vtx_storage.push(bytes);
+            }
+            Err(status) => {
+                crate::observe::fail(format!(
+                    "metal_draw gate: vertex buffer miss ref={} idx={} off={}",
+                    b.buffer_ref, b.index, b.offset
+                ));
+                return (status, None);
+            }
+        }
     }
     for b in req.fragment_buffers.iter() {
         if b.buffer_ref == 0 {
             continue;
         }
-        let Some(bytes) = load_buffer_bytes(state, host, req.task_id, b.buffer_ref, b.offset)
-        else {
-            crate::observe::fail(format!(
-                "metal_draw gate: fragment buffer miss ref={} idx={} off={}",
-                b.buffer_ref, b.index, b.offset
-            ));
-            return (
-                EncodeStatus::MetalFailed("draw_mtl_fragment_buffer_miss"),
-                None,
-            );
-        };
-        frag_bind_idx.push(b.index);
-        frag_storage.push(bytes);
+        match inputs::prepare(
+            state,
+            host,
+            req.task_id,
+            b,
+            InputClass::Fragment,
+            direct_inputs,
+            "draw_mtl_fragment_buffer_miss",
+        ) {
+            Ok(PreparedInput::Native(buffer)) => native_frag.push(buffer),
+            Ok(PreparedInput::Cpu(bytes)) => {
+                frag_bind_idx.push(b.index);
+                frag_storage.push(bytes);
+            }
+            Err(status) => {
+                crate::observe::fail(format!(
+                    "metal_draw gate: fragment buffer miss ref={} idx={} off={}",
+                    b.buffer_ref, b.index, b.offset
+                ));
+                return (status, None);
+            }
+        }
     }
 
     // Stage-in attrs: layout always comes from the serializer-object pipeline vertex
@@ -438,13 +479,6 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     // bound that buffer index; otherwise Metal still needs the descriptor or
     // PSO create fails with "Vertex function has input attributes but no
     // vertex descriptor was set".
-    let stage_in_indices: std::collections::BTreeSet<u32> = pipeline
-        .vertex_attributes
-        .iter()
-        .filter(|a| a.format != 0 && a.stride != 0)
-        .map(|a| a.buffer_index)
-        .collect();
-
     // Build ReimsVgpuVertexAttr list from pipeline vertex block + optional buffer storage.
     use crate::backend::metal::abi::ReimsVgpuVertexAttr;
     let mut attrs: Vec<ReimsVgpuVertexAttr> = Vec::new();
@@ -490,9 +524,6 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         if stage_in_with_data.contains(&binding) {
             continue;
         }
-        // Stage-in layout without bytes: still setVertexBuffer so the PSO
-        // descriptor's buffer index has a bound buffer at draw time.
-        let _ = stage_in_indices.contains(&binding);
         let mut ab = null_apv_buffer();
         ab.binding = binding;
         ab.data = data.as_ptr() as *mut u8;
@@ -721,22 +752,36 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     let depth_storage = req.depth_attach.as_ref().and_then(|da| {
         let prior = pass.depth.take();
         let continuing = prior.is_some();
-        let mut seeded = prior.or_else(|| seed_host_depth_stencil(
-            state,
-            host,
-            req,
-            DepthStencilAspect::Depth {
-                clear: da.clear_depth,
-            },
-            HostAttachment::from(*da),
-            (width, height),
-        ))?;
+        let mut seeded = prior.or_else(|| {
+            seed_host_depth_stencil(
+                state,
+                host,
+                req,
+                DepthStencilAspect::Depth {
+                    clear: da.clear_depth,
+                },
+                HostAttachment::from(*da),
+                (width, height),
+            )
+        })?;
         depth_attach_api = Some(ReimsVgpuDepthAttachment {
             pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
-            load_action: map_load_action(req.pipeline_ref,
-                if continuing { MTL_LOAD_ACTION_LOAD } else { da.load_action }),
-            store_action: map_store_action(req.pipeline_ref,
-                if req.render_pass_continues { MTL_STORE_ACTION_STORE } else { da.store_action }),
+            load_action: map_load_action(
+                req.pipeline_ref,
+                if continuing {
+                    MTL_LOAD_ACTION_LOAD
+                } else {
+                    da.load_action
+                },
+            ),
+            store_action: map_store_action(
+                req.pipeline_ref,
+                if req.render_pass_continues {
+                    MTL_STORE_ACTION_STORE
+                } else {
+                    da.store_action
+                },
+            ),
             clear_depth: da.clear_depth,
             data: seeded.data.as_mut_ptr(),
             len: seeded.data.len(),
@@ -748,22 +793,36 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     let stencil_storage = req.stencil_attach.as_ref().and_then(|sa| {
         let prior = pass.stencil.take();
         let continuing = prior.is_some();
-        let mut seeded = prior.or_else(|| seed_host_depth_stencil(
-            state,
-            host,
-            req,
-            DepthStencilAspect::Stencil {
-                clear: sa.clear_stencil,
-            },
-            HostAttachment::from(*sa),
-            (width, height),
-        ))?;
+        let mut seeded = prior.or_else(|| {
+            seed_host_depth_stencil(
+                state,
+                host,
+                req,
+                DepthStencilAspect::Stencil {
+                    clear: sa.clear_stencil,
+                },
+                HostAttachment::from(*sa),
+                (width, height),
+            )
+        })?;
         stencil_attach_api = Some(ReimsVgpuStencilAttachment {
             pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8,
-            load_action: map_load_action(req.pipeline_ref,
-                if continuing { MTL_LOAD_ACTION_LOAD } else { sa.load_action }),
-            store_action: map_store_action(req.pipeline_ref,
-                if req.render_pass_continues { MTL_STORE_ACTION_STORE } else { sa.store_action }),
+            load_action: map_load_action(
+                req.pipeline_ref,
+                if continuing {
+                    MTL_LOAD_ACTION_LOAD
+                } else {
+                    sa.load_action
+                },
+            ),
+            store_action: map_store_action(
+                req.pipeline_ref,
+                if req.render_pass_continues {
+                    MTL_STORE_ACTION_STORE
+                } else {
+                    sa.store_action
+                },
+            ),
             clear_stencil: sa.clear_stencil,
             data: seeded.data.as_mut_ptr(),
             len: seeded.data.len(),
@@ -822,15 +881,19 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     // boots; see [`chain_phase::CostSpan`].
     let mut color_outs: Vec<Vec<u8>> = {
         let _outs = chain_phase::CostSpan::new("metal_seed_outs_us");
-        color_list.iter().map(|c| {
-            if writeback_guest && c.storage == ColorStorage::GuestBacked
-                && c.store_action != MTL_STORE_ACTION_DONT_CARE
-            {
-                vec![0u8; need]
-            } else {
-                Vec::new()
-            }
-        }).collect()
+        color_list
+            .iter()
+            .map(|c| {
+                if writeback_guest
+                    && c.storage == ColorStorage::GuestBacked
+                    && c.store_action != MTL_STORE_ACTION_DONT_CARE
+                {
+                    vec![0u8; need]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect()
     };
 
     // For indexed draws, pass index_count as vertex_count for the early gate.
@@ -874,31 +937,40 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             // is read whatever the load action, because it is also what the
             // Store publishes against.
             if target.texture.is_none() {
-                target.resident = (c.mapping_id != 0).then(|| {
-                    plan_resident_target(state, host, req.task_id, c, width, height)
-                });
+                target.resident = (c.mapping_id != 0)
+                    .then(|| plan_resident_target(state, host, req.task_id, c, width, height));
                 let Some(device) = crate::backend::metal::runtime::system_device() else {
                     return (EncodeStatus::NoMetal("draw_mtl_render_pass_device"), None);
                 };
                 target.texture = match target.resident.as_mut() {
                     Some(plan) => plan.texture.take().or_else(|| {
                         crate::backend::metal::resident::create(
-                            device, &plan.key, ::metal::MTLPixelFormat::RGBA8Unorm, 4,
+                            device,
+                            &plan.key,
+                            ::metal::MTLPixelFormat::RGBA8Unorm,
+                            4,
                         )
                     }),
                     None => crate::backend::metal::render::new_color_target(
-                        device, ::metal::MTLPixelFormat::RGBA8Unorm, width, height,
+                        device,
+                        ::metal::MTLPixelFormat::RGBA8Unorm,
+                        width,
+                        height,
                         ::metal::MTLStorageMode::Shared,
                     ),
                 };
                 if target.texture.is_none() {
-                    return (EncodeStatus::MetalFailed("draw_mtl_render_pass_allocation"), None);
+                    return (
+                        EncodeStatus::MetalFailed("draw_mtl_render_pass_allocation"),
+                        None,
+                    );
                 }
             }
             if c.load_action != MTL_LOAD_ACTION_LOAD || color_seeds[i].is_some() {
                 continue;
             }
-            if target.resident
+            if target
+                .resident
                 .as_ref()
                 .is_some_and(|plan| plan.holds_prior)
             {
@@ -909,7 +981,8 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
                 continue;
             }
             crate::runtime::drain::note_store_route("metal_seed_load_asked");
-            color_seeds[i] = seed_color_load(state, host, req.task_id, c.texture_ref, 0, width, height);
+            color_seeds[i] =
+                seed_color_load(state, host, req.task_id, c.texture_ref, 0, width, height);
             if color_seeds[i].is_none() {
                 crate::observe::fail(format!(
                     "metal_draw guest_attachment_fallback_seed fail \
@@ -1028,20 +1101,29 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     }
 
     use crate::backend::metal::render::{reflect_render_textures_mtlb, RenderPipelineLayout};
-    let color_keys: Vec<_> = color_rts.iter()
-        .map(|color| color.pipeline_key(color.native_pixel_format())).collect();
-    let texture_usages = match reflect_render_textures_mtlb(&vert, &frag, RenderPipelineLayout {
-        attrs: &attrs,
-        blend: blend_opt,
-        colors: &color_keys,
-        depth_format: depth_attach_api.as_ref().map_or(0, |a| a.pixel_format),
-        stencil_format: stencil_attach_api.as_ref().map_or(0, |a| a.pixel_format),
-    }) {
+    let color_keys: Vec<_> = color_rts
+        .iter()
+        .map(|color| color.pipeline_key(color.native_pixel_format()))
+        .collect();
+    let texture_usages = match reflect_render_textures_mtlb(
+        &vert,
+        &frag,
+        RenderPipelineLayout {
+            attrs: &attrs,
+            blend: blend_opt,
+            colors: &color_keys,
+            depth_format: depth_attach_api.as_ref().map_or(0, |a| a.pixel_format),
+            stencil_format: stencil_attach_api.as_ref().map_or(0, |a| a.pixel_format),
+        },
+    ) {
         Ok(usages) => usages,
         Err(reason) => return (EncodeStatus::RailRefused(reason), None),
     };
     let mut writable = storage::StorageTextures::default();
-    if texture_usages.vertex.iter().chain(&texture_usages.fragment)
+    if texture_usages
+        .vertex
+        .iter()
+        .chain(&texture_usages.fragment)
         .any(|usage| usage.access.writes())
     {
         crate::runtime::drain::note_store_route("metal_batch_storage_boundary");
@@ -1054,15 +1136,28 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         (&texture_usages.fragment, &req.fragment_textures),
     ] {
         for usage in usages.iter().filter(|usage| usage.access.writes()) {
-            let Some(index) = usage.binding.checked_sub(
-                crate::backend::metal::abi::REIMS_VGPU_BINDING_TEXTURE_BASE,
-            ) else {
+            let Some(index) = usage
+                .binding
+                .checked_sub(crate::backend::metal::abi::REIMS_VGPU_BINDING_TEXTURE_BASE)
+            else {
                 return (EncodeStatus::BadArgs("draw_mtl_storage_binding"), None);
             };
-            let Some(bind) = binds.iter().find(|bind| bind.index == index && bind.texture_ref != 0)
-                else { return (EncodeStatus::BadArgs("draw_mtl_storage_unbound"), None) };
-            if !pass.dependencies.borrow_mut().aliases(state, host, req, bind.texture_ref).is_empty() {
-                return (EncodeStatus::Unsupported("draw_mtl_storage_attachment_alias"), None);
+            let Some(bind) = binds
+                .iter()
+                .find(|bind| bind.index == index && bind.texture_ref != 0)
+            else {
+                return (EncodeStatus::BadArgs("draw_mtl_storage_unbound"), None);
+            };
+            if !pass
+                .dependencies
+                .borrow_mut()
+                .aliases(state, host, req, bind.texture_ref)
+                .is_empty()
+            {
+                return (
+                    EncodeStatus::Unsupported("draw_mtl_storage_attachment_alias"),
+                    None,
+                );
             }
             if let Err(reason) = writable.add(state, host, req, bind.texture_ref, index) {
                 return (reason, None);
@@ -1077,8 +1172,18 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     let mut vtx_imgs: Vec<ReimsVgpuSampledImage> = Vec::new();
     let mut frag_imgs: Vec<ReimsVgpuSampledImage> = Vec::new();
     for (binds, uploads, images, miss_reason) in [
-        (&req.vertex_textures, &mut vtx_tex_items, &mut vtx_imgs, "draw_mtl_vertex_texture_miss"),
-        (&req.fragment_textures, &mut frag_tex_items, &mut frag_imgs, "draw_mtl_fragment_texture_miss"),
+        (
+            &req.vertex_textures,
+            &mut vtx_tex_items,
+            &mut vtx_imgs,
+            "draw_mtl_vertex_texture_miss",
+        ),
+        (
+            &req.fragment_textures,
+            &mut frag_tex_items,
+            &mut frag_imgs,
+            "draw_mtl_fragment_texture_miss",
+        ),
     ] {
         for bind in binds.iter().filter(|bind| bind.texture_ref != 0) {
             // Any read alias shares the native writable allocation, even across stages.
@@ -1089,7 +1194,8 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             let Some(upload) = sampled::load(state, host, req.task_id, bind.texture_ref) else {
                 crate::observe::fail(format!(
                     "metal_draw gate: reason={miss_reason} ref={} {}",
-                    bind.texture_ref, sample_miss_detail(state, host, req.task_id, bind.texture_ref),
+                    bind.texture_ref,
+                    sample_miss_detail(state, host, req.task_id, bind.texture_ref),
                 ));
                 return (EncodeStatus::MetalFailed(miss_reason), None);
             };
@@ -1116,9 +1222,12 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         && visibility.is_none()
         && depth_attach_api.is_none()
         && stencil_attach_api.is_none()
-        && !texture_usages.vertex.iter().chain(&texture_usages.fragment)
+        && !texture_usages
+            .vertex
+            .iter()
+            .chain(&texture_usages.fragment)
             .any(|usage| usage.access.writes());
-    let st = render_core_mrt(
+    let st = render_core_mrt_inputs(
         &vert,
         &frag,
         width,
@@ -1133,8 +1242,16 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         None,
         indexed_draw.as_ref(),
         &attrs,
-        &vtx_bufs,
-        &frag_bufs,
+        if direct_inputs {
+            RenderBuffers::Native(native_vtx)
+        } else {
+            RenderBuffers::Host(&vtx_bufs)
+        },
+        if direct_inputs {
+            RenderBuffers::Native(native_frag)
+        } else {
+            RenderBuffers::Host(&frag_bufs)
+        },
         &vtx_imgs,
         &vtx_samps,
         &frag_imgs,
@@ -1161,7 +1278,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     if let Some(query) = visibility.as_ref() {
         req.visibility_samples = query.samples;
     }
-    // Keep owned storage live through render_core_mrt (ReimsVgpu* hold raw pointers).
+    // CPU-view storage stays live through the render call (ReimsVgpu* hold raw pointers).
     let _ = (
         &vtx_storage,
         &frag_storage,
@@ -1191,10 +1308,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         // bytes on the next record.
         pass.depth = depth_storage;
         pass.stencil = stencil_storage;
-        return (
-            EncodeStatus::Ok,
-            None,
-        );
+        return (EncodeStatus::Ok, None);
     }
     for (i, c) in color_list.iter().enumerate() {
         if c.store_action == MTL_STORE_ACTION_DONT_CARE {
@@ -1318,7 +1432,11 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         };
         if wrote {
             any_write = true;
-            if let Some(plan) = pass.target(c).ok().and_then(|target| target.resident.as_ref()) {
+            if let Some(plan) = pass
+                .target(c)
+                .ok()
+                .and_then(|target| target.resident.as_ref())
+            {
                 publish_resident_target(state, plan);
             }
             // Early-boot logo+pill: paint mapper-ref-texture front before first DisplaySwap.
@@ -1344,7 +1462,11 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     // Only a total writeback failure is an error: a partial MRT writeback is Ok
     // if at least one RT landed, and each RT that did not has already emitted its
     // own `metal_draw writeback fail` line above.
-    if !any_write && color_list.iter().any(|c| c.store_action != MTL_STORE_ACTION_DONT_CARE) {
+    if !any_write
+        && color_list
+            .iter()
+            .any(|c| c.store_action != MTL_STORE_ACTION_DONT_CARE)
+    {
         return (
             EncodeStatus::WritebackFailed("draw_mtl_writeback_none"),
             None,

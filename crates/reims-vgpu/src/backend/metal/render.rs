@@ -10,6 +10,7 @@ use crate::backend::metal::cache::{
 use crate::backend::metal::constants::*;
 use crate::backend::metal::format::mtl_pixel_format_bpp;
 use crate::backend::metal::function::load_only_function;
+use crate::backend::metal::input::{self, Class as InputClass};
 use crate::backend::metal::mtl_enum;
 use crate::backend::metal::raw_metal::{
     command_buffer_error_description, render_reflection_sampler_mask,
@@ -28,32 +29,18 @@ use metal::*;
 use reims_vgpu_protocol::extent::tight_image_bytes;
 use std::ptr;
 
-// Draw staging vectors disappear before a deferred batch is submitted. Copy
-// even page-aligned inputs; retaining a no-copy MTLBuffer would retain only the
-// pointer, not the caller's allocation or its contents.
-fn new_buffer_from_host(device: &Device, data: *const u8, len: usize) -> Option<Buffer> {
-    if data.is_null() || len == 0 {
-        return None;
-    }
-    unsafe {
-        super::raw_metal::new_buffer_with_data(
-            device, data.cast(), len as u64, MTLResourceOptions::StorageModeShared,
-        )
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct RenderBatch {
     command: Option<CommandBuffer>,
     encoder: Option<RenderCommandEncoder>,
-    buffers: Vec<Buffer>,
+    inputs: input::Submission,
     textures: Vec<Texture>,
     vertex_buffer_slots: Vec<u64>,
     fragment_buffer_slots: Vec<u64>,
     vertex_texture_slots: Vec<u64>,
     fragment_texture_slots: Vec<u64>,
     attachments: Vec<(u64, usize)>,
-    failed: bool,
+    failure: Option<Status>,
     #[cfg(test)]
     pub(crate) submissions: usize,
     #[cfg(test)]
@@ -66,15 +53,27 @@ impl RenderBatch {
     }
 
     pub(crate) fn encoder(
-        &mut self, device: &Device, pass: &RenderPassDescriptorRef,
+        &mut self,
+        device: &Device,
+        pass: &RenderPassDescriptorRef,
     ) -> Result<RenderCommandEncoder, Status> {
+        if let Some(status) = self.failure {
+            return Err(status);
+        }
         let attachments: Vec<_> = (0..REIMS_VGPU_METAL_MAX_COLOR_RTS as u64)
             .filter_map(|slot| {
-                pass.color_attachments().object_at(slot)?.texture()
+                pass.color_attachments()
+                    .object_at(slot)?
+                    .texture()
                     .map(|texture| (slot, texture.as_ptr() as usize))
-            }).collect();
+            })
+            .collect();
         let reload = attachments.iter().any(|&(slot, _)| {
-            pass.color_attachments().object_at(slot).unwrap().load_action() as u64 != MTLLoadAction::Load as u64
+            pass.color_attachments()
+                .object_at(slot)
+                .unwrap()
+                .load_action() as u64
+                != MTLLoadAction::Load as u64
         });
         if self.pending() && (self.attachments != attachments || reload) {
             crate::runtime::drain::note_store_route("metal_batch_attachment_boundary");
@@ -90,6 +89,13 @@ impl RenderBatch {
         let encoder = super::raw_metal::new_render_command_encoder(&command, pass)
             .ok_or_else(|| Status::execute("metal_render_encoder_unavailable"))?
             .to_owned();
+        if let Err(status) = self
+            .inputs
+            .begin(&command, super::runtime::thread_input_pool(device))
+        {
+            encoder.end_encoding();
+            return Err(status);
+        }
         self.command = Some(command);
         self.encoder = Some(encoder.clone());
         self.attachments = attachments;
@@ -104,24 +110,39 @@ impl RenderBatch {
     }
 
     pub(crate) fn finish(&mut self, err: ErrOut<'_>) -> Result<(), Status> {
-        if self.failed {
-            return Err(Status::execute("metal_render_command_buffer_failed"));
+        if let Some(status) = self.failure {
+            return Err(status);
         }
         self.end_encoding();
-        let Some(command) = self.command.take() else { return Ok(()); };
+        let Some(command) = self.command.take() else {
+            return Ok(());
+        };
         let _span = crate::runtime::chain_phase::CostSpan::new("metal_commit_us");
         crate::runtime::drain::note_store_route("metal_submissions");
         #[cfg(test)]
-        { self.submissions += 1; }
+        {
+            self.submissions += 1;
+        }
         command.commit();
         command.wait_until_completed();
-        self.buffers.clear();
         self.textures.clear();
         if command.status() != MTLCommandBufferStatus::Completed {
-            self.failed = true;
-            set_err(err, format!("Metal command buffer failed: {}",
-                command_buffer_error_description(&command)));
-            return Err(Status::execute("metal_render_command_buffer_failed"));
+            self.inputs.discard();
+            let status = Status::execute("metal_render_command_buffer_failed");
+            self.failure = Some(status);
+            set_err(
+                err,
+                format!(
+                    "Metal command buffer failed: {}",
+                    command_buffer_error_description(&command)
+                ),
+            );
+            return Err(status);
+        }
+        if let Err(status) = self.inputs.completed(&command) {
+            self.inputs.discard();
+            self.failure = Some(status);
+            return Err(status);
         }
         Ok(())
     }
@@ -131,7 +152,9 @@ impl Drop for RenderBatch {
     fn drop(&mut self) {
         if self.pending() {
             if let Err(status) = self.finish((ptr::null_mut(), 0)) {
-                crate::observe::Emit::refusal("metal_render_batch_drop", &status).unwrap().fail();
+                crate::observe::Emit::refusal("metal_render_batch_drop", &status)
+                    .unwrap()
+                    .fail();
             }
         }
     }
@@ -147,7 +170,8 @@ fn reset_draw_state(encoder: &RenderCommandEncoderRef, batch: &mut RenderBatch) 
     // metal-rs's setter cannot spell Metal's documented nil reset.
     unsafe {
         use objc::{msg_send, sel, sel_impl};
-        let _: () = msg_send![encoder, setDepthStencilState: ptr::null_mut::<objc::runtime::Object>()];
+        let _: () =
+            msg_send![encoder, setDepthStencilState: ptr::null_mut::<objc::runtime::Object>()];
     }
     encoder.set_stencil_reference_value(0);
     encoder.set_visibility_result_mode(MTLVisibilityResultMode::Disabled, 0);
@@ -176,7 +200,7 @@ struct AttrBufferSlot {
     step_function: u32,
     step_rate: u32,
     index: u64,
-    buffer: Buffer,
+    buffer: input::Filled,
 }
 
 fn apply_blend(
@@ -540,13 +564,19 @@ fn find_or_add_attr_slot(
             .field("count", slots.len())
             .field("limit", REIMS_VGPU_METAL_MAX_BUFFERS));
     }
-    let buffer = match new_buffer_from_host(device, attr.data, attr.len) {
-        Some(b) => b,
-        None => {
+    let buffer = match unsafe {
+        input::copy(
+            device,
+            attr.data,
+            attr.len,
+            InputClass::Attribute,
+            "metal_render_vertex_buffer_create_failed",
+        )
+    } {
+        Ok(b) => b,
+        Err(status) => {
             set_err(err, "failed to create vertex attribute buffer");
-            return Err(Status::execute("metal_render_vertex_buffer_create_failed")
-                .field("buffer", attr.buffer_index)
-                .field("len", attr.len));
+            return Err(status.field("buffer", attr.buffer_index));
         }
     };
     let index = attr.buffer_index as u64;
@@ -707,13 +737,18 @@ pub(crate) fn reflect_render_textures_mtlb(
     layout: RenderPipelineLayout<'_>,
 ) -> Result<std::sync::Arc<RenderTextureUsages>, Status> {
     objc::rc::autoreleasepool(|| {
-        let device = system_device().ok_or_else(|| Status::execute("metal_render_device_unavailable"))?;
+        let device =
+            system_device().ok_or_else(|| Status::execute("metal_render_device_unavailable"))?;
         let err = (std::ptr::null_mut(), 0);
         let vertex = load_only_function(device, vertex_mtlb, "vertex", err)?;
         let fragment = load_only_function(device, fragment_mtlb, "fragment", err)?;
         let descriptor = make_vertex_descriptor(layout.attrs, err)?;
         let key = fill_render_pso_key(
-            layout.attrs, layout.blend, layout.colors, layout.depth_format, layout.stencil_format,
+            layout.attrs,
+            layout.blend,
+            layout.colors,
+            layout.depth_format,
+            layout.stencil_format,
         );
         let lookup = RenderPsoLookup {
             desc: &key,
@@ -721,7 +756,12 @@ pub(crate) fn reflect_render_textures_mtlb(
             frag: BlobKey::new(fragment_mtlb),
         };
         let (_, _, _, textures) = get_render_pipeline_state(
-            device, &vertex, &fragment, descriptor.as_ref(), &lookup, err,
+            device,
+            &vertex,
+            &fragment,
+            descriptor.as_ref(),
+            &lookup,
+            err,
         )?;
         Ok(textures)
     })
@@ -853,7 +893,15 @@ pub(super) fn get_render_pipeline_state(
     vertex_descriptor: Option<&VertexDescriptor>,
     lookup: &RenderPsoLookup<'_>,
     err: ErrOut<'_>,
-) -> Result<(RenderPipelineState, u32, u32, std::sync::Arc<RenderTextureUsages>), Status> {
+) -> Result<
+    (
+        RenderPipelineState,
+        u32,
+        u32,
+        std::sync::Arc<RenderTextureUsages>,
+    ),
+    Status,
+> {
     if let Some(hit) = render_pso_lookup(lookup) {
         return Ok(hit);
     }
@@ -965,7 +1013,9 @@ pub(super) fn get_render_pipeline_state(
         vertex: reflect_texture_stage(reflection_ptr, true)?,
         fragment: reflect_texture_stage(reflection_ptr, false)?,
     });
-    Ok(render_pso_insert(lookup, pso, vert_mask, frag_mask, textures))
+    Ok(render_pso_insert(
+        lookup, pso, vert_mask, frag_mask, textures,
+    ))
 }
 
 fn reflect_texture_stage(
@@ -973,7 +1023,9 @@ fn reflect_texture_stage(
     vertex: bool,
 ) -> Result<Vec<RenderTextureUsage>, Status> {
     let bindings = super::raw_metal::render_reflection_texture_bindings(reflection, vertex)
-        .ok_or_else(|| Status::execute("metal_render_texture_reflection_missing").field("vertex", vertex))?;
+        .ok_or_else(|| {
+            Status::execute("metal_render_texture_reflection_missing").field("vertex", vertex)
+        })?;
     texture_usages(&bindings, vertex)
 }
 
@@ -990,21 +1042,35 @@ fn texture_usages(
             BINDING_ACCESS_READ_ONLY => RenderTextureAccess::Read,
             BINDING_ACCESS_READ_WRITE => RenderTextureAccess::ReadWrite,
             BINDING_ACCESS_WRITE_ONLY => RenderTextureAccess::Write,
-            unknown => return Err(Status::execute("metal_render_texture_access_unknown")
-                .field("vertex", vertex).field("index", binding.index).field("access", unknown)),
+            unknown => {
+                return Err(Status::execute("metal_render_texture_access_unknown")
+                    .field("vertex", vertex)
+                    .field("index", binding.index)
+                    .field("access", unknown))
+            }
         };
         let count = binding.array_length.max(1);
-        let end = binding.index.checked_add(count)
+        let end = binding
+            .index
+            .checked_add(count)
             .filter(|end| *end <= REIMS_VGPU_METAL_MAX_TEXTURES as u64)
-            .ok_or_else(|| Status::execute("metal_render_texture_reflection_past_table")
-                .field("vertex", vertex).field("index", binding.index).field("count", count))?;
+            .ok_or_else(|| {
+                Status::execute("metal_render_texture_reflection_past_table")
+                    .field("vertex", vertex)
+                    .field("index", binding.index)
+                    .field("count", count)
+            })?;
         for index in binding.index..end {
             let banded = REIMS_VGPU_BINDING_TEXTURE_BASE + index as u32;
             if result.iter().any(|prior| prior.binding == banded) {
                 return Err(Status::execute("metal_render_texture_reflection_overlap")
-                    .field("vertex", vertex).field("index", index));
+                    .field("vertex", vertex)
+                    .field("index", index));
             }
-            result.push(RenderTextureUsage { binding: banded, access });
+            result.push(RenderTextureUsage {
+                binding: banded,
+                access,
+            });
         }
     }
     Ok(result)
@@ -1016,11 +1082,14 @@ fn validate_render_texture_bindings(
     vertex: bool,
 ) -> Status {
     for usage in usages.iter().filter(|usage| usage.access.writes()) {
-        let mut matches = images.iter().filter(|image| image.binding() == usage.binding);
+        let mut matches = images
+            .iter()
+            .filter(|image| image.binding() == usage.binding);
         let image = matches.next();
         if matches.next().is_some() {
             return Status::args("metal_render_writable_texture_duplicate")
-                .field("vertex", vertex).field("binding", usage.binding);
+                .field("vertex", vertex)
+                .field("binding", usage.binding);
         }
         let required = if usage.access == RenderTextureAccess::ReadWrite {
             MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
@@ -1030,26 +1099,84 @@ fn validate_render_texture_bindings(
         match image {
             Some(ReimsVgpuSampledImage::Native { texture, .. })
                 if texture.usage().contains(required) => {}
-            Some(_) => return Status::args("metal_render_writable_texture_requires_native")
-                .field("vertex", vertex).field("binding", usage.binding),
-            None => return Status::args("metal_render_writable_texture_unbound")
-                .field("vertex", vertex).field("binding", usage.binding),
+            Some(_) => {
+                return Status::args("metal_render_writable_texture_requires_native")
+                    .field("vertex", vertex)
+                    .field("binding", usage.binding)
+            }
+            None => {
+                return Status::args("metal_render_writable_texture_unbound")
+                    .field("vertex", vertex)
+                    .field("binding", usage.binding)
+            }
         }
     }
     Status::OK
 }
 
+/// An immutable native snapshot with no escaping CPU view. Sealing moves its
+/// unique lease into the command buffer's completion owner.
+pub(crate) struct NativeBuffer {
+    pub binding: u32,
+    pub attribute_stride: Option<u64>,
+    pub bytes: input::Filled,
+}
+
+pub(crate) enum RenderBuffers<'a> {
+    Host(&'a [ReimsVgpuBuffer]),
+    Native(Vec<NativeBuffer>),
+}
+
+impl RenderBuffers<'_> {
+    fn record_slots(&self, slots: &mut Vec<u64>) {
+        match self {
+            Self::Host(buffers) => slots.extend(buffers.iter().map(|b| u64::from(b.binding))),
+            Self::Native(buffers) => slots.extend(buffers.iter().map(|b| u64::from(b.binding))),
+        }
+    }
+}
+
 fn bind_storage_buffers(
     device: &Device,
     encoder: &RenderCommandEncoderRef,
-    retained: &mut Vec<Buffer>,
-    buffers: &[ReimsVgpuBuffer],
+    retained: &mut input::Submission,
+    buffers: RenderBuffers<'_>,
     fragment_stage: bool,
     err: ErrOut<'_>,
 ) -> Status {
-    if buffers.is_empty() {
-        return Status::OK;
-    }
+    let buffers = match buffers {
+        RenderBuffers::Host(buffers) => buffers,
+        RenderBuffers::Native(buffers) => {
+            for buffer in buffers {
+                if !valid_buffer_binding(buffer.binding) {
+                    set_err(
+                        err,
+                        format!("invalid native buffer binding {}", buffer.binding),
+                    );
+                    return Status::args("metal_render_buffer_binding_out_of_range")
+                        .field("fragment", fragment_stage)
+                        .field("binding", buffer.binding)
+                        .field("limit", REIMS_VGPU_METAL_MAX_BUFFERS);
+                }
+                let native = match retained.seal(buffer.bytes) {
+                    Ok(buffer) => buffer,
+                    Err(status) => return status,
+                };
+                let status = bind_native_storage_buffer(
+                    encoder,
+                    buffer.binding,
+                    buffer.attribute_stride,
+                    &native,
+                    fragment_stage,
+                    err,
+                );
+                if !status.is_ok() {
+                    return status;
+                }
+            }
+            return Status::OK;
+        }
+    };
     for buffer in buffers {
         if !valid_buffer_binding(buffer.binding) {
             set_err(
@@ -1091,9 +1218,21 @@ fn bind_storage_buffers(
                 .field("fragment", fragment_stage)
                 .field("binding", buffer.binding);
         }
-        let mtl_buffer = match new_buffer_from_host(device, buffer.data, buffer.len) {
-            Some(b) => b,
-            None => {
+        let input = match unsafe {
+            input::copy(
+                device,
+                buffer.data,
+                buffer.len,
+                if fragment_stage {
+                    InputClass::Fragment
+                } else {
+                    InputClass::Vertex
+                },
+                "metal_render_buffer_create_failed",
+            )
+        } {
+            Ok(b) => b,
+            Err(status) => {
                 set_err(
                     err,
                     format!(
@@ -1101,46 +1240,70 @@ fn bind_storage_buffers(
                         if fragment_stage { "fragment" } else { "vertex" }
                     ),
                 );
-                return Status::execute("metal_render_buffer_create_failed")
+                return status
                     .field("fragment", fragment_stage)
-                    .field("binding", buffer.binding)
-                    .field("len", buffer.len);
+                    .field("binding", buffer.binding);
             }
         };
-        if fragment_stage {
-            encoder.set_fragment_buffer(buffer.binding as u64, Some(&mtl_buffer), 0);
-        } else if buffer.has_attribute_stride != 0 {
-            // `setVertexBuffer:offset:attributeStride:atIndex:` is only legal
-            // where the pipeline's `MTLVertexBufferLayoutDescriptor.stride` for
-            // this index is `MTLBufferLayoutStrideDynamic`, exactly as the
-            // compute rail's `metal_compute_attribute_stride_without_dynamic_layout`
-            // states for `MTLBufferLayoutDescriptor`. This rail's vertex
-            // descriptor is built from the serializer-object attribute block and never
-            // declares a dynamic layout, so the selector would raise an
-            // NSException — a process abort, not an error return.
-            //
-            // Refused by name rather than bound with the pipeline's own stride.
-            // A guest that sent this negotiated `supportsDynamicAttributeStride`
-            // and built a pipeline whose layout stride is the sentinel, so
-            // fetching at that stride is not "close enough": it is wrong
-            // geometry the guest is never told about. Closing this means the
-            // render pipeline declaring the dynamic layout, at which point the
-            // bind becomes `raw_metal`'s render sibling of the compute setter.
-            set_err(
-                err,
-                format!(
-                    "vertex buffer {} carries an attributeStride and this rail's \
-                     vertex descriptor declares no dynamic layout",
-                    buffer.binding
-                ),
-            );
-            return Status::args("metal_render_attribute_stride_without_dynamic_layout")
-                .field("binding", buffer.binding)
-                .field("stride", buffer.attribute_stride);
-        } else {
-            encoder.set_vertex_buffer(buffer.binding as u64, Some(&mtl_buffer), 0);
+        let mtl_buffer = match retained.seal(input) {
+            Ok(buffer) => buffer,
+            Err(status) => return status,
+        };
+        let status = bind_native_storage_buffer(
+            encoder,
+            buffer.binding,
+            (buffer.has_attribute_stride != 0).then_some(buffer.attribute_stride),
+            &mtl_buffer,
+            fragment_stage,
+            err,
+        );
+        if !status.is_ok() {
+            return status;
         }
-        retained.push(mtl_buffer);
+    }
+    Status::OK
+}
+
+fn bind_native_storage_buffer(
+    encoder: &RenderCommandEncoderRef,
+    binding: u32,
+    attribute_stride: Option<u64>,
+    buffer: &metal::Buffer,
+    fragment_stage: bool,
+    err: ErrOut<'_>,
+) -> Status {
+    if fragment_stage {
+        encoder.set_fragment_buffer(binding as u64, Some(buffer), 0);
+    } else if let Some(stride) = attribute_stride {
+        // `setVertexBuffer:offset:attributeStride:atIndex:` is only legal
+        // where the pipeline's `MTLVertexBufferLayoutDescriptor.stride` for
+        // this index is `MTLBufferLayoutStrideDynamic`, exactly as the
+        // compute rail's `metal_compute_attribute_stride_without_dynamic_layout`
+        // states for `MTLBufferLayoutDescriptor`. This rail's vertex
+        // descriptor is built from the serializer-object attribute block and never
+        // declares a dynamic layout, so the selector would raise an
+        // NSException — a process abort, not an error return.
+        //
+        // Refused by name rather than bound with the pipeline's own stride.
+        // A guest that sent this negotiated `supportsDynamicAttributeStride`
+        // and built a pipeline whose layout stride is the sentinel, so
+        // fetching at that stride is not "close enough": it is wrong
+        // geometry the guest is never told about. Closing this means the
+        // render pipeline declaring the dynamic layout, at which point the
+        // bind becomes `raw_metal`'s render sibling of the compute setter.
+        set_err(
+            err,
+            format!(
+                "vertex buffer {} carries an attributeStride and this rail's \
+                     vertex descriptor declares no dynamic layout",
+                binding
+            ),
+        );
+        return Status::args("metal_render_attribute_stride_without_dynamic_layout")
+            .field("binding", binding)
+            .field("stride", stride);
+    } else {
+        encoder.set_vertex_buffer(binding as u64, Some(buffer), 0);
     }
     Status::OK
 }
@@ -1161,7 +1324,8 @@ fn bind_sampled_images(
             ReimsVgpuSampledImage::Packed(image) => image,
             ReimsVgpuSampledImage::Native { binding, texture } => {
                 let Some(index) = texture_index(*binding) else {
-                    return Status::args("metal_render_sampled_binding_invalid").field("binding", *binding);
+                    return Status::args("metal_render_sampled_binding_invalid")
+                        .field("binding", *binding);
                 };
                 if fragment_stage {
                     encoder.set_fragment_texture(index as u64, Some(texture));
@@ -1845,7 +2009,11 @@ pub struct ColorRt<'a> {
 
 impl ColorRt<'_> {
     pub(crate) fn native_pixel_format(&self) -> u32 {
-        if self.pixel_format == 0 { MTLPixelFormat::RGBA8Unorm as u32 } else { self.pixel_format }
+        if self.pixel_format == 0 {
+            MTLPixelFormat::RGBA8Unorm as u32
+        } else {
+            self.pixel_format
+        }
     }
 
     pub(crate) fn pipeline_key(&self, pixel_format: u32) -> ColorRtKey {
@@ -1870,7 +2038,10 @@ impl ColorRt<'_> {
             };
             attachment.set_load_action(load);
             attachment.set_clear_color(MTLClearColor::new(
-                self.clear_r, self.clear_g, self.clear_b, self.clear_a,
+                self.clear_r,
+                self.clear_g,
+                self.clear_b,
+                self.clear_a,
             ));
             // Memoryless's private allocation survives only inside the guest
             // pass; Store here preserves exact texels for its next split draw.
@@ -1888,9 +2059,14 @@ impl ColorRt<'_> {
     /// silently degrade to a clear.
     fn prior_content_present(&self) -> bool {
         match &self.target {
-            ColorTarget::Memoryless(target) | ColorTarget::PassLocal(target) =>
-                target.initialized() || self.seed_rgba8.is_some()
-                    || target.resident.as_ref().is_some_and(|plan| plan.holds_prior),
+            ColorTarget::Memoryless(target) | ColorTarget::PassLocal(target) => {
+                target.initialized()
+                    || self.seed_rgba8.is_some()
+                    || target
+                        .resident
+                        .as_ref()
+                        .is_some_and(|plan| plan.holds_prior)
+            }
             #[cfg(test)]
             ColorTarget::Transient => self.seed_rgba8.is_some(),
         }
@@ -1972,13 +2148,27 @@ mod memoryless_tests {
             eprintln!("memoryless native test requires Apple GPU memoryless support");
             return;
         }
-        let memoryless = new_color_target(&device, MTLPixelFormat::RGBA16Float,
-            4, 4, MTLStorageMode::Memoryless).expect("memoryless target");
+        let memoryless = new_color_target(
+            &device,
+            MTLPixelFormat::RGBA16Float,
+            4,
+            4,
+            MTLStorageMode::Memoryless,
+        )
+        .expect("memoryless target");
         assert_eq!(memoryless.storage_mode(), MTLStorageMode::Memoryless);
         assert_eq!(memoryless.pixel_format(), MTLPixelFormat::RGBA16Float);
-        let output = new_color_target(&device, MTLPixelFormat::RGBA8Unorm,
-            4, 4, MTLStorageMode::Shared).expect("readback target");
-        let library = crate::backend::metal::raw_metal::new_library_with_source(&device, r#"
+        let output = new_color_target(
+            &device,
+            MTLPixelFormat::RGBA8Unorm,
+            4,
+            4,
+            MTLStorageMode::Shared,
+        )
+        .expect("readback target");
+        let library = crate::backend::metal::raw_metal::new_library_with_source(
+            &device,
+            r#"
             #include <metal_stdlib>
             using namespace metal;
             vertex float4 memoryless_vertex(uint i [[vertex_id]]) {
@@ -1988,13 +2178,29 @@ mod memoryless_tests {
             fragment half4 memoryless_fragment(half4 prior [[color(1)]]) {
                 return prior;
             }
-        "#).expect("original synthetic framebuffer-fetch shader");
+        "#,
+        )
+        .expect("original synthetic framebuffer-fetch shader");
         let pipeline = RenderPipelineDescriptor::new();
-        pipeline.set_vertex_function(Some(&library.get_function("memoryless_vertex", None).unwrap()));
-        pipeline.set_fragment_function(Some(&library.get_function("memoryless_fragment", None).unwrap()));
-        pipeline.color_attachments().object_at(0).unwrap().set_pixel_format(MTLPixelFormat::RGBA8Unorm);
-        pipeline.color_attachments().object_at(1).unwrap().set_pixel_format(MTLPixelFormat::RGBA16Float);
-        let pipeline = device.new_render_pipeline_state(&pipeline).expect("framebuffer-fetch pipeline");
+        pipeline.set_vertex_function(Some(
+            &library.get_function("memoryless_vertex", None).unwrap(),
+        ));
+        pipeline.set_fragment_function(Some(
+            &library.get_function("memoryless_fragment", None).unwrap(),
+        ));
+        pipeline
+            .color_attachments()
+            .object_at(0)
+            .unwrap()
+            .set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+        pipeline
+            .color_attachments()
+            .object_at(1)
+            .unwrap()
+            .set_pixel_format(MTLPixelFormat::RGBA16Float);
+        let pipeline = device
+            .new_render_pipeline_state(&pipeline)
+            .expect("framebuffer-fetch pipeline");
         let pass = RenderPassDescriptor::new();
         let color = pass.color_attachments().object_at(0).unwrap();
         color.set_texture(Some(&output));
@@ -2015,8 +2221,12 @@ mod memoryless_tests {
         command.wait_until_completed();
         assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
         let mut pixels = [0u8; 64];
-        output.get_bytes(pixels.as_mut_ptr().cast(), 16,
-            MTLRegion::new_2d(0, 0, 4, 4), 0);
+        output.get_bytes(
+            pixels.as_mut_ptr().cast(),
+            16,
+            MTLRegion::new_2d(0, 0, 4, 4),
+            0,
+        );
         for pixel in pixels.chunks_exact(4) {
             assert_eq!(pixel, &[64, 128, 191, 255]);
         }
@@ -2108,14 +2318,7 @@ mod attachment_decline_tests {
     }
 }
 
-/// Encode one draw into its guest pass's native batch.
-///
-/// Deferred calls copy staging inputs and retain native allocations, but return
-/// no CPU results. Compatible calls reuse the encoder and command buffer.
-/// Queries, depth/stencil's CPU fallback, native borrowed/writable bindings and
-/// final Store complete synchronously before reading or publishing results.
-/// The existing phase clocks and `metal_submissions`/readback census measure
-/// actual work, including dependency materializations outside this function.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_core_mrt(
     vert_mtlb: &[u8],
@@ -2128,6 +2331,80 @@ pub(crate) fn render_core_mrt(
     attrs: &[ReimsVgpuVertexAttr],
     buffers: &[ReimsVgpuBuffer],
     frag_buffers: &[ReimsVgpuBuffer],
+    vertex_images: &[ReimsVgpuSampledImage],
+    vertex_samplers: &[ReimsVgpuSampler],
+    images: &[ReimsVgpuSampledImage],
+    samplers: &[ReimsVgpuSampler],
+    viewports: &[ReimsVgpuViewport],
+    scissors: &[ReimsVgpuScissor],
+    raster: Option<&ReimsVgpuRasterState>,
+    depth_bias: Option<&ReimsVgpuDepthBiasState>,
+    depth_stencil: Option<&ReimsVgpuDepthStencilState>,
+    stencil_reference: Option<&ReimsVgpuStencilReferenceState>,
+    depth_attachment: Option<&mut ReimsVgpuDepthAttachment>,
+    stencil_attachment: Option<&mut ReimsVgpuStencilAttachment>,
+    blend: Option<&ReimsVgpuBlendState>,
+    colors: &mut [ColorRt<'_>],
+    visibility: Option<&mut VisibilityQuery>,
+    err: ErrOut<'_>,
+    batch: &mut RenderBatch,
+    defer: bool,
+) -> Status {
+    render_core_mrt_inputs(
+        vert_mtlb,
+        frag_mtlb,
+        width,
+        height,
+        draw,
+        primitive_indirect,
+        indexed,
+        attrs,
+        RenderBuffers::Host(buffers),
+        RenderBuffers::Host(frag_buffers),
+        vertex_images,
+        vertex_samplers,
+        images,
+        samplers,
+        viewports,
+        scissors,
+        raster,
+        depth_bias,
+        depth_stencil,
+        stencil_reference,
+        depth_attachment,
+        stencil_attachment,
+        blend,
+        colors,
+        visibility,
+        err,
+        batch,
+        defer,
+    )
+}
+
+/// Encode one draw into its guest pass's native batch.
+///
+/// Deferred calls copy host staging inputs or consume owned native snapshots,
+/// but return no CPU results. Compatible calls reuse the encoder and command
+/// buffer. Queries, depth/stencil's CPU fallback, native borrowed/writable
+/// bindings and final Store complete synchronously before publishing results.
+/// The phase clocks and `metal_submissions`/readback census measure actual work,
+/// including dependency materializations outside this function.
+///
+/// The public pointer-bearing records remain host sources; native snapshots
+/// are moved through this Rust-only route, never disguised as those pointers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_core_mrt_inputs(
+    vert_mtlb: &[u8],
+    frag_mtlb: &[u8],
+    width: u32,
+    height: u32,
+    draw: crate::protocol::draw::DrawArgs,
+    primitive_indirect: Option<&ReimsVgpuPrimitiveIndirectDraw>,
+    indexed: Option<&ReimsVgpuIndexedDraw>,
+    attrs: &[ReimsVgpuVertexAttr],
+    buffers: RenderBuffers<'_>,
+    frag_buffers: RenderBuffers<'_>,
     vertex_images: &[ReimsVgpuSampledImage],
     vertex_samplers: &[ReimsVgpuSampler],
     images: &[ReimsVgpuSampledImage],
@@ -2174,7 +2451,8 @@ pub(crate) fn render_core_mrt(
     // (slot, fmt_u32, bpp, mtl_fmt)
     for c in colors.iter() {
         if matches!(c.target, ColorTarget::Memoryless(_))
-            && (c.seed_rgba8.is_some() || c.out_rgba8.is_some()
+            && (c.seed_rgba8.is_some()
+                || c.out_rgba8.is_some()
                 || (c.load_action == REIMS_VGPU_MTL_LOAD_ACTION_LOAD && !c.prior_content_present()))
         {
             set_err(err, "memoryless attachment cannot carry external contents");
@@ -2304,7 +2582,10 @@ pub(crate) fn render_core_mrt(
         Err(st) => return st,
     };
     let mut attr_slots = Vec::new();
-    for attr in attrs.iter().filter(|attr| attr.format != 0 && attr.stride != 0) {
+    for attr in attrs
+        .iter()
+        .filter(|attr| attr.format != 0 && attr.stride != 0)
+    {
         if let Err(st) = find_or_add_attr_slot(device, &mut attr_slots, attr, err) {
             return st;
         }
@@ -2346,17 +2627,18 @@ pub(crate) fn render_core_mrt(
         vert: BlobKey::new(vert_mtlb),
         frag: BlobKey::new(frag_mtlb),
     };
-    let (pso, vert_sampler_mask, frag_sampler_mask, texture_usages) = match get_render_pipeline_state(
-        device,
-        &vertex,
-        &fragment,
-        vertex_descriptor.as_ref(),
-        &pso_lookup,
-        err,
-    ) {
-        Ok(v) => v,
-        Err(st) => return st,
-    };
+    let (pso, vert_sampler_mask, frag_sampler_mask, texture_usages) =
+        match get_render_pipeline_state(
+            device,
+            &vertex,
+            &fragment,
+            vertex_descriptor.as_ref(),
+            &pso_lookup,
+            err,
+        ) {
+            Ok(v) => v,
+            Err(st) => return st,
+        };
     for (images, usages, vertex) in [
         (vertex_images, texture_usages.vertex.as_slice(), true),
         (images, texture_usages.fragment.as_slice(), false),
@@ -2366,9 +2648,18 @@ pub(crate) fn render_core_mrt(
             return status;
         }
     }
-    let immediate = visibility.is_some() || depth_attachment.is_some() || stencil_attachment.is_some()
-        || vertex_images.iter().chain(images).any(|image| matches!(image, ReimsVgpuSampledImage::Native { .. }))
-        || texture_usages.vertex.iter().chain(&texture_usages.fragment).any(|usage| usage.access.writes());
+    let immediate = visibility.is_some()
+        || depth_attachment.is_some()
+        || stencil_attachment.is_some()
+        || vertex_images
+            .iter()
+            .chain(images)
+            .any(|image| matches!(image, ReimsVgpuSampledImage::Native { .. }))
+        || texture_usages
+            .vertex
+            .iter()
+            .chain(&texture_usages.fragment)
+            .any(|usage| usage.access.writes());
     if immediate {
         if let Err(status) = batch.finish(err) {
             return status;
@@ -2395,7 +2686,8 @@ pub(crate) fn render_core_mrt(
             ),
             #[cfg(test)]
             ColorTarget::Transient => {
-                let Some(target) = new_color_target(device, mtl_fmt, width, height, MTLStorageMode::Shared)
+                let Some(target) =
+                    new_color_target(device, mtl_fmt, width, height, MTLStorageMode::Shared)
                 else {
                     return Status::execute("metal_render_color_target_alloc_failed")
                         .field("slot", slot)
@@ -2405,7 +2697,8 @@ pub(crate) fn render_core_mrt(
                 (target, false)
             }
         };
-        if target.width() != u64::from(width) || target.height() != u64::from(height)
+        if target.width() != u64::from(width)
+            || target.height() != u64::from(height)
             || target.pixel_format() != mtl_fmt
         {
             return Status::args("metal_render_pass_target_geometry").field("slot", slot);
@@ -2441,8 +2734,6 @@ pub(crate) fn render_core_mrt(
         retained_tex.push(target.clone());
         color_textures.push((slot, target, bpp));
     }
-    let mut retained_buf: Vec<Buffer> = Vec::new();
-
     let span_pass = crate::runtime::chain_phase::CostSpan::new("metal_pass_us");
     let pass = RenderPassDescriptor::new();
     for (i, c) in colors.iter().enumerate() {
@@ -2548,15 +2839,21 @@ pub(crate) fn render_core_mrt(
     // A fresh encoder used to supply these defaults implicitly. Reusing it must
     // not leak bindings or optional raster state from an earlier record.
     reset_draw_state(encoder, batch);
-    batch.vertex_buffer_slots.extend(attr_slots.iter().map(|slot| slot.index));
-    batch.vertex_buffer_slots.extend(buffers.iter().map(|buffer| u64::from(buffer.binding)));
-    batch.fragment_buffer_slots.extend(frag_buffers.iter().map(|buffer| u64::from(buffer.binding)));
-    batch.vertex_texture_slots.extend(vertex_images.iter().filter_map(|image| {
-        texture_index(image.binding()).map(|index| index as u64)
-    }));
-    batch.fragment_texture_slots.extend(images.iter().filter_map(|image| {
-        texture_index(image.binding()).map(|index| index as u64)
-    }));
+    batch
+        .vertex_buffer_slots
+        .extend(attr_slots.iter().map(|slot| slot.index));
+    buffers.record_slots(&mut batch.vertex_buffer_slots);
+    frag_buffers.record_slots(&mut batch.fragment_buffer_slots);
+    batch.vertex_texture_slots.extend(
+        vertex_images
+            .iter()
+            .filter_map(|image| texture_index(image.binding()).map(|index| index as u64)),
+    );
+    batch.fragment_texture_slots.extend(
+        images
+            .iter()
+            .filter_map(|image| texture_index(image.binding()).map(|index| index as u64)),
+    );
     encoder.set_render_pipeline_state(&pso);
     if let Some(mode) = visibility_mode {
         encoder.set_visibility_result_mode(mode, 0);
@@ -2576,15 +2873,22 @@ pub(crate) fn render_core_mrt(
     apply_viewports(encoder, viewports, width, height);
     apply_scissors(encoder, scissors, width, height);
 
-    for slot in &attr_slots {
-        encoder.set_vertex_buffer(slot.index, Some(&slot.buffer), 0);
+    for slot in attr_slots {
+        let buffer = match batch.inputs.seal(slot.buffer) {
+            Ok(buffer) => buffer,
+            Err(status) => {
+                encoder.end_encoding();
+                return status;
+            }
+        };
+        encoder.set_vertex_buffer(slot.index, Some(&buffer), 0);
     }
-    let rc = bind_storage_buffers(device, encoder, &mut retained_buf, buffers, false, err);
+    let rc = bind_storage_buffers(device, encoder, &mut batch.inputs, buffers, false, err);
     if !rc.is_ok() {
         encoder.end_encoding();
         return rc;
     }
-    let rc = bind_storage_buffers(device, encoder, &mut retained_buf, frag_buffers, true, err);
+    let rc = bind_storage_buffers(device, encoder, &mut batch.inputs, frag_buffers, true, err);
     if !rc.is_ok() {
         encoder.end_encoding();
         return rc;
@@ -2638,20 +2942,23 @@ pub(crate) fn render_core_mrt(
                 .field("len", pi.arguments_len)
                 .field("required", need);
         }
-        let indirect = unsafe {
-            crate::backend::metal::raw_metal::new_buffer_with_data(
+        let indirect = match unsafe {
+            input::copy(
                 device,
-                pi.arguments as *const _,
-                pi.arguments_len as u64,
-                MTLResourceOptions::StorageModeShared,
+                pi.arguments,
+                pi.arguments_len,
+                InputClass::Indirect,
+                "metal_render_indirect_buffer_alloc_failed",
             )
+        }
+        .and_then(|input| batch.inputs.seal(input))
+        {
+            Ok(buffer) => buffer,
+            Err(status) => {
+                encoder.end_encoding();
+                return status;
+            }
         };
-        let Some(indirect) = indirect else {
-            encoder.end_encoding();
-            return Status::execute("metal_render_indirect_buffer_alloc_failed")
-                .field("len", pi.arguments_len);
-        };
-        retained_buf.push(indirect.clone());
         encoder.draw_primitives_indirect(prim, &indirect, 0);
     } else if let Some(ix) = indexed {
         let converted_index_type = mtl_enum::index_type(ix.index_type);
@@ -2750,36 +3057,42 @@ pub(crate) fn render_core_mrt(
                     .field("indices_len", ix.indices_len);
             }
         }
-        let index_buffer = unsafe {
-            crate::backend::metal::raw_metal::new_buffer_with_data(
+        let index_buffer = match unsafe {
+            input::copy(
                 device,
-                ix.indices as *const _,
-                ix.indices_len as u64,
-                MTLResourceOptions::StorageModeShared,
+                ix.indices,
+                ix.indices_len,
+                InputClass::Index,
+                "metal_render_index_buffer_alloc_failed",
             )
+        }
+        .and_then(|input| batch.inputs.seal(input))
+        {
+            Ok(buffer) => buffer,
+            Err(status) => {
+                encoder.end_encoding();
+                return status;
+            }
         };
-        let Some(index_buffer) = index_buffer else {
-            encoder.end_encoding();
-            return Status::execute("metal_render_index_buffer_alloc_failed")
-                .field("len", ix.indices_len);
-        };
-        retained_buf.push(index_buffer.clone());
         if indexed_indirect {
             let ind = unsafe { &*ix.indirect };
-            let indirect = unsafe {
-                crate::backend::metal::raw_metal::new_buffer_with_data(
+            let indirect = match unsafe {
+                input::copy(
                     device,
-                    ind.arguments as *const _,
-                    ind.arguments_len as u64,
-                    MTLResourceOptions::StorageModeShared,
+                    ind.arguments,
+                    ind.arguments_len,
+                    InputClass::Indirect,
+                    "metal_render_indexed_indirect_buffer_alloc_failed",
                 )
+            }
+            .and_then(|input| batch.inputs.seal(input))
+            {
+                Ok(buffer) => buffer,
+                Err(status) => {
+                    encoder.end_encoding();
+                    return status;
+                }
             };
-            let Some(indirect) = indirect else {
-                encoder.end_encoding();
-                return Status::execute("metal_render_indexed_indirect_buffer_alloc_failed")
-                    .field("len", ind.arguments_len);
-            };
-            retained_buf.push(indirect.clone());
             encoder.draw_indexed_primitives_indirect(
                 prim,
                 index_type,
@@ -2819,8 +3132,6 @@ pub(crate) fn render_core_mrt(
         encoder.draw_primitives(prim, first_vertex as u64, vertex_count as u64);
     }
 
-    batch.buffers.extend(attr_slots.into_iter().map(|slot| slot.buffer));
-    batch.buffers.extend(retained_buf);
     batch.textures.extend(retained_tex);
     if defer {
         batch.encoder = Some(encoder_owner);
@@ -2849,7 +3160,9 @@ pub(crate) fn render_core_mrt(
                 continue;
             }
             #[cfg(test)]
-            { batch.readbacks += 1; }
+            {
+                batch.readbacks += 1;
+            }
             let (slot, target, bpp) = &color_textures[i];
             let _ = slot;
             let target_len = (width as usize)
@@ -2956,8 +3269,10 @@ pub(crate) fn render_core_mrt(
                     0,
                 );
                 crate::runtime::drain::note_store_route("metal_depth_readbacks");
-                crate::runtime::drain::note_store_route_n("metal_depth_readback_bytes",
-                    u64::from(width) * u64::from(height) * 4);
+                crate::runtime::drain::note_store_route_n(
+                    "metal_depth_readback_bytes",
+                    u64::from(width) * u64::from(height) * 4,
+                );
             }
         }
     }
@@ -2974,8 +3289,10 @@ pub(crate) fn render_core_mrt(
                 };
                 tex.get_bytes(stencil.data as *mut _, width as u64, region, 0);
                 crate::runtime::drain::note_store_route("metal_stencil_readbacks");
-                crate::runtime::drain::note_store_route_n("metal_stencil_readback_bytes",
-                    u64::from(width) * u64::from(height));
+                crate::runtime::drain::note_store_route_n(
+                    "metal_stencil_readback_bytes",
+                    u64::from(width) * u64::from(height),
+                );
             }
         }
     }

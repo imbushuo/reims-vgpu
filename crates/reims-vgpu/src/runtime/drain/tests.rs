@@ -2227,6 +2227,131 @@ fn poll_rescue_only_publishes_work_for_async_drain() {
     );
 }
 
+#[test]
+fn a_doorbell_for_an_already_served_channel_survives_until_the_next_wakeup() {
+    use crate::runtime::host::MemError;
+    use std::cell::{Cell, RefCell};
+    use std::sync::{atomic::AtomicU32, Arc};
+
+    struct ReringHost {
+        inner: RefCell<FakeHost>,
+        rung: Arc<AtomicU32>,
+        trigger: u64,
+        late_ring: u64,
+        late_tail: u64,
+        late_packet: Vec<u8>,
+        fired: Cell<bool>,
+    }
+    impl HostMemory for ReringHost {
+        fn read_gpa(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), MemError> {
+            if gpa == self.trigger && !self.fired.replace(true) {
+                let mut inner = self.inner.borrow_mut();
+                inner.write_gpa(self.late_ring, &self.late_packet)?;
+                inner.write_gpa(self.late_tail, &(2 * PACKET_HEADER_LEN).to_le_bytes())?;
+                self.rung
+                    .fetch_or(1 << 1, std::sync::atomic::Ordering::Release);
+                inner.schedule_bh();
+            }
+            self.inner.borrow().read_gpa(gpa, bytes)
+        }
+        fn write_gpa(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), MemError> {
+            self.inner.get_mut().write_gpa(gpa, bytes)
+        }
+    }
+    impl HostOps for ReringHost {
+        fn mono_ns(&self) -> u64 {
+            self.inner.borrow().mono_ns()
+        }
+        fn enqueue(&mut self, action: HostAction) {
+            self.inner.get_mut().enqueue(action);
+        }
+        fn schedule_bh(&mut self) {
+            self.inner.get_mut().schedule_bh();
+        }
+        fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
+            self.inner.get_mut().map_pages(gpas, page_size)
+        }
+        fn unmap_pages(&mut self, ptr: usize, len: usize) {
+            self.inner.get_mut().unmap_pages(ptr, len);
+        }
+    }
+
+    for page_shift in [PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        let mut state = DeviceState::new(DeviceId(1), page_shift);
+        let page_size = state.page_size();
+        state.gfx.fifo_base_page = 0x40;
+        state.gfx.root_page = 0x50;
+        state.open_child_domains_for_test((1 << 1) | (1 << 2));
+        let mut inner = FakeHost::new();
+        for pfn in [0x40, 0x50, 0x60, 0x61, 0x70, 0x71] {
+            inner.map_range(state.pfn_gpa(pfn), page_size as usize, 0);
+        }
+        let regs =
+            |channel| state.pfn_gpa(state.gfx.root_page) + child_reg_block_offset(channel).unwrap();
+        for (channel, ring_pfn, list_pfn, stamp) in
+            [(1, 0x60u32, 0x70u32, 101), (2, 0x61, 0x71, 201)]
+        {
+            inner
+                .write_gpa(state.pfn_gpa(list_pfn), &ring_pfn.to_le_bytes())
+                .unwrap();
+            inner
+                .write_gpa(regs(channel) + CHILD_REG_BASE_PFN, &list_pfn.to_le_bytes())
+                .unwrap();
+            inner
+                .write_gpa(
+                    regs(channel) + CHILD_REG_STAMP_INDEX,
+                    &channel.to_le_bytes(),
+                )
+                .unwrap();
+            inner
+                .write_gpa(
+                    regs(channel) + CHILD_REG_TAIL,
+                    &PACKET_HEADER_LEN.to_le_bytes(),
+                )
+                .unwrap();
+            inner
+                .write_gpa(
+                    state.pfn_gpa(ring_pfn),
+                    &packet_bytes(CHILD_OP_NOP, stamp, &[]),
+                )
+                .unwrap();
+        }
+        let first_head = regs(1) + CHILD_REG_HEAD;
+        let stamp_gpa =
+            state.pfn_gpa(state.gfx.fifo_base_page) + stamp_slot_offset(1, page_size).unwrap();
+        let mut host = ReringHost {
+            inner: RefCell::new(inner),
+            rung: Arc::clone(&state.gfx.child_doorbell_rung),
+            trigger: regs(2) + CHILD_REG_HEAD,
+            late_ring: state.pfn_gpa(0x60) + u64::from(PACKET_HEADER_LEN),
+            late_tail: regs(1) + CHILD_REG_TAIL,
+            late_packet: packet_bytes(CHILD_OP_NOP, 102, &[]),
+            fired: Cell::new(false),
+        };
+        state.pending.child_mask = (1 << 1) | (1 << 2);
+
+        drain_pending(&mut state, &mut host);
+        assert!(host.fired.get());
+        assert!(host.inner.borrow().bh_scheduled);
+        assert_eq!(host.inner.borrow().get_u32(first_head), PACKET_HEADER_LEN);
+        assert_eq!(host.inner.borrow().get_u32(stamp_gpa), 101);
+        assert_eq!(
+            state.pending.child_mask,
+            1 << 1,
+            "the scheduled wakeup must retain the channel rung after its drain ended"
+        );
+
+        drain_pending(&mut state, &mut host);
+        assert_eq!(
+            host.inner.borrow().get_u32(first_head),
+            2 * PACKET_HEADER_LEN
+        );
+        assert_eq!(host.inner.borrow().get_u32(stamp_gpa), 102);
+        assert_eq!(state.pending.child_mask, 0);
+        assert!(state.parked.is_empty());
+    }
+}
+
 /// Archive render_wait_surface: no inflight async job for mapping ⇒ no-op,
 /// returns current content_generation. Does not drain other FIFOs.
 #[test]

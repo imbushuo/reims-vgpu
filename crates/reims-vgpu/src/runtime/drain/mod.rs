@@ -2569,6 +2569,7 @@ fn run_parked<H: HostMemory + HostOps>(
     ingress: reims_vgpu_core::identity::IngressOrdinal,
     work: &crate::runtime::parked::ParkedWork,
 ) {
+    census::checkpoints::packet_started(state);
     let domain = work.domain();
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
         process_root_packet(state, host, work.packet());
@@ -2622,6 +2623,7 @@ fn run_parked<H: HostMemory + HostOps>(
                     None => note_store_route("stamp_released_without_a_word"),
                 }
             }
+            census::checkpoints::completed(state);
         }
         // The incarnation the work was submitted under has ended. Its
         // withdrawal already released whatever was queued behind it, so there
@@ -7920,11 +7922,12 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             }
         }
         fold_rung_child_doorbells(state);
-        // Only channels this pass has not already run: a channel rung again
-        // while its own drain was in flight has had that work seen, and
-        // re-running it here would spin on one busy channel while the others
-        // wait.
-        mask = std::mem::take(&mut state.pending.child_mask) & !served;
+        // Do not re-run a served channel in this tranche, but keep its bit:
+        // the guest may have rung it after its drain observed an empty ring.
+        // The already-scheduled next wakeup still needs to know which ring.
+        let pending = std::mem::take(&mut state.pending.child_mask);
+        state.pending.child_mask = pending & served;
+        mask = pending & !served;
         if mask == 0 {
             break;
         }

@@ -22,6 +22,9 @@
 // here mentions a rail.
 use super::DISPLAY_VBL_MIN_INTERVAL_US;
 use crate::backend::{Backend as _, CensusSite};
+
+pub(crate) mod checkpoints;
+
 /// Delivered-VBL rate, reported from the branch that decides it.
 ///
 /// VBL is what paces the guest's compositor: WindowServer produces a frame off

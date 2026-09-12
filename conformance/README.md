@@ -211,6 +211,12 @@ different shader constants. Each must finish a cold compute pipeline and render
 pipeline; a previous task's equal-numbered object references must not satisfy
 its translation waits or retire its pipelines.
 
+`--render-input-buffers-only` runs the existing vertex/fragment buffer, indexed
+draw, render barrier, encoder binding lifetime, command-buffer resource retention,
+and indirect-command mutation cases. This isolates input binding and lifetime
+coverage without first running the unrelated linear-texture cases. It changes
+neither case expectations nor the full suite's running order.
+
 `--corner-encoder-readiness-only` runs 24 cases: a 12-case corner restore sequence,
 then the same sequence with warm shader translations. It crosses BGRA8/RGBA16Float,
 shared/separate command buffers, and no snapshot/blit snapshot/fragment snapshot.

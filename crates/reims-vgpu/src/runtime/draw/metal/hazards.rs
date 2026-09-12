@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) struct PassDependencies {
     colors: Vec<Option<BTreeSet<u64>>>,
     inputs: BTreeMap<u32, Option<BTreeSet<u64>>>,
+    bound_buffers: BTreeMap<u64, Option<BTreeSet<u64>>>,
     roots: BTreeMap<u32, u32>,
     color_roots: Vec<u32>,
 }
@@ -94,6 +95,39 @@ fn may_overlap(left: Option<&BTreeSet<u64>>, right: Option<&BTreeSet<u64>>) -> b
 }
 
 impl PassDependencies {
+    fn buffer_aliases<M: HostMemory + HostOps>(
+        &mut self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &DrawEncodeRequest,
+        bind: &BufferBind,
+    ) -> Vec<usize> {
+        let Some(resource) = bind.resource.as_deref() else {
+            return self.aliases(state, host, req, bind.buffer_ref);
+        };
+        self.prepare(state, host, req);
+        // Bind tables retain the resource, not the current meaning of its
+        // numeric reference. The footprint must name that same allocation.
+        let identity = resource.lifetime_ref().id();
+        let pages = self.bound_buffers.entry(identity).or_insert_with(|| {
+            let (gva, span) = objects::resolve_buffer_span_from_resource(state, resource).ok()?;
+            gva_pages(state, host, req.task_id, gva, span)
+        });
+        if pages.is_none() {
+            crate::runtime::drain::note_store_route("metal_batch_footprint_unknown");
+        }
+        req.colors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, color)| {
+                (self.color_roots[index] == bind.buffer_ref
+                    || (color.storage == ColorStorage::GuestBacked
+                        && may_overlap(self.colors[index].as_ref(), pages.as_ref())))
+                .then_some(index)
+            })
+            .collect()
+    }
+
     fn prepare<M: HostMemory + HostOps>(
         &mut self,
         state: &mut DeviceState,
@@ -188,17 +222,11 @@ pub(super) fn materialize_inputs<M: HostMemory + HostOps>(
     req: &DrawEncodeRequest,
     pass: &mut crate::backend::metal::render_pass::MetalRenderPass,
 ) -> Result<(), EncodeStatus> {
-    let references: BTreeSet<_> = req
-        .vertex_buffers
+    let mut references: BTreeSet<_> = req
+        .vertex_textures
         .iter()
-        .chain(req.fragment_buffers.iter())
-        .map(|bind| bind.buffer_ref)
-        .chain(
-            req.vertex_textures
-                .iter()
-                .chain(req.fragment_textures.iter())
-                .map(|bind| bind.texture_ref),
-        )
+        .chain(req.fragment_textures.iter())
+        .map(|bind| bind.texture_ref)
         .chain(req.indexed.as_ref().map(|draw| draw.index_buffer_ref))
         .chain(req.depth_attach.as_ref().map(|a| a.texture_ref))
         .chain(req.stencil_attach.as_ref().map(|a| a.texture_ref))
@@ -221,6 +249,29 @@ pub(super) fn materialize_inputs<M: HostMemory + HostOps>(
                 affected.insert(index);
             }
         }
+    }
+    for bind in req
+        .vertex_buffers
+        .iter()
+        .chain(req.fragment_buffers.iter())
+        .filter(|bind| bind.buffer_ref != 0)
+    {
+        for index in pass
+            .dependencies
+            .borrow_mut()
+            .buffer_aliases(state, host, req, bind)
+        {
+            let color = &req.colors[index];
+            if color.storage == ColorStorage::Memoryless {
+                return Err(EncodeStatus::Unsupported(
+                    "draw_mtl_memoryless_sample_alias",
+                ));
+            }
+            if pass.target(color).is_ok_and(|target| target.initialized()) {
+                affected.insert(index);
+            }
+        }
+        references.insert(bind.buffer_ref);
     }
     if affected.is_empty() {
         return Ok(());
@@ -337,6 +388,74 @@ pub(crate) fn land_before_refusal<M: HostMemory + HostOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffer_only_draw_checks_attachment_aliases_without_texture_bindings() {
+        use crate::runtime::draw::buffer_read_tests::Fixture;
+        for fragment in [false, true] {
+            let mut fixture = Fixture::new(crate::model::PAGE_SHIFT_ARM64E);
+            let bind = fixture.bind(7, 1, 16, 0);
+            let mut req = DrawEncodeRequest {
+                task_id: 1,
+                colors: vec![ColorRtRequest {
+                    texture_ref: 7,
+                    storage: ColorStorage::Memoryless,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            if fragment {
+                req.fragment_buffers = std::sync::Arc::new(vec![bind]);
+            } else {
+                req.vertex_buffers = std::sync::Arc::new(vec![bind]);
+            }
+            let mut pass = crate::backend::metal::render_pass::MetalRenderPass::default();
+            assert!(matches!(
+                materialize_inputs(&mut fixture.state, &mut fixture.host, &req, &mut pass),
+                Err(EncodeStatus::Unsupported(
+                    "draw_mtl_memoryless_sample_alias"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn retained_buffer_footprint_follows_binding_not_reused_numeric_reference() {
+        use crate::runtime::draw::buffer_read_tests::Fixture;
+        let mut fixture = Fixture::new(crate::model::PAGE_SHIFT_ARM64E);
+        let old = fixture.bind(7, 1, 16, 0);
+        let req = DrawEncodeRequest {
+            task_id: 1,
+            colors: vec![ColorRtRequest {
+                texture_ref: 100,
+                storage: ColorStorage::GuestBacked,
+                target_gva: fixture.page,
+                row_stride: 16,
+                height: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut dependencies = PassDependencies::default();
+        assert_eq!(
+            dependencies.buffer_aliases(&mut fixture.state, &mut fixture.host, &req, &old),
+            [0]
+        );
+        assert!(fixture.state.delete_object(1, 7));
+        let new = fixture.bind(7, 2, 16, 0);
+        assert!(dependencies
+            .buffer_aliases(&mut fixture.state, &mut fixture.host, &req, &new)
+            .is_empty());
+        assert_eq!(
+            dependencies.buffer_aliases(&mut fixture.state, &mut fixture.host, &req, &old),
+            [0]
+        );
+        assert_eq!(
+            dependencies.bound_buffers.len(),
+            2,
+            "separate immutable construction identities"
+        );
+    }
 
     #[test]
     fn physical_aliases_and_unknown_footprints_require_materialization() {

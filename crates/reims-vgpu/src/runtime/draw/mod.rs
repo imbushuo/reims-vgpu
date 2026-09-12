@@ -90,8 +90,8 @@ pub(crate) use texture_view::*;
 // ladder's two report helpers are its own working parts and only these two
 // items have callers outside it.
 mod render_target;
-use render_target::{lookup_render_target, ResolvedRenderTarget};
 pub use reims_vgpu_protocol::memoryless::ColorStorage;
+use render_target::{lookup_render_target, ResolvedRenderTarget};
 
 /// Bind **index** cap for the buffer argument table.
 ///
@@ -1234,6 +1234,61 @@ fn read_buffer_bytes_resolved<M: HostMemory + HostOps>(
     offset: u64,
     extent_cap: Option<u64>,
 ) -> Option<Vec<u8>> {
+    let window = prepare_buffer_read(
+        state, host, task_id, buffer_ref, backing, offset, extent_cap,
+    )?;
+    window.read_vec()
+}
+
+/// A checked, settled read window, used synchronously under the caller's device
+/// ownership. It owns neither guest pages nor permission to defer a guest read.
+struct BufferReadWindow<'a, M: HostMemory> {
+    state: &'a DeviceState,
+    host: &'a M,
+    task: u32,
+    base_gva: u64,
+    offset: u64,
+    gva: u64,
+    len: usize,
+}
+
+impl<M: HostMemory> BufferReadWindow<'_, M> {
+    fn read_into(&self, destination: &mut [u8]) -> Result<(), crate::runtime::host::MemError> {
+        if destination.len() != self.len {
+            return Err(crate::runtime::host::MemError::BadArgs);
+        }
+        gva_mem::read_task_gva_by_id(
+            self.host,
+            &self.state.tasks,
+            self.task,
+            self.gva,
+            destination,
+            self.state.page_shift,
+        )
+        .inspect_err(|_| {
+            crate::observe::fail(format!(
+                "load_buffer gva read fail task={} gva={:#x}+{} want={} shift={}",
+                self.task, self.base_gva, self.offset, self.len, self.state.page_shift,
+            ));
+        })
+    }
+
+    fn read_vec(&self) -> Option<Vec<u8>> {
+        let mut bytes = vec![0; self.len];
+        self.read_into(&mut bytes).ok()?;
+        Some(bytes)
+    }
+}
+
+fn prepare_buffer_read<'a, M: HostMemory + HostOps>(
+    state: &'a mut DeviceState,
+    host: &'a mut M,
+    task_id: u32,
+    buffer_ref: u32,
+    backing: &BufferBacking,
+    offset: u64,
+    extent_cap: Option<u64>,
+) -> Option<BufferReadWindow<'a, M>> {
     let (gva, size) = (backing.gva, backing.size);
     if offset >= size {
         crate::observe::fail(format!(
@@ -1254,7 +1309,19 @@ fn read_buffer_bytes_resolved<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route_n("cpu_buffer_extent_saved_bytes", full - avail);
     }
     let want = host_alloc_len(avail).filter(|&n| n > 0)?;
-    let (read_gva, read_span) = (gva + offset, want as u64);
+    let read_gva = match gva
+        .checked_add(offset)
+        .filter(|start| start.checked_add(want as u64).is_some())
+    {
+        Some(gva) => gva,
+        None => {
+            crate::observe::Emit::decline("load_buffer", &crate::runtime::host::MemError::Overflow)
+                .field("task", task_id)
+                .field("ref", buffer_ref)
+                .fail();
+            return None;
+        }
+    };
     // Census, pay, settle — the whole obligation of a CPU read of one named
     // resource's guest bytes. This site used to carry the settle alone, because
     // it held `DeviceState` shared and so *could* not pay; see
@@ -1265,28 +1332,43 @@ fn read_buffer_bytes_resolved<M: HostMemory + HostOps>(
         task_id,
         buffer_ref,
         read_gva,
-        read_span,
+        want as u64,
         crate::runtime::render_writeback::SettleSite::BufferGuestRead,
     );
-    let mut buf = vec![0u8; want];
-    // Use device page_shift (x86=12); unshifted helper defaults to arm14 and fails.
-    if gva_mem::read_task_gva_by_id(
+    Some(BufferReadWindow {
+        state,
         host,
-        &state.tasks,
+        task: task_id,
+        base_gva: gva,
+        offset,
+        gva: read_gva,
+        len: want,
+    })
+}
+
+#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+fn prepare_bound_buffer_read<'a, M: HostMemory + HostOps>(
+    state: &'a mut DeviceState,
+    host: &'a mut M,
+    task_id: u32,
+    bind: &BufferBind,
+) -> Option<BufferReadWindow<'a, M>> {
+    let backing = resolve_buffer_backing(
+        state,
+        host,
         task_id,
-        gva + offset,
-        &mut buf,
-        state.page_shift,
+        bind.buffer_ref,
+        bind.resource.as_deref(),
+    )?;
+    prepare_buffer_read(
+        state,
+        host,
+        task_id,
+        bind.buffer_ref,
+        &backing,
+        bind.offset,
+        None,
     )
-    .is_err()
-    {
-        crate::observe::fail(format!(
-            "load_buffer gva read fail task={task_id} gva={gva:#x}+{offset} want={want} shift={}",
-            state.page_shift
-        ));
-        return None;
-    }
-    Some(buf)
 }
 
 /// Standalone CPU buffer read (non-draw-setup callers): resolve + read.
@@ -2353,13 +2435,21 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         height: rt.height,
         format: rt.format,
         sample_count: attachment_sample_count,
-        load_action: if rt.storage == ColorStorage::Memoryless { color.load_action } else { 0 },
+        load_action: if rt.storage == ColorStorage::Memoryless {
+            color.load_action
+        } else {
+            0
+        },
         store_action: if rt.storage == ColorStorage::Memoryless {
             color.store_action
         } else {
             MTL_STORE_ACTION_STORE
         },
-        clear_color: if rt.storage == ColorStorage::Memoryless { color.clear_color } else { [0.0; 4] },
+        clear_color: if rt.storage == ColorStorage::Memoryless {
+            color.clear_color
+        } else {
+            [0.0; 4]
+        },
         target_seed_rgba: None,
         multisample_source_ref: 0,
     };
@@ -2518,12 +2608,17 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             base_h = mh;
         } else if mw != base_w || mh != base_h {
             if storage == ColorStorage::Memoryless
-                || colors.iter().any(|c: &ColorRtRequest| c.storage == ColorStorage::Memoryless)
+                || colors
+                    .iter()
+                    .any(|c: &ColorRtRequest| c.storage == ColorStorage::Memoryless)
             {
                 if let Some(event) = crate::observe::Emit::refusal(
-                    "mrt_request", &EncodeStatus::BadArgs("mrt_memoryless_geometry"),
+                    "mrt_request",
+                    &EncodeStatus::BadArgs("mrt_memoryless_geometry"),
                 ) {
-                    event.field("task", task_id).field("slot", slot)
+                    event
+                        .field("task", task_id)
+                        .field("slot", slot)
                         .field("dims", format!("{mw}x{mh}"))
                         .field("pass_dims", format!("{base_w}x{base_h}"))
                         .fail_once((u64::from(task_id) << 32) | u64::from(att.texture_ref));
@@ -3931,5 +4026,7 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     )
 }
 
+#[cfg(test)]
+pub(crate) mod buffer_read_tests;
 #[cfg(test)]
 mod tests;

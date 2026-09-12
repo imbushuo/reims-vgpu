@@ -4636,6 +4636,14 @@ impl DeviceState {
         self.session.lock().expect("session").take_ready()
     }
 
+    /// Measurement only. Contention/poisoning is unknown, never a drained model.
+    pub(crate) fn pending_transactions_for_observation(&self) -> Option<usize> {
+        self.session
+            .try_lock()
+            .ok()
+            .map(|session| session.scheduler().pending())
+    }
+
     /// A transaction finished on the host.
     ///
     /// Releases its dependents, retires its accesses, and hands back what its
@@ -6164,6 +6172,16 @@ mod device_access_tests {
     const TASK: u32 = 3;
     const DOMAIN: ChannelId = ChannelId(1);
     const BACKING: BackingId = BackingId(0x4000);
+
+    #[test]
+    fn checkpoint_pending_snapshot_is_nonblocking() {
+        let state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let held = state.session.lock().unwrap();
+        assert_eq!(state.pending_transactions_for_observation(), None);
+        assert_eq!(held.scheduler().pending(), 0);
+        drop(held);
+        assert_eq!(state.pending_transactions_for_observation(), Some(0));
+    }
 
     /// A device with one task holding one dedicated resource, and that
     /// resource's name.

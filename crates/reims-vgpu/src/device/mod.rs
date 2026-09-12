@@ -663,7 +663,7 @@ pub fn device_drain(id: u64) -> bool {
         crate::runtime::drain::note_drain_exit(entry_us, true);
         return true;
     }
-    let Some(_worker) = slot.iosfc_admission.worker() else {
+    let Some(worker) = slot.iosfc_admission.worker() else {
         crate::runtime::drain::note_drain_skipped();
         crate::runtime::drain::note_drain_exit(entry_us, true);
         return true;
@@ -700,7 +700,9 @@ pub fn device_drain(id: u64) -> bool {
     // The same instant on the crate's own clock, so a lookup inside the drain
     // can say how late in this tranche it happened without threading a start
     // time through every call. See `census::tranche_elapsed_us`.
-    crate::runtime::drain::note_tranche_started(crate::observe::elapsed_us());
+    let tranche_started_us = crate::observe::elapsed_us();
+    crate::runtime::drain::note_tranche_started(tranche_started_us);
+    let checkpoints = worker.observe_tranche(id, tranche_started_us);
     device.drain(&mut host);
     // The tail is timed apart from `Device::drain` because it is inside
     // `drain_us` and inside no `DrainPhase`, and that residue is a third of the
@@ -797,6 +799,9 @@ pub fn device_drain(id: u64) -> bool {
     }
     if device.state.pending.host_action_yield {
         slot.present_action_pending.store(true, Ordering::Release);
+    }
+    if let Some(report) = checkpoints.finish(crate::observe::elapsed_us()) {
+        crate::observe::off(report.line());
     }
     crate::runtime::drain::note_drain_exit(busy_end_us, false);
     true

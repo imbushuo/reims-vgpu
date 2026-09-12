@@ -504,6 +504,15 @@ pub fn new_command_buffer(queue: &CommandQueueRef) -> Option<&CommandBufferRef> 
     }
 }
 
+/// Compare the command's actual originating queue without extending its borrow.
+pub fn command_buffer_uses_queue(command: &CommandBufferRef, queue: &CommandQueueRef) -> bool {
+    // SAFETY: commandQueue is a borrowed native object retained by command.
+    unsafe {
+        let actual: *mut Object = msg_send![command, commandQueue];
+        actual == queue.as_ptr().cast()
+    }
+}
+
 /// `[MTLCommandBuffer renderCommandEncoderWithDescriptor:]`, with the nil an
 /// invalid pass descriptor answers.
 ///
