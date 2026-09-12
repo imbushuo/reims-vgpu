@@ -2353,6 +2353,13 @@ pub(crate) fn selected_within(
         )
 }
 
+/// Mapping writes carry their authority through every page-plan resolution.
+enum MappingCopy<'a> {
+    Write(&'a [u8], &'a PagesVouched),
+    Read(&'a mut [u8]),
+    ReadRect(&'a mut [u8], RectStride),
+}
+
 /// Copy `[off, off+len)` between a caller buffer and the mapping's guest pages.
 ///
 /// One packed contig view when the mapping has one that covers the range;
@@ -2376,17 +2383,22 @@ pub(crate) fn selected_within(
 /// caller's bytes, so all four are named; the read direction used to return a
 /// bare `false` on three of them and left the caller with no reason.
 ///
-/// Callers flush deferred writeback over the range first, and the write
-/// direction re-checks its [`PagesVouched`] after that flush.
+/// Callers flush deferred writeback over the range first. Writes retain their
+/// [`PagesVouched`] here because either resolver can replace the page plan.
 fn copy_mapping_runs<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     mapping_id: u32,
     off: u64,
-    mut copy: RunCopy<'_>,
+    copy: MappingCopy<'_>,
     only: Option<&[(u64, u64)]>,
     site: &str,
 ) -> bool {
+    let (mut copy, vouched) = match copy {
+        MappingCopy::Write(buf, vouched) => (RunCopy::Write(buf), Some(vouched)),
+        MappingCopy::Read(buf) => (RunCopy::Read(buf), None),
+        MappingCopy::ReadRect(buf, rect) => (RunCopy::ReadRect(buf, rect), None),
+    };
     if copy.is_write() {
         // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
         // witness. The read direction shares this walk and writes nothing.
@@ -2395,8 +2407,22 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     let page_size = state.page_size();
     let len = copy.len();
     let need_end = off.saturating_add(len as u64);
+    let authority_current = |state: &DeviceState| {
+        if vouched.is_some_and(|token| !token.covers(state, mapping_id)) {
+            crate::observe::fail(format!(
+                "{site} fail reason=vouch_stale mid={mapping_id} off={off:#x} len={len:#x} \
+                 (the page list was cleared or replaced while resolving this write)"
+            ));
+            return false;
+        }
+        true
+    };
     // Fast path: one packed view covering the whole range.
-    if let Some((ptr, view_len)) = ensure_contig_view(state, host, mapping_id) {
+    let view = ensure_contig_view(state, host, mapping_id);
+    if !authority_current(state) {
+        return false;
+    }
+    if let Some((ptr, view_len)) = view {
         if (view_len as u64) >= need_end && (off as usize) + len <= view_len {
             for (lo, hi) in selected_within(only, off, need_end) {
                 let buf_off = (lo - off) as usize;
@@ -2417,6 +2443,9 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         ));
         return false;
     };
+    if !authority_current(state) {
+        return false;
+    }
     let page_sz = page_size as usize;
     let span_end = (gpas.len() as u64).saturating_mul(page_size);
     if need_end > span_end {
@@ -2573,7 +2602,7 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
         host,
         mapping_id,
         off,
-        RunCopy::Write(buf),
+        MappingCopy::Write(buf, vouched),
         only,
         "mapping_write",
     )
@@ -2629,7 +2658,7 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
         host,
         mapping_id,
         off,
-        RunCopy::Read(buf),
+        MappingCopy::Read(buf),
         None,
         "mapping_read",
     )
@@ -2645,8 +2674,7 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
 /// sample window first pays a plane-sized allocation and a second copy out of it.
 ///
 /// `dst` shorter than the rectangle's packed size is a refusal, not a partial
-/// read: the shape is checked at [`RunCopy::read_rect`] before any page is
-/// touched.
+/// read: the shape is checked here before any page is touched.
 pub(crate) fn read_mapping_rect<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2675,15 +2703,12 @@ pub(crate) fn read_mapping_rect<H: HostMemory + HostOps>(
         ));
         return false;
     }
-    let Some(copy) = RunCopy::read_rect(dst, rect) else {
-        return false;
-    };
     copy_mapping_runs(
         state,
         host,
         mapping_id,
         off,
-        copy,
+        MappingCopy::ReadRect(dst, rect),
         None,
         "mapping_read_rect",
     )

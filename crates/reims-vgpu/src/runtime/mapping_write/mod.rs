@@ -68,7 +68,7 @@ pub enum SurfaceWriteRefusal {
         height: u32,
         format: u16,
     },
-    /// The page walk refused to vouch for the mapping's page list.
+    /// The page witness or current page-plan authority refused the write.
     PagesNotOurs,
     /// The format has no packed row length, so there is no rect to write.
     FormatRowLength { format: u16 },
@@ -392,15 +392,19 @@ fn contig_for_write<H: HostMemory + HostOps>(
     mapping_id: u32,
     span_end: u64,
     vouched: &mapper::PagesVouched,
-) -> Option<(usize, usize)> {
+) -> Result<Option<(usize, usize)>, SurfaceWriteRefusal> {
+    let view = contig_for_span(state, host, mapping_id, span_end);
+    // Resolving the view can adopt a replacement page plan.
     if !vouched.covers(state, mapping_id) {
         crate::observe::fail(format!(
             "mapping_write contig mid={mapping_id} reason=vouch_stale need={span_end} \
              (the page list was cleared or replaced between the walk and this write)"
         ));
-        return None;
+        return Err(SurfaceWriteRefusal::PagesNotOurs);
     }
-    let view = contig_for_span(state, host, mapping_id, span_end)?;
+    let Some(view) = view else {
+        return Ok(None);
+    };
     // Every raw-pointer write in this file goes through here, and none of them
     // goes through `mapper::write_mapping_bytes` — they poke rows straight into
     // the view. So this is where those writes enter `observe::footprint`, and
@@ -420,7 +424,7 @@ fn contig_for_write<H: HostMemory + HostOps>(
     // the footprint mark rather than in each caller, so the two cannot drift and
     // a new caller inherits both.
     state.note_host_wrote_mapping(mapping_id);
-    Some(view)
+    Ok(Some(view))
 }
 
 /// One past the last mapping byte a rect transfer touches: the last texel of its
@@ -856,7 +860,11 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     let frame_bytes = (mh as u64).saturating_mul(tight as u64);
 
     // Fast path: one packed view, poke rows in place.
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+    let contig = match contig_for_write(state, host, mapping_id, span_end, &vouched) {
+        Ok(view) => view,
+        Err(reason) => return refuse(mapping_id, reason),
+    };
+    if let Some((ptr, _)) = contig {
         note_surface_write_path(true, frame_bytes);
         let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
@@ -1288,7 +1296,10 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rgba8_changed") else {
         return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
-    let contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
+    let contig = match contig_for_write(state, host, mapping_id, span_end, &vouched) {
+        Ok(view) => view,
+        Err(reason) => return refuse(mapping_id, reason),
+    };
     // SAFETY: when Some, contig covers span_end.
     let base = contig.map(|(ptr, _)| unsafe { (ptr as *mut u8).add(base_off as usize) });
 
@@ -1741,7 +1752,11 @@ pub fn write_native_image_skipping<M: HostMemory + HostOps>(
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "native_image") else {
         return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+    let contig = match contig_for_write(state, host, mapping_id, span_end, &vouched) {
+        Ok(view) => view,
+        Err(reason) => return refuse(mapping_id, reason),
+    };
+    if let Some((ptr, _)) = contig {
         // SAFETY: the revalidated contiguous view covers `span_end`.
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         for y in 0..height as usize {
@@ -1858,7 +1873,11 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "raw_rows") else {
         return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+    let contig = match contig_for_write(state, host, mapping_id, span_end, &vouched) {
+        Ok(view) => view,
+        Err(reason) => return refuse(mapping_id, reason),
+    };
+    if let Some((ptr, _)) = contig {
         // SAFETY: contig covers span_end from offset 0.
         let base = ptr as *mut u8;
         for y in 0..height as usize {
@@ -2479,6 +2498,10 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
         "rectwr_contig_us",
         contig_started.elapsed().as_micros() as u64,
     );
+    let contig = match contig {
+        Ok(view) => view,
+        Err(reason) => return refuse(mapping_id, reason),
+    };
     if let Some((ptr, _)) = contig {
         crate::runtime::drain::note_store_route("rectwr_contig_n");
         // SAFETY: contig covers span_end, and write_end ≤ span_end (checked).
