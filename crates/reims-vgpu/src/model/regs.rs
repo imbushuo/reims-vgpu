@@ -880,8 +880,8 @@ pub const DISPLAY_MODE1_W: u16 = 1440;
 pub const DISPLAY_MODE1_H: u16 = 1080;
 pub const DISPLAY_MODE2_W: u16 = 1280;
 pub const DISPLAY_MODE2_H: u16 = 1024;
-/// 4K UHD, advertised at `DISPLAY_REFRESH_HZ` (120) like every other mode so the
-/// guest can select native 3840×2160 @ 120 Hz. 3840 < `MAX_SCANOUT_DIM` (8192);
+/// 4K UHD, advertised at `DISPLAY_REFRESH_HZ` (60) like every other mode so the
+/// guest can select native 3840×2160 @ 60 Hz. 3840 < `MAX_SCANOUT_DIM` (8192);
 /// a 4K BGRA8 surface is 33 MiB (slab bucket 6). The scanout/present/host-window
 /// geometry is dynamic (follows the presented surface), so no other constant
 /// changes to run the desktop at 4K — see [[scanout-bridge]] mode-switch contract.
@@ -964,9 +964,9 @@ pub fn display_dimension_mm(millimetres: u16) -> (f32, u16) {
 /// (`REIMS_VGPU_PCI_HEARTBEAT_MS` = 4). The limiter now *derives* its interval
 /// from this constant (`DISPLAY_VBL_MIN_INTERVAL_US`) rather than restating it,
 /// because the two were allowed to drift apart: a hardcoded 8 ms delivered
-/// 125 Hz against the 120 advertised here, and the guest paces to what is
+/// 125 Hz against the advertised refresh, and the guest paces to what is
 /// delivered.
-pub const DISPLAY_REFRESH_HZ: u32 = 120;
+pub const DISPLAY_REFRESH_HZ: u32 = 60;
 pub const DISPLAY_PRODUCT_NAME: &[u8] = b"QEMU display\0";
 /// How many unacked ONLINE pulses this device sends before it stops.
 ///
