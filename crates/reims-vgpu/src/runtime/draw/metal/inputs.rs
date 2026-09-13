@@ -7,6 +7,11 @@ pub(crate) enum PreparedInput {
     Native(NativeBuffer),
 }
 
+pub(crate) enum Capture {
+    Cpu,
+    Native(Option<crate::backend::metal::buffer_extent::BoundedRead>),
+}
+
 pub(super) struct InputPlan {
     pub native_plain: bool,
     stage_in: std::collections::BTreeSet<u32>,
@@ -50,10 +55,22 @@ pub(crate) fn prepare<M: HostMemory + HostOps>(
     task: u32,
     bind: &BufferBind,
     class: Class,
-    native: bool,
+    capture: Capture,
     miss_reason: &'static str,
 ) -> Result<PreparedInput, EncodeStatus> {
-    let window = prepare_bound_buffer_read(state, host, task, bind)
+    let (native, extent) = match capture {
+        Capture::Cpu => (false, None),
+        Capture::Native(bounded) => (
+            true,
+            bounded.and_then(|proof| proof.bytes_for(class, bind.index)),
+        ),
+    };
+    let window = match extent {
+        Some(extent) => {
+            prepare_bound_buffer_read_with_extent(state, host, task, bind, Some(extent))
+        }
+        None => prepare_bound_buffer_read(state, host, task, bind),
+    }
         .ok_or(EncodeStatus::MetalFailed(miss_reason))?;
     if !native {
         return window
@@ -68,8 +85,12 @@ pub(crate) fn prepare<M: HostMemory + HostOps>(
     })?;
     // Preparation paid reference debt and settled overlapping GPU work. The
     // synchronous fill owns no pool/TLS borrow, HostOps or guest-memory alias.
-    let bytes = input::fill(
+    // Keep the declared allocation shape when the native owner can do so;
+    // its filled range carries the exact shader-visible suffix and bind offset.
+    let bytes = input::fill_resource_prefix(
         device,
+        window.backing.size,
+        window.offset,
         window.len,
         class,
         "metal_render_buffer_create_failed",
@@ -86,7 +107,8 @@ pub(crate) fn prepare<M: HostMemory + HostOps>(
             EncodeStatus::MetalFailed(miss_reason)
         }
     })?;
-    debug_assert_eq!(bytes.len(), window.len);
+    debug_assert_eq!(bytes.captured_len(), window.len);
+    debug_assert_eq!(bytes.len() as u64, window.backing.size - window.offset);
     Ok(PreparedInput::Native(NativeBuffer {
         binding: bind.index,
         attribute_stride: bind.attribute_stride,
@@ -164,13 +186,22 @@ mod tests {
             crate::runtime::draw::buffer_read_tests::Fixture::new(crate::model::PAGE_SHIFT_ARM64E);
         let mut bind = fixture.bind(7, 1, 32, 8);
         bind.index = 2;
+        let proof = crate::backend::metal::buffer_extent::tests::object(
+            crate::backend::metal::buffer_extent::Stage::Vertex,
+            bind.index,
+            4,
+        );
         let input = prepare(
             &mut fixture.state,
             &mut fixture.host,
             1,
             &bind,
             Class::Vertex,
-            plan.native_vertex(bind.index),
+            if plan.native_vertex(bind.index) {
+                Capture::Native(Some(proof))
+            } else {
+                Capture::Cpu
+            },
             "draw_mtl_vertex_buffer_miss",
         )
         .unwrap();

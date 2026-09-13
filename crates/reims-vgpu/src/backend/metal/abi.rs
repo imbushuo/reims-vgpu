@@ -301,14 +301,24 @@ pub(crate) enum ReimsVgpuSampledImage {
     Packed(ReimsVgpuPackedSampledImage),
     Planar { binding: u32, image: std::sync::Arc<super::planar::SampledImage> },
     Native { binding: u32, texture: metal::Texture },
+    /// An immutable leased publication, never a writable storage binding.
+    Resident { binding: u32, image: super::resident::PublishedSample },
 }
 
 impl ReimsVgpuSampledImage {
     pub(crate) fn binding(&self) -> u32 {
         match self {
             Self::Packed(image) => image.binding,
-            Self::Planar { binding, .. } | Self::Native { binding, .. } => *binding,
+            Self::Planar { binding, .. }
+            | Self::Native { binding, .. }
+            | Self::Resident { binding, .. } => *binding,
         }
+    }
+
+    pub(crate) fn needs_completion(&self) -> bool {
+        // Resident's read lease forbids writable reuse and travels with the
+        // batch, unlike a borrowed/writable native storage allocation.
+        matches!(self, Self::Native { .. })
     }
 }
 

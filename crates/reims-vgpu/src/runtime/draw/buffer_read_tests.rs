@@ -86,6 +86,8 @@ fn checked_buffer_destination_preserves_full_suffix_and_scattered_page_geometry(
         let bind = fixture.bind(7, 1, fixture.page + 5, fixture.page - 3);
         let window =
             prepare_bound_buffer_read(&mut fixture.state, &mut fixture.host, 1, &bind).unwrap();
+        assert_eq!(window.backing.size, fixture.page + 5);
+        assert_eq!(window.offset, fixture.page - 3);
         assert_eq!(
             window.len, 8,
             "allocation size minus offset, not a reflected extent"

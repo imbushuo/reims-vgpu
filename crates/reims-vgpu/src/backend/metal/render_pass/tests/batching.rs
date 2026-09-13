@@ -3,7 +3,8 @@ use crate::backend::blob::BlobKey;
 use crate::backend::metal::abi::*;
 use crate::backend::metal::input::{self, Class as InputClass};
 use crate::backend::metal::render::{
-    render_core_mrt, render_core_mrt_inputs, RenderBuffers, VisibilityQuery,
+    prepare_render_pipeline, render_core_mrt, render_core_mrt_inputs, RenderBuffers,
+    RenderPipelineLayout, VisibilityQuery,
 };
 
 const SOURCE: &str = r#"
@@ -145,7 +146,7 @@ fn record_inputs(
     query: Option<&mut VisibilityQuery>,
     mode: InputMode,
 ) -> EncodeStatus {
-    use crate::runtime::draw::metal::inputs::{prepare, PreparedInput};
+    use crate::runtime::draw::metal::inputs::{prepare, Capture, PreparedInput};
     use crate::runtime::host::HostMemory;
     let native = matches!(mode, InputMode::NativeFilled { .. });
     let mut guest_inputs = if let InputMode::NativeFilled { fail_fragment } = mode {
@@ -287,7 +288,7 @@ fn record_inputs(
                     1,
                     bind,
                     class,
-                    true,
+                    Capture::Native(None),
                     miss,
                 ) {
                     Ok(PreparedInput::Native(buffer)) => destination.push(buffer),
@@ -345,15 +346,29 @@ fn record_inputs(
                 target: ColorTarget::PassLocal(owner.target(color).unwrap()),
             })
             .collect();
-        let status = render_core_mrt_inputs(
-            if native {
+        let color_keys: Vec<_> = colors
+            .iter()
+            .map(|color| color.pipeline_key(color.native_pixel_format()))
+            .collect();
+        let pipeline = prepare_render_pipeline(
+            BlobKey::new(if native {
                 NATIVE_VERT
             } else if stage_in {
                 INPUT_VERT
             } else {
                 VERT
+            }),
+            BlobKey::new(if native { NATIVE_FRAG } else { FRAG }),
+            RenderPipelineLayout {
+                attrs: if stage_in { &attrs } else { &[] },
+                blend: None,
+                colors: &color_keys,
+                depth_format: 0,
+                stencil_format: 0,
             },
-            if native { NATIVE_FRAG } else { FRAG },
+        ).unwrap();
+        let status = render_core_mrt_inputs(
+            &pipeline,
             8,
             4,
             crate::protocol::draw::DrawArgs {
@@ -365,7 +380,6 @@ fn record_inputs(
             },
             matches!(mode, InputMode::PrimitiveIndirect).then_some(&primitive),
             indexed.as_ref(),
-            if stage_in { &attrs } else { &[] },
             if native {
                 RenderBuffers::Native(native_vertex)
             } else if stage_in {
@@ -385,7 +399,6 @@ fn record_inputs(
             &[],
             &[scissor],
             raster.as_ref(),
-            None,
             None,
             None,
             None,
@@ -486,7 +499,12 @@ fn ordinary_direct_filled_suffixes_keep_native_sizes_full_tails_and_deferred_sna
             }
         }
         assert_eq!(pass.batch.borrow().submissions, 1);
-        assert_eq!(pool.borrow().inventory(), [(20, 3), (48, 3)]);
+        let lengths = if device.supports_family(MTLGPUFamily::Apple2) {
+            [(52, 3), (80, 3)]
+        } else {
+            [(20, 3), (48, 3)]
+        };
+        assert_eq!(pool.borrow().inventory(), lengths);
         for (class, before, bytes) in [
             (InputClass::Vertex, before_vertex, 20),
             (InputClass::Fragment, before_fragment, 48),
@@ -528,7 +546,7 @@ fn ordinary_direct_filled_suffixes_keep_native_sizes_full_tails_and_deferred_sna
             ));
         }
         assert_eq!(actual, expected,
-                "exact suffix lengths, zero native offsets, full array tails, first vertex/base instance \
+                "exact suffix lengths, captured native offsets, full array tails, first vertex/base instance \
                  and guest bytes overwritten before completion must preserve the image");
     });
 }
@@ -590,7 +608,11 @@ fn ordinary_direct_fill_partial_guest_read_refuses_draw_and_completes_prior_work
         assert!(!pass.batch.borrow().pending());
         assert_eq!(
             pool.borrow().inventory(),
-            [(20, 1), (48, 1)],
+            if device.supports_family(MTLGPUFamily::Apple2) {
+                [(52, 1), (80, 1)]
+            } else {
+                [(20, 1), (48, 1)]
+            },
             "no partial or unsubmitted input recycled"
         );
         let vertex = input::snapshot(InputClass::Vertex);

@@ -298,17 +298,8 @@ fn materialize_targets<M: HostMemory + HostOps>(
     affected: BTreeSet<usize>,
     boundary: &'static str,
 ) -> Result<(), EncodeStatus> {
-    let stores: Vec<_> = affected
-        .into_iter()
-        .map(|index| {
-            (
-                index,
-                sync_store_target_pages(state, host, req.task_id, &req.colors[index]),
-            )
-        })
-        .collect();
     pass.flush(boundary).map_err(EncodeStatus::RailRefused)?;
-    for (index, pages) in stores {
+    for index in affected {
         let color = &req.colors[index];
         let target = pass.target(color).map_err(EncodeStatus::BadArgs)?;
         let len = reims_vgpu_protocol::extent::tight_image_bytes(color.width, color.height, 4)
@@ -338,6 +329,10 @@ fn materialize_targets<M: HostMemory + HostOps>(
                 mapping_write::FramePublication::HostCache,
             )
         } else {
+            let pages = target
+                .store_pages
+                .as_ref()
+                .ok_or(EncodeStatus::BadArgs("draw_mtl_store_pages_missing"))?;
             write_gva_rgba8_within(
                 state,
                 host,
@@ -348,7 +343,7 @@ fn materialize_targets<M: HostMemory + HostOps>(
                 color.row_stride,
                 color.format,
                 &bytes,
-                pages.as_ref().map(StoreTargetPages::membership),
+                Some(pages.membership()),
             )
             .is_ok()
         };

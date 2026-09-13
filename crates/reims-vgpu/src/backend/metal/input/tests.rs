@@ -378,6 +378,8 @@ fn isolated_queue_inventory_drops_without_host_or_thread_retention() {
             .seal(Filled {
                 allocation,
                 owner: owner.clone(),
+                offset: 0,
+                captured_len: 31,
             })
             .unwrap();
         finish(&mut submission, &cmd);
@@ -392,6 +394,582 @@ fn isolated_queue_inventory_drops_without_host_or_thread_retention() {
             before.retained_bytes
         );
         assert_eq!(snapshot(Class::Attribute).owned_bytes, before.owned_bytes);
+    });
+}
+
+#[test]
+fn resource_suffixes_reuse_original_lengths_and_zero_uncaptured_prefixes() {
+    objc::rc::autoreleasepool(|| {
+        let device = runtime::system_device().expect("Metal device");
+        if !device.supports_family(metal::MTLGPUFamily::Apple2) {
+            return;
+        }
+        let pool = runtime::thread_input_pool(device);
+        pool.borrow_mut().clear_available();
+        let before = snapshot(Class::Vertex);
+        let mut submission = Submission::default();
+        let mut first = Vec::new();
+        for (round, offsets) in [[0u64, 4, 12], [8, 16, 24]].into_iter().enumerate() {
+            let cmd = command(device);
+            submission.begin(&cmd, pool.clone()).unwrap();
+            let mut buffers = Vec::new();
+            for (index, offset) in offsets.into_iter().enumerate() {
+                if round == 0 {
+                    pool.borrow_mut().poison_fresh = true;
+                }
+                let byte = (round * 8 + index + 1) as u8;
+                let input = fill_resource_suffix::<()>(
+                    device,
+                    32,
+                    offset,
+                    Class::Vertex,
+                    "test_input_allocation",
+                    |suffix| {
+                        assert_eq!(suffix.len() as u64, 32 - offset);
+                        if round == 0 {
+                            assert!(suffix.iter().all(|byte| *byte == 0));
+                        }
+                        suffix.fill(byte);
+                        Ok(suffix.len())
+                    },
+                )
+                .unwrap();
+                assert_eq!(input.len() as u64, 32 - offset);
+                assert_eq!(input.binding_offset(), offset);
+                let buffer = submission.seal(input).unwrap();
+                assert_eq!(buffer.length() - offset, 32 - offset);
+                let bytes = contents(&buffer);
+                assert_eq!(&bytes[..offset as usize], vec![0; offset as usize]);
+                assert_eq!(
+                    &bytes[offset as usize..],
+                    vec![byte; (32 - offset) as usize]
+                );
+                buffers.push(buffer);
+            }
+            assert_eq!(
+                buffers
+                    .iter()
+                    .map(|buffer| buffer.as_ptr() as usize)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                3,
+                "uncompleted offsets need independent snapshots",
+            );
+            assert!(pool.borrow().inventory().is_empty());
+            assert!(submission.completed(&cmd).is_err());
+            if round == 0 {
+                first = buffers.iter().map(|buffer| buffer.as_ptr()).collect();
+            } else {
+                assert!(buffers
+                    .iter()
+                    .all(|buffer| first.contains(&buffer.as_ptr())));
+            }
+            finish(&mut submission, &cmd);
+            assert_eq!(pool.borrow().inventory(), [(32, 3)]);
+            assert_index(&pool.borrow());
+        }
+        let after = snapshot(Class::Vertex);
+        assert_eq!(after.allocations - before.allocations, 3);
+        assert_eq!(after.allocated_bytes - before.allocated_bytes, 96);
+        assert_eq!(after.reuses - before.reuses, 3);
+        assert_eq!(
+            after.resource_shaped_fills - before.resource_shaped_fills,
+            6
+        );
+        assert_eq!(after.direct_fill_bytes - before.direct_fill_bytes, 128);
+        assert_eq!(
+            after.direct_fill_zeroed_bytes - before.direct_fill_zeroed_bytes,
+            144
+        );
+        assert_eq!(after.live_bytes, before.live_bytes);
+    });
+}
+
+#[test]
+fn resource_suffix_fallbacks_preserve_bounds_without_expanded_allocations() {
+    objc::rc::autoreleasepool(|| {
+        let device = runtime::system_device().expect("Metal device");
+        let pool = runtime::thread_input_pool(device);
+        pool.borrow_mut().clear_available();
+        for (size, offset) in [
+            (32, 1),
+            (device.max_buffer_length() + 16, device.max_buffer_length()),
+        ] {
+            let before = snapshot(Class::Fragment);
+            let input = fill_resource_suffix::<()>(
+                device,
+                size,
+                offset,
+                Class::Fragment,
+                "test_input_allocation",
+                |suffix| {
+                    assert_eq!(suffix.len() as u64, size - offset);
+                    suffix.fill(0x5b);
+                    Ok(suffix.len())
+                },
+            )
+            .unwrap();
+            assert_eq!(input.binding_offset(), 0);
+            assert_eq!(input.allocation.buffer.length(), size - offset);
+            assert_eq!(
+                contents(&input.allocation.buffer),
+                vec![0x5b; (size - offset) as usize]
+            );
+            let after = snapshot(Class::Fragment);
+            assert_eq!(
+                after.allocated_bytes - before.allocated_bytes,
+                size - offset
+            );
+        }
+        if device.supports_family(metal::MTLGPUFamily::Apple2) {
+            for deny_headroom in [true, false] {
+                if deny_headroom {
+                    pool.borrow_mut().shape_headroom = Some(0);
+                } else {
+                    pool.borrow_mut().shape_headroom = None;
+                    pool.borrow_mut().fail_next_allocation();
+                }
+                let before = snapshot(Class::Fragment);
+                let input = fill_resource_suffix::<()>(
+                    device,
+                    64,
+                    48,
+                    Class::Fragment,
+                    "test_input_allocation",
+                    |suffix| {
+                        assert_eq!(suffix.len(), 16);
+                        suffix.fill(0x6c);
+                        Ok(suffix.len())
+                    },
+                )
+                .unwrap();
+                assert_eq!(input.binding_offset(), 0);
+                assert_eq!(input.allocation.buffer.length(), 16);
+                assert_eq!(
+                    snapshot(Class::Fragment).allocated_bytes - before.allocated_bytes,
+                    16
+                );
+            }
+            pool.borrow_mut().shape_headroom = None;
+            submit_lengths(device, &[64]);
+            pool.borrow_mut().shape_headroom = Some(0);
+            let before = snapshot(Class::Fragment);
+            let input = fill_resource_suffix::<()>(
+                device,
+                64,
+                48,
+                Class::Fragment,
+                "test_input_allocation",
+                |suffix| {
+                    suffix.fill(0x7d);
+                    Ok(suffix.len())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                input.binding_offset(),
+                48,
+                "reuse requires no new working-set headroom"
+            );
+            assert_eq!(input.allocation.buffer.length(), 64);
+            assert_eq!(snapshot(Class::Fragment).allocations, before.allocations);
+            assert_eq!(snapshot(Class::Fragment).reuses - before.reuses, 1);
+        }
+        pool.borrow_mut().clear_available();
+    });
+}
+
+#[test]
+fn plain_draw_offsets_reuse_one_declared_allocation_after_completion() {
+    use crate::runtime::draw::metal::inputs::{prepare, Capture, PreparedInput};
+    use crate::runtime::host::HostMemory;
+    objc::rc::autoreleasepool(|| {
+        let device = runtime::system_device().expect("Metal device");
+        if !device.supports_family(metal::MTLGPUFamily::Apple2) {
+            return;
+        }
+        let pool = runtime::thread_input_pool(device);
+        pool.borrow_mut().clear_available();
+        let mut fixture =
+            crate::runtime::draw::buffer_read_tests::Fixture::new(crate::model::PAGE_SHIFT_ARM64E);
+        let size = fixture.page;
+        let mut bind = fixture.bind(7, 1, size, 0);
+        let before = snapshot(Class::Vertex);
+        let mut first = None;
+        let offsets = [0, 4, 20, 256, 512, size / 2, size - 16];
+        for (index, offset) in offsets.into_iter().enumerate() {
+            bind.offset = offset;
+            let byte = index as u8 + 1;
+            fixture
+                .host
+                .write_gpa(8 * size, &vec![byte; size as usize])
+                .unwrap();
+            let PreparedInput::Native(input) = prepare(
+                &mut fixture.state,
+                &mut fixture.host,
+                1,
+                &bind,
+                Class::Vertex,
+                Capture::Native(None),
+                "draw_mtl_vertex_buffer_miss",
+            )
+            .unwrap() else {
+                panic!("plain input must keep its native snapshot");
+            };
+            assert_eq!(input.bytes.binding_offset(), offset);
+            assert_eq!(input.bytes.len() as u64, size - offset);
+            fixture
+                .host
+                .write_gpa(8 * size, &vec![0xee; size as usize])
+                .unwrap();
+            let cmd = command(device);
+            let mut submission = Submission::default();
+            submission.begin(&cmd, pool.clone()).unwrap();
+            let buffer = submission.seal(input.bytes).unwrap();
+            assert_eq!(buffer.length(), size);
+            assert_eq!(buffer.length() - offset, size - bind.offset);
+            let bytes = contents(&buffer);
+            assert!(bytes[..offset as usize].iter().all(|byte| *byte == 0));
+            assert!(bytes[offset as usize..]
+                .iter()
+                .all(|actual| *actual == byte));
+            if let Some(first) = first {
+                assert_eq!(
+                    buffer.as_ptr(),
+                    first,
+                    "offset changes must not change the pool key"
+                );
+            } else {
+                first = Some(buffer.as_ptr());
+            }
+            finish(&mut submission, &cmd);
+            assert_eq!(pool.borrow().inventory(), [(size as usize, 1)]);
+        }
+        let after = snapshot(Class::Vertex);
+        assert_eq!(after.allocations - before.allocations, 1);
+        assert_eq!(after.reuses - before.reuses, offsets.len() as u64 - 1);
+        assert_eq!(after.allocated_bytes - before.allocated_bytes, size);
+    });
+}
+
+#[test]
+fn resource_suffix_partial_capture_is_never_sealed_or_retried() {
+    objc::rc::autoreleasepool(|| {
+        let device = runtime::system_device().expect("Metal device");
+        let pool = runtime::thread_input_pool(device);
+        pool.borrow_mut().clear_available();
+        let mut calls = 0;
+        let before = snapshot(Class::Vertex);
+        let result = fill_resource_suffix::<()>(
+            device,
+            64,
+            48,
+            Class::Vertex,
+            "test_input_allocation",
+            |suffix| {
+                calls += 1;
+                suffix[..3].fill(0x31);
+                Ok(3)
+            },
+        );
+        assert!(matches!(result, Err(FillError::Backend(_))));
+        assert_eq!(calls, 1);
+        assert!(pool.borrow().inventory().is_empty());
+        assert_eq!(snapshot(Class::Vertex).live_bytes, before.live_bytes);
+        for (size, offset) in [(0, 0), (8, 8), (8, 9)] {
+            assert!(fill_resource_suffix::<()>(
+                device,
+                size,
+                offset,
+                Class::Vertex,
+                "test_input_allocation",
+                |_| panic!("invalid suffix must not expose a slice"),
+            )
+            .is_err());
+        }
+    });
+}
+
+#[test]
+fn bounded_prefix_keeps_full_native_length_and_zeroes_recycled_tail() {
+    objc::rc::autoreleasepool(|| {
+        let device = runtime::system_device().expect("Metal device");
+        let pool = runtime::thread_input_pool(device);
+        pool.borrow_mut().clear_available();
+        submit_lengths(device, &[64]);
+        for (offset, captured) in [(0, 4), (16, 8), (12, 1), (3, 5), (4, 0)] {
+            let input = fill_resource_prefix::<()>(
+                device,
+                64,
+                offset,
+                captured,
+                Class::Fragment,
+                "test_input_allocation",
+                |view| {
+                    assert_eq!(view.len(), captured);
+                    view.fill(0xab);
+                    Ok(view.len())
+                },
+            )
+            .unwrap();
+            let native_offset = input.binding_offset();
+            assert_eq!(input.len() as u64, 64 - offset);
+            assert_eq!(input.captured_len(), captured);
+            let bytes = contents(&input.allocation.buffer);
+            assert_eq!(
+                input.allocation.buffer.length() - native_offset,
+                64 - offset
+            );
+            assert!(bytes[..native_offset as usize]
+                .iter()
+                .all(|&byte| byte == 0));
+            assert!(
+                bytes[native_offset as usize..native_offset as usize + captured]
+                    .iter()
+                    .all(|&byte| byte == 0xab)
+            );
+            assert!(bytes[native_offset as usize + captured..]
+                .iter()
+                .all(|&byte| byte == 0));
+            let cmd = command(device);
+            let mut submission = Submission::default();
+            submission.begin(&cmd, pool.clone()).unwrap();
+            submission.seal(input).unwrap();
+            finish(&mut submission, &cmd);
+        }
+        for reported in [3, 5] {
+            let result = fill_resource_prefix::<()>(
+                device,
+                64,
+                16,
+                4,
+                Class::Fragment,
+                "test_input_allocation",
+                |view| {
+                    assert_eq!(view.len(), 4);
+                    view.fill(1);
+                    Ok(reported)
+                },
+            );
+            assert!(matches!(result, Err(FillError::Backend(_))));
+        }
+        assert!(fill_resource_prefix::<()>(
+            device,
+            64,
+            16,
+            49,
+            Class::Fragment,
+            "test_input_allocation",
+            |_| panic!("an out-of-bounds capture cannot expose a slice"),
+        )
+        .is_err());
+    });
+}
+
+#[test]
+fn bounded_plain_input_skips_unreachable_pages_but_preserves_full_buffer_size() {
+    use crate::backend::blob::BlobKey;
+    use crate::backend::metal::buffer_extent::{self, Stage};
+    use crate::runtime::draw::metal::inputs::{prepare, Capture, PreparedInput};
+    use crate::runtime::host::HostMemory;
+    objc::rc::autoreleasepool(|| {
+        let device = runtime::system_device().expect("Metal device");
+        let pool = runtime::thread_input_pool(device);
+        pool.borrow_mut().clear_available();
+        let mut fixture =
+            crate::runtime::draw::buffer_read_tests::Fixture::new(crate::model::PAGE_SHIFT_ARM64E);
+        let size = fixture.page + 32;
+        let offset = fixture.page - 16;
+        let bind = fixture.bind(7, 1, size, offset);
+        let proof = buffer_extent::tests::object(Stage::Vertex, bind.index, 8);
+        fixture
+            .host
+            .write_gpa(3 * fixture.page + 2 * 4, &0u32.to_le_bytes())
+            .unwrap();
+        let before = snapshot(Class::Vertex);
+        let PreparedInput::Native(input) = prepare(
+            &mut fixture.state,
+            &mut fixture.host,
+            1,
+            &bind,
+            Class::Vertex,
+            Capture::Native(Some(proof)),
+            "draw_mtl_vertex_buffer_miss",
+        )
+        .unwrap() else {
+            panic!("plain input must retain the native allocation");
+        };
+        let native_offset = input.bytes.binding_offset();
+        assert_eq!(input.bytes.len(), 48);
+        assert_eq!(input.bytes.captured_len(), 8);
+        assert_eq!(input.bytes.allocation.buffer.length() - native_offset, 48);
+        let bytes = contents(&input.bytes.allocation.buffer);
+        assert!(bytes[..native_offset as usize]
+            .iter()
+            .all(|&byte| byte == 0));
+        assert_eq!(
+            &bytes[native_offset as usize..native_offset as usize + 8],
+            &[0x11; 8]
+        );
+        assert!(bytes[native_offset as usize + 8..]
+            .iter()
+            .all(|&byte| byte == 0));
+        assert_eq!(
+            snapshot(Class::Vertex).direct_fill_bytes - before.direct_fill_bytes,
+            8
+        );
+        drop(input);
+        // Unknown or failed metadata must still attempt the full suffix, not
+        // turn inaccessible trailing bytes into a successful short snapshot.
+        let failed =
+            buffer_extent::cached(BlobKey::new(b"invalid metadata fixture"), Stage::Vertex);
+        assert!(prepare(
+            &mut fixture.state,
+            &mut fixture.host,
+            1,
+            &bind,
+            Class::Vertex,
+            Capture::Native(failed.bound(bind.index)),
+            "draw_mtl_vertex_buffer_miss",
+        )
+        .is_err());
+        assert!(prepare(
+            &mut fixture.state,
+            &mut fixture.host,
+            1,
+            &bind,
+            Class::Vertex,
+            Capture::Cpu,
+            "draw_mtl_vertex_buffer_miss",
+        )
+        .is_err());
+        assert!(
+            pool.borrow().inventory().is_empty(),
+            "unsealed inputs never recycle"
+        );
+    });
+}
+
+#[test]
+fn bounded_fragment_snapshots_keep_native_pixels_and_pending_input_lifetimes() {
+    use crate::backend::metal::buffer_extent::{self, Stage};
+    use crate::runtime::draw::metal::inputs::{prepare, Capture, PreparedInput};
+    use crate::runtime::host::HostMemory;
+    const SOURCE: &str = r#"
+        #include <metal_stdlib>
+        using namespace metal;
+        vertex float4 bounded_vertex(uint i [[vertex_id]]) {
+            const float2 p[] = {float2(-1,-1), float2(3,-1), float2(-1,3)};
+            return float4(p[i], 0, 1);
+        }
+        fragment float4 bounded_fragment(constant float4 &color [[buffer(0)]]) {
+            return color;
+        }
+    "#;
+    objc::rc::autoreleasepool(|| {
+        let device = runtime::system_device().expect("Metal device");
+        let pool = runtime::thread_input_pool(device);
+        pool.borrow_mut().clear_available();
+        let library = raw_metal::new_library_with_source(device, SOURCE).unwrap();
+        let descriptor = RenderPipelineDescriptor::new();
+        descriptor
+            .set_vertex_function(Some(&library.get_function("bounded_vertex", None).unwrap()));
+        descriptor.set_fragment_function(Some(
+            &library.get_function("bounded_fragment", None).unwrap(),
+        ));
+        descriptor
+            .color_attachments()
+            .object_at(0)
+            .unwrap()
+            .set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+        let pipeline = raw_metal::new_render_pipeline_state(device, &descriptor).unwrap();
+        let descriptor = TextureDescriptor::new();
+        descriptor.set_texture_type(MTLTextureType::D2);
+        descriptor.set_width(2);
+        descriptor.set_height(1);
+        descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+        descriptor.set_storage_mode(MTLStorageMode::Shared);
+        descriptor.set_usage(MTLTextureUsage::RenderTarget);
+        let texture = raw_metal::new_texture(device, &descriptor).unwrap();
+        let mut fixture =
+            crate::runtime::draw::buffer_read_tests::Fixture::new(crate::model::PAGE_SHIFT_ARM64E);
+        let bind = fixture.bind(7, 1, 96, 32);
+        let proof = buffer_extent::tests::object(Stage::Fragment, bind.index, 16);
+        let cmd = command(device);
+        let mut submission = Submission::default();
+        submission.begin(&cmd, pool.clone()).unwrap();
+        let pass = RenderPassDescriptor::new();
+        let color = pass.color_attachments().object_at(0).unwrap();
+        color.set_texture(Some(&texture));
+        color.set_load_action(MTLLoadAction::Clear);
+        color.set_store_action(MTLStoreAction::Store);
+        let encoder = raw_metal::new_render_command_encoder(&cmd, &pass).unwrap();
+        encoder.set_render_pipeline_state(&pipeline);
+        encoder.set_viewport(MTLViewport {
+            originX: 0.,
+            originY: 0.,
+            width: 2.,
+            height: 1.,
+            znear: 0.,
+            zfar: 1.,
+        });
+        let before = snapshot(Class::Fragment);
+        for (x, color) in [[1f32, 0., 0., 1.], [0., 1., 0., 1.]]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes: Vec<_> = color.into_iter().flat_map(f32::to_ne_bytes).collect();
+            fixture
+                .host
+                .write_gpa(8 * fixture.page + 32, &bytes)
+                .unwrap();
+            let PreparedInput::Native(input) = prepare(
+                &mut fixture.state,
+                &mut fixture.host,
+                1,
+                &bind,
+                Class::Fragment,
+                Capture::Native(Some(proof)),
+                "draw_mtl_fragment_buffer_miss",
+            )
+            .unwrap() else {
+                panic!("plain fragment input must remain native");
+            };
+            let offset = input.bytes.binding_offset();
+            assert_eq!(input.bytes.len(), 64);
+            assert_eq!(input.bytes.captured_len(), 16);
+            let buffer = submission.seal(input.bytes).unwrap();
+            assert_eq!(buffer.length() - offset, 64);
+            fixture
+                .host
+                .write_gpa(8 * fixture.page + 32, &[0; 16])
+                .unwrap();
+            encoder.set_fragment_buffer(0, Some(&buffer), offset);
+            encoder.set_scissor_rect(MTLScissorRect {
+                x: x as u64,
+                y: 0,
+                width: 1,
+                height: 1,
+            });
+            encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+        }
+        assert!(pool.borrow().inventory().is_empty());
+        assert_eq!(submission.inputs.len(), 2);
+        encoder.end_encoding();
+        finish(&mut submission, &cmd);
+        let mut pixels = [0u8; 8];
+        texture.get_bytes(
+            pixels.as_mut_ptr().cast(),
+            8,
+            MTLRegion::new_2d(0, 0, 2, 1),
+            0,
+        );
+        assert_eq!(pixels, [255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!(
+            snapshot(Class::Fragment).direct_fill_bytes - before.direct_fill_bytes,
+            32
+        );
+        assert_eq!(snapshot(Class::Fragment).live_bytes, before.live_bytes);
     });
 }
 

@@ -77,14 +77,149 @@ fn pipeline_from_source(
     };
     let v = library.get_function(vertex, None).unwrap();
     let f = library.get_function(fragment, None).unwrap();
-    let (pipeline, _, _, usage) = get_render_pipeline_state(
-        device, &v, &f, None, &lookup, (ptr::null_mut(), 0),
+    let pipeline = get_render_pipeline_state(
+        device, &lookup, (ptr::null_mut(), 0), || Ok((v, f, None)),
     ).unwrap();
-    let (_, _, _, cached) = get_render_pipeline_state(
-        device, &v, &f, None, &lookup, (ptr::null_mut(), 0),
+    let cached = get_render_pipeline_state(
+        device, &lookup, (ptr::null_mut(), 0),
+        || panic!("a PSO hit must not prepare functions or a vertex descriptor"),
     ).unwrap();
-    assert!(std::sync::Arc::ptr_eq(&usage, &cached), "reflection belongs to the cached PSO");
-    (pipeline, usage)
+    assert!(std::sync::Arc::ptr_eq(&pipeline, &cached), "reflection belongs to the cached PSO");
+    (pipeline.pso.clone(), pipeline.textures.clone())
+}
+
+#[test]
+fn prepared_render_pipeline_retains_content_and_specialization_after_staging() {
+    const VERTEX: &[u8] = b"owned-prepared-pipeline-vertex";
+    const FRAGMENT: &[u8] = b"owned-prepared-pipeline-fragment";
+    let Some(device) = system_device() else {
+        return;
+    };
+    let colors = [ColorRtKey {
+        slot: 0,
+        pixel_format: MTLPixelFormat::RGBA16Float as u32,
+        blend: None,
+        write_mask: 0xf,
+    }];
+    let layout = |colors| RenderPipelineLayout {
+        attrs: &[],
+        blend: None,
+        colors,
+        depth_format: 0,
+        stencil_format: 0,
+    };
+    let prepared = objc::rc::autoreleasepool(|| {
+        let library =
+            super::super::raw_metal::new_library_with_source(device, SNAPSHOT_SHADER).unwrap();
+        for (bytes, name) in [(VERTEX, "snapshot_vertex"), (FRAGMENT, "consume_fragment")] {
+            super::super::cache::fn_cache_insert(
+                &BlobKey::new(bytes),
+                library.get_function(name, None).unwrap(),
+            );
+        }
+        // The prepared PSO must outlive these owned snapshots and this pool.
+        let vertex = VERTEX.to_vec();
+        let fragment = FRAGMENT.to_vec();
+        prepare_render_pipeline(
+            BlobKey::new(&vertex),
+            BlobKey::new(&fragment),
+            layout(&colors),
+        )
+        .unwrap()
+    });
+    let again = prepare_render_pipeline(
+        BlobKey::new(VERTEX),
+        BlobKey::new(FRAGMENT),
+        layout(&colors),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&prepared.entry, &again.entry));
+    assert!(std::ptr::eq(
+        prepared.texture_usages(),
+        again.texture_usages()
+    ));
+    assert_eq!(
+        prepared.texture_usages().fragment,
+        vec![RenderTextureUsage {
+            binding: REIMS_VGPU_BINDING_TEXTURE_BASE + 3,
+            access: RenderTextureAccess::Read,
+        }]
+    );
+
+    let masked_colors = [ColorRtKey {
+        write_mask: 0,
+        ..colors[0]
+    }];
+    let masked = prepare_render_pipeline(
+        BlobKey::new(VERTEX),
+        BlobKey::new(FRAGMENT),
+        layout(&masked_colors),
+    )
+    .unwrap();
+    assert!(
+        !Arc::ptr_eq(&prepared.entry, &masked.entry),
+        "a prepared pipeline still specializes an unblended attachment's write mask"
+    );
+
+    for vertex in [true, false] {
+        let mut collided = prepared.entry.id.as_lookup();
+        if vertex {
+            collided.vert.bytes = b"other-prepared-pipeline-vertex";
+        } else {
+            collided.frag.bytes = b"other-prepared-pipeline-fragment";
+        }
+        let mut rebuilt = false;
+        let result = get_render_pipeline_state(device, &collided, (ptr::null_mut(), 0), || {
+            rebuilt = true;
+            Err(Status::args("metal_function_mtlb_empty"))
+        });
+        assert!(
+            rebuilt && result.is_err(),
+            "a collided shader digest must miss and attempt preparation"
+        );
+    }
+
+    let mut target = ColorRt {
+        slot: 0,
+        pixel_format: colors[0].pixel_format,
+        seed_rgba8: None,
+        out_rgba8: None,
+        clear_r: 0.0,
+        clear_g: 0.0,
+        clear_b: 0.0,
+        clear_a: 1.0,
+        load_action: REIMS_VGPU_MTL_LOAD_ACTION_CLEAR,
+        blend: None,
+        write_mask: 0xf,
+        target: ColorTarget::Transient,
+    };
+    assert!(prepared
+        .validate_attachments(std::slice::from_ref(&target), 0, 0)
+        .is_ok());
+    assert!(prepared.validate_attachments(&[], 0, 0).is_err());
+    assert!(prepared
+        .validate_attachments(
+            std::slice::from_ref(&target),
+            MTLPixelFormat::Depth32Float as u32,
+            0,
+        )
+        .is_err());
+    assert!(prepared
+        .validate_attachments(
+            std::slice::from_ref(&target),
+            0,
+            MTLPixelFormat::Stencil8 as u32,
+        )
+        .is_err());
+    target.slot = 1;
+    assert!(prepared
+        .validate_attachments(std::slice::from_ref(&target), 0, 0)
+        .is_err());
+    target.slot = 0;
+    target.pixel_format = MTLPixelFormat::RGBA8Unorm as u32;
+    assert!(prepared
+        .validate_attachments(std::slice::from_ref(&target), 0, 0)
+        .is_err());
 }
 
 fn color_pass<'a>(target: &TextureRef, clear: MTLClearColor) -> &'a RenderPassDescriptorRef {
@@ -95,6 +230,172 @@ fn color_pass<'a>(target: &TextureRef, clear: MTLClearColor) -> &'a RenderPassDe
     color.set_store_action(MTLStoreAction::Store);
     color.set_clear_color(clear);
     pass
+}
+
+#[test]
+fn resident_sample_matches_readback_upload_and_owns_deferred_snapshot() {
+    use super::super::resident;
+    use objc::rc::{autoreleasepool, WeakPtr};
+    const VERTEX: &[u8] = b"resident-sample-owned-vertex";
+    const FRAGMENT: &[u8] = b"resident-sample-owned-fragment";
+    const SOURCE: &str = r#"
+        #include <metal_stdlib>
+        using namespace metal;
+        vertex float4 resident_vertex(uint i [[vertex_id]]) {
+            const float2 p[] = {float2(-1,-1), float2(3,-1), float2(-1,3)};
+            return float4(p[i], 0, 1);
+        }
+        fragment half4 resident_fragment(float4 p [[position]],
+            texture2d<half> image [[texture(3)]], sampler s [[sampler(2)]]) {
+            return image.sample(s, (p.xy + float2(0.25, -0.25)) / 4.0);
+        }
+    "#;
+    let device = system_device().expect("Metal device");
+    let key = resident::ResidentColorKey::for_surface(0xffff_a113, 4, 4);
+    let pixels: Vec<_> = (0..64).map(|i| (i * 3) as u8).collect();
+    let (weak, image, readback) = autoreleasepool(|| {
+        let library = super::super::raw_metal::new_library_with_source(device, SOURCE).unwrap();
+        for (bytes, name) in [(VERTEX, "resident_vertex"), (FRAGMENT, "resident_fragment")] {
+            super::super::cache::fn_cache_insert(
+                &BlobKey::new(bytes),
+                library.get_function(name, None).unwrap(),
+            );
+        }
+        let texture = resident::create(device, &key, MTLPixelFormat::RGBA8Unorm, 4).unwrap();
+        texture.replace_region(MTLRegion::new_2d(0, 0, 4, 4), 0, pixels.as_ptr().cast(), 16);
+        let weak = unsafe { WeakPtr::new(texture.as_ptr().cast()) };
+        resident::published(&key, 7);
+        let readback = resident::read_published_rgba8(&key, 7).unwrap();
+        let image = ReimsVgpuSampledImage::Resident {
+            binding: REIMS_VGPU_BINDING_TEXTURE_BASE + 3,
+            image: resident::sample_published_rgba8(&key, 7).unwrap(),
+        };
+        (weak, image, readback)
+    });
+    assert_eq!(readback, pixels);
+    assert!(
+        !weak.load().is_null(),
+        "the published sample retains its source"
+    );
+    for access in [RenderTextureAccess::Write, RenderTextureAccess::ReadWrite] {
+        assert!(
+            !validate_render_texture_bindings(
+                std::slice::from_ref(&image),
+                &[RenderTextureUsage {
+                    binding: image.binding(),
+                    access
+                }],
+                false,
+            )
+            .is_ok(),
+            "a published frame cannot be rebound as writable storage"
+        );
+    }
+    let packed = ReimsVgpuSampledImage::Packed(ReimsVgpuPackedSampledImage {
+        binding: image.binding(),
+        width: 4,
+        height: 4,
+        rgba8: readback.as_ptr(),
+        len: readback.len(),
+        pixel_format: 0,
+        bytes_per_row: 16,
+        data: readback.as_ptr(),
+        data_len: readback.len(),
+    });
+    let encode = |image: &ReimsVgpuSampledImage, capture: bool| {
+        autoreleasepool(|| {
+            let mut output = vec![0u8; 128];
+            let mut batch = RenderBatch::default();
+            let mut color = ColorRt {
+                slot: 0,
+                pixel_format: MTLPixelFormat::RGBA16Float as u32,
+                seed_rgba8: None,
+                out_rgba8: capture.then_some(output.as_mut_slice()),
+                clear_r: 0.0,
+                clear_g: 0.0,
+                clear_b: 0.0,
+                clear_a: 1.0,
+                load_action: REIMS_VGPU_MTL_LOAD_ACTION_CLEAR,
+                blend: None,
+                write_mask: 0xf,
+                target: ColorTarget::Transient,
+            };
+            let status = render_core_mrt(
+                VERTEX,
+                FRAGMENT,
+                4,
+                4,
+                crate::protocol::draw::DrawArgs {
+                    vertex_count: 3,
+                    instance_count: 1,
+                    primitive_type: 3,
+                    first_vertex: 0,
+                    base_instance: 0,
+                },
+                None,
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                std::slice::from_ref(image),
+                &[],
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                std::slice::from_mut(&mut color),
+                None,
+                (ptr::null_mut(), 0),
+                &mut batch,
+                true,
+            );
+            assert!(status.is_ok(), "{status:?}");
+            if capture {
+                assert!(!batch.pending());
+                assert_eq!(batch.submissions, 1);
+                assert!(
+                    batch.published_samples.is_empty(),
+                    "completion releases native read leases"
+                );
+            } else {
+                assert!(
+                    batch.pending(),
+                    "leased snapshots preserve existing batching"
+                );
+                assert_eq!(batch.submissions, 0);
+                assert_eq!(batch.published_samples.len(), 1);
+            }
+            (output, batch)
+        })
+    };
+    assert_eq!(
+        encode(&image, true).0,
+        encode(&packed, true).0,
+        "retained RGBA8 sampling must equal readback followed by packed upload"
+    );
+    let (_, mut pending) = encode(&image, false);
+    drop(image);
+    assert!(
+        resident::take(&key, 7).is_none(),
+        "the batch's lease alone excludes writable reuse"
+    );
+    resident::forget(key.mapping_id);
+    assert!(
+        !weak.load().is_null(),
+        "the batch owns the source after the caller drops it"
+    );
+    autoreleasepool(|| pending.finish((ptr::null_mut(), 0)).unwrap());
+    assert!(
+        weak.load().is_null(),
+        "completed sampling retains no evicted source"
+    );
 }
 
 fn texture_half_bits(texture: &TextureRef) -> Vec<u16> {

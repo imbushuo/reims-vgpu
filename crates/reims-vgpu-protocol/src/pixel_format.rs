@@ -3369,13 +3369,20 @@ impl Rgba8ToRow {
                 }
             }
             Self::Rgba16Float => {
-                let lut = unorm8_to_f16_lut();
-                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(8)) {
-                    let r = u64::from(lut[s[COMPONENT_R] as usize]);
-                    let g = u64::from(lut[s[COMPONENT_G] as usize]);
-                    let b = u64::from(lut[s[COMPONENT_B] as usize]);
-                    let a = u64::from(lut[s[COMPONENT_A] as usize]);
-                    d.copy_from_slice(&(r | (g << 16) | (b << 32) | (a << 48)).to_le_bytes());
+                for (&channel, out) in src.iter().zip(dst.chunks_exact_mut(2)) {
+                    // Nonzero unorm8 values are normal, finite half-floats.
+                    // This exact expansion vectorizes without a per-lane LUT
+                    // gather; zero is the only value needing separate handling.
+                    let bits = if channel == 0 {
+                        0
+                    } else {
+                        let normalized = channel as f32 * (1.0 / UNORM8_MAX as f32);
+                        (((normalized.to_bits() + F32_TO_F16_ROUND_BIT)
+                            >> F16_F32_MANT_SHIFT)
+                            - (((F32_EXP_BIAS - F16_EXP_BIAS) as u32) << F16_EXP_SHIFT))
+                            as u16
+                    };
+                    out.copy_from_slice(&bits.to_le_bytes());
                 }
             }
             Self::Bgr10A2 => {
@@ -3407,6 +3414,32 @@ pub fn convert_rgba8_to_row(format: u16, src_rgba: &[u8], pixels: u32, dst: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rgba16float_rows_match_scalar_conversion_for_every_channel_and_tail() {
+        for pixels in [0, 1, 2, 3, 4, 7, 15, 16, 17, 63, 64, 65] {
+            for base in 0..=255u8 {
+                let src: Vec<_> = (0..pixels * 4)
+                    .map(|i| base.wrapping_add((i * 37) as u8))
+                    .collect();
+                let mut out = vec![0xa5; pixels * 8 + 3];
+                assert!(Rgba8ToRow::Rgba16Float.convert(&src, pixels as u32, &mut out));
+                for (value, bytes) in src.iter().zip(out.chunks_exact(2)) {
+                    assert_eq!(
+                        u16::from_le_bytes([bytes[0], bytes[1]]),
+                        unorm8_to_f16_slow(*value),
+                    );
+                }
+                assert_eq!(&out[pixels * 8..], &[0xa5; 3]);
+            }
+        }
+        let mut short = [0xa5; 7];
+        assert!(!Rgba8ToRow::Rgba16Float.convert(&[0; 4], 1, &mut short));
+        assert_eq!(short, [0xa5; 7]);
+        let mut out = [0xa5; 8];
+        assert!(!Rgba8ToRow::Rgba16Float.convert(&[0; 3], 1, &mut out));
+        assert_eq!(out, [0xa5; 8]);
+    }
 
     /// [`TexelLayout::has_cpu_loader_arm`] answers for the loader it names.
     ///

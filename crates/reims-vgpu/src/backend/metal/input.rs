@@ -1,4 +1,6 @@
-//! Exact-length, copied draw inputs. Only completed allocations enter the
+//! Exact-bound, copied draw inputs. Plain buffer snapshots may retain the
+//! original allocation length and bind offset; no padded shader-visible tail.
+//! Only completed allocations enter the
 //! thread's queue-owned inventory; its contents are never a guest-data cache.
 //! Available storage is bounded by the queue's maximum completed-submission
 //! input count AND bytes. Tiny/empty submissions do not reset those bounds.
@@ -34,6 +36,9 @@ const CLASSES: [Class; 5] = [
     Class::Indirect,
 ];
 
+// Metal Feature Set Tables, Apple2–Apple10: minimum constant-buffer offset.
+const APPLE_CONSTANT_BUFFER_OFFSET_ALIGNMENT: u64 = 4;
+
 macro_rules! counters {
     ($($field:ident),+ $(,)?) => {
         struct Counters { $($field: AtomicU64),+ }
@@ -59,6 +64,8 @@ counters!(
     direct_fill_failures,
     direct_fill_partial_bytes,
     direct_fill_zeroed_bytes,
+    resource_shaped_fills,
+    resource_compact_fills,
     reuses,
     requests,
     miss_absent_length,
@@ -128,6 +135,8 @@ pub(super) fn emit_census() {
     // (possibly evicted), exhausted means its available entries were leased
     // since the last completion, and overlap means all remaining candidates
     // overlap the source. None of these is a claim about historical length churn.
+    // A resource-shaped fill can request two lengths before capture if its
+    // original-size allocation falls back to the compact suffix.
     for class in CLASSES {
         let s = class.counters().snapshot();
         crate::observe::off(format!(
@@ -135,6 +144,7 @@ pub(super) fn emit_census() {
              class={} allocations={} allocated_bytes={} copies={} copied_bytes={} reuses={} \
              direct_fill_requests={} direct_fills={} direct_fill_bytes={} direct_fill_failures={} \
              direct_fill_partial_bytes={} direct_fill_zeroed_bytes={} \
+             resource_shaped_fills={} resource_compact_fills={} \
              requests={} miss_absent_length={} miss_exhausted_length={} miss_source_overlap={} \
              available_discards={} available_discard_bytes={} budget_discards={} budget_discard_bytes={} \
              completed_inputs={} completed_input_bytes={} completed_peak_buffers={} completed_peak_bytes={} \
@@ -152,6 +162,8 @@ pub(super) fn emit_census() {
             s.direct_fill_failures,
             s.direct_fill_partial_bytes,
             s.direct_fill_zeroed_bytes,
+            s.resource_shaped_fills,
+            s.resource_compact_fills,
             s.requests,
             s.miss_absent_length,
             s.miss_exhausted_length,
@@ -294,6 +306,8 @@ pub(super) struct Pool {
     fail_inventory: bool,
     #[cfg(test)]
     poison_fresh: bool,
+    #[cfg(test)]
+    shape_headroom: Option<u64>,
 }
 
 impl Pool {
@@ -316,12 +330,17 @@ impl Pool {
             fail_inventory: false,
             #[cfg(test)]
             poison_fresh: false,
+            #[cfg(test)]
+            shape_headroom: None,
         }))
     }
 
     fn allocate(&mut self, device: &Device, len: usize) -> Option<Buffer> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_allocation) {
+            return None;
+        }
+        if len as u64 > device.max_buffer_length() {
             return None;
         }
         let buffer =
@@ -605,6 +624,7 @@ impl Pool {
         self.fail_allocation = false;
         self.fail_inventory = false;
         self.poison_fresh = false;
+        self.shape_headroom = None;
     }
 
     #[cfg(test)]
@@ -667,11 +687,22 @@ impl Filling {
 pub(crate) struct Filled {
     allocation: Allocation,
     owner: Owner,
+    offset: usize,
+    captured_len: usize,
 }
 
 impl Filled {
+    /// Shader-visible length, never the allocation's uncaptured prefix.
     pub(crate) fn len(&self) -> usize {
-        self.allocation.account.len as usize
+        self.allocation.account.len as usize - self.offset
+    }
+
+    pub(crate) fn binding_offset(&self) -> u64 {
+        self.offset as u64
+    }
+
+    pub(crate) fn captured_len(&self) -> usize {
+        self.captured_len
     }
 }
 
@@ -679,6 +710,8 @@ impl std::fmt::Debug for Filled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Filled")
             .field("len", &self.len())
+            .field("offset", &self.offset)
+            .field("captured_len", &self.captured_len)
             .finish_non_exhaustive()
     }
 }
@@ -696,6 +729,7 @@ fn acquire(
     class: Class,
     allocation_failure: &'static str,
     source: Option<*const u8>,
+    resource_shaped: bool,
 ) -> Result<Acquired, Status> {
     if len == 0 {
         return Err(Status::args("metal_render_input_span_invalid").field("len", len));
@@ -706,6 +740,20 @@ fn acquire(
     let Filling(allocation) = match recycled {
         Some(input) => input,
         None => Filling::allocate(len, class, allocation_failure, || {
+            // Reuse spends no new residency. A cold expanded snapshot must fit
+            // the device's own working-set headroom, not an arbitrary ratio or
+            // a guest-data cache limit. This is placement policy, not permission
+            // to truncate: failure returns to the exact suffix representation.
+            if resource_shaped {
+                let headroom = device
+                    .recommended_max_working_set_size()
+                    .saturating_sub(device.current_allocated_size());
+                #[cfg(test)]
+                let headroom = owner.borrow().shape_headroom.unwrap_or(headroom);
+                if len as u64 > headroom {
+                    return None;
+                }
+            }
             owner.borrow_mut().allocate(device, len)
         })?,
     };
@@ -742,7 +790,7 @@ pub(super) unsafe fn copy(
     if data.is_null() || len == 0 {
         return Err(Status::args("metal_render_input_span_invalid").field("len", len));
     }
-    let acquired = acquire(device, len, class, allocation_failure, Some(data))?;
+    let acquired = acquire(device, len, class, allocation_failure, Some(data), false)?;
     // SAFETY: the source is caller-bounded and the destination is an exclusively
     // filling, exact-length Shared allocation, either fresh or disjoint from
     // the source. No submitted draw can read it while filling.
@@ -755,6 +803,8 @@ pub(super) unsafe fn copy(
     Ok(Filled {
         allocation: acquired.allocation,
         owner: acquired.owner,
+        offset: 0,
+        captured_len: len,
     })
 }
 
@@ -767,6 +817,16 @@ pub(crate) enum FillError<E> {
 struct DirectAttempt {
     class: Class,
     success: bool,
+}
+
+impl DirectAttempt {
+    fn new(class: Class) -> Self {
+        class.counters().direct_fill_requests.fetch_add(1, Relaxed);
+        Self {
+            class,
+            success: false,
+        }
+    }
 }
 
 impl Drop for DirectAttempt {
@@ -799,30 +859,195 @@ pub(crate) fn fill<E>(
     allocation_failure: &'static str,
     callback: impl for<'bytes> FnOnce(&'bytes mut [u8]) -> Result<usize, E>,
 ) -> Result<Filled, FillError<E>> {
-    let c = class.counters();
-    c.direct_fill_requests.fetch_add(1, Relaxed);
-    let mut attempt = DirectAttempt {
-        class,
-        success: false,
-    };
+    let mut attempt = DirectAttempt::new(class);
     if len > isize::MAX as usize {
         return Err(FillError::Backend(
             Status::args("metal_render_input_fill_span_too_large").field("len", len),
         ));
     }
     let acquired =
-        acquire(device, len, class, allocation_failure, None).map_err(FillError::Backend)?;
-    if acquired.fresh {
+        acquire(device, len, class, allocation_failure, None, false).map_err(FillError::Backend)?;
+    let filled = complete_fill(acquired, 0, None, class, callback)?;
+    attempt.success = true;
+    Ok(filled)
+}
+
+/// Snapshot the declared buffer's full logical suffix at its actual bind offset.
+///
+/// `MTLBuffer.length - offset` is exactly the captured byte count on both paths.
+/// Apple GPU families 2+ specify four-byte constant-buffer offset alignment
+/// (Metal Feature Set Tables, Resources); other families and unaligned offsets
+/// retain the existing compact representation. No size rounding is allowed.
+/// Cold original-size allocations are bounded by maxBufferLength and the
+/// device's recommended working-set headroom. A failed expansion retries the
+/// compact suffix before any guest bytes have been read.
+pub(crate) fn fill_resource_suffix<E>(
+    device: &Device,
+    allocation_len: u64,
+    offset: u64,
+    class: Class,
+    allocation_failure: &'static str,
+    callback: impl for<'bytes> FnOnce(&'bytes mut [u8]) -> Result<usize, E>,
+) -> Result<Filled, FillError<E>> {
+    fill_resource_region(
+        device,
+        allocation_len,
+        offset,
+        None,
+        class,
+        allocation_failure,
+        callback,
+    )
+}
+
+/// Preserve the complete native suffix while capturing only a proved prefix.
+/// Every byte outside capture is initialized to zero, including recycled tails.
+pub(crate) fn fill_resource_prefix<E>(
+    device: &Device,
+    allocation_len: u64,
+    offset: u64,
+    read_len: usize,
+    class: Class,
+    allocation_failure: &'static str,
+    callback: impl for<'bytes> FnOnce(&'bytes mut [u8]) -> Result<usize, E>,
+) -> Result<Filled, FillError<E>> {
+    if allocation_len.checked_sub(offset) == Some(read_len as u64) {
+        return fill_resource_suffix(
+            device,
+            allocation_len,
+            offset,
+            class,
+            allocation_failure,
+            callback,
+        );
+    }
+    fill_resource_region(
+        device,
+        allocation_len,
+        offset,
+        Some(read_len),
+        class,
+        allocation_failure,
+        callback,
+    )
+}
+
+fn fill_resource_region<E>(
+    device: &Device,
+    allocation_len: u64,
+    offset: u64,
+    read_len: Option<usize>,
+    class: Class,
+    allocation_failure: &'static str,
+    callback: impl for<'bytes> FnOnce(&'bytes mut [u8]) -> Result<usize, E>,
+) -> Result<Filled, FillError<E>> {
+    if offset == 0 && read_len.is_none() {
+        let len = usize::try_from(allocation_len).map_err(|_| {
+            FillError::Backend(
+                Status::args("metal_render_input_fill_span_too_large").field("len", allocation_len),
+            )
+        })?;
+        let filled = fill(device, len, class, allocation_failure, callback)?;
+        class.counters().resource_shaped_fills.fetch_add(1, Relaxed);
+        return Ok(filled);
+    }
+    let mut attempt = DirectAttempt::new(class);
+    let len = allocation_len
+        .checked_sub(offset)
+        .and_then(|len| usize::try_from(len).ok())
+        .filter(|&len| len > 0 && len <= isize::MAX as usize)
+        .ok_or_else(|| {
+            FillError::Backend(
+                Status::args("metal_render_input_suffix_invalid")
+                    .field("allocation_len", allocation_len)
+                    .field("offset", offset),
+            )
+        })?;
+    let original = usize::try_from(allocation_len)
+        .ok()
+        .filter(|&size| size <= isize::MAX as usize);
+    let shaped = original.filter(|_| {
+        offset != 0
+            && offset.is_multiple_of(APPLE_CONSTANT_BUFFER_OFFSET_ALIGNMENT)
+            && device.supports_family(metal::MTLGPUFamily::Apple2)
+    });
+    let acquired = shaped.and_then(|size| {
+        acquire(device, size, class, allocation_failure, None, offset != 0)
+            .inspect_err(|status| {
+                if let Some(emit) =
+                    crate::observe::Emit::refusal("metal_input_resource_shape", status)
+                {
+                    emit.field("allocation_len", allocation_len)
+                        .field("fallback_len", len)
+                        .fail_once(allocation_len);
+                }
+            })
+            .ok()
+            .map(|acquired| (acquired, offset as usize))
+    });
+    let (acquired, native_offset) = match acquired {
+        Some(acquired) => acquired,
+        None => (
+            acquire(device, len, class, allocation_failure, None, false)
+                .map_err(FillError::Backend)?,
+            0,
+        ),
+    };
+    let filled = complete_fill(acquired, native_offset, read_len, class, callback)?;
+    let c = class.counters();
+    if native_offset as u64 == offset {
+        c.resource_shaped_fills.fetch_add(1, Relaxed);
+    } else {
+        c.resource_compact_fills.fetch_add(1, Relaxed);
+    }
+    attempt.success = true;
+    Ok(filled)
+}
+
+fn complete_fill<E>(
+    acquired: Acquired,
+    offset: usize,
+    read_len: Option<usize>,
+    class: Class,
+    callback: impl for<'bytes> FnOnce(&'bytes mut [u8]) -> Result<usize, E>,
+) -> Result<Filled, FillError<E>> {
+    let c = class.counters();
+    let allocation_len = acquired.allocation.account.len as usize;
+    let available = allocation_len - offset;
+    let len = read_len.unwrap_or(available);
+    if len > available {
+        return Err(FillError::Backend(
+            Status::args("metal_render_input_capture_past_suffix")
+                .field("captured", len)
+                .field("available", available),
+        ));
+    }
+    let zeroed = if acquired.fresh {
+        allocation_len
+    } else {
+        offset
+    };
+    if zeroed != 0 {
         // Native allocation does not promise initialized Rust u8 values.
-        // SAFETY: this exclusively filling allocation owns all len bytes.
+        // Reused prefixes are not captured guest bytes and must not expose the
+        // previous snapshot. The suffix itself is initialized and fully refilled.
+        // SAFETY: this exclusively filling allocation owns all zeroed bytes.
         unsafe {
-            std::ptr::write_bytes(acquired.destination, 0, len);
+            std::ptr::write_bytes(acquired.destination, 0, zeroed);
         }
-        c.direct_fill_zeroed_bytes.fetch_add(len as u64, Relaxed);
+        c.direct_fill_zeroed_bytes.fetch_add(zeroed as u64, Relaxed);
+    }
+    let tail = offset + len;
+    if !acquired.fresh && tail < allocation_len {
+        unsafe {
+            std::ptr::write_bytes(acquired.destination.add(tail), 0, allocation_len - tail);
+        }
+        c.direct_fill_zeroed_bytes
+            .fetch_add((allocation_len - tail) as u64, Relaxed);
     }
     // SAFETY: the full exact-length storage is initialized, exclusively filling,
     // and remains owned through this synchronous, non-escaping callback.
-    let view = unsafe { std::slice::from_raw_parts_mut(acquired.destination, len) };
+    let view = unsafe { std::slice::from_raw_parts_mut(acquired.destination.add(offset), len) };
     let reported = callback(view).map_err(FillError::Callback)?;
     if reported != len {
         if reported < len {
@@ -837,10 +1062,11 @@ pub(crate) fn fill<E>(
     }
     c.direct_fills.fetch_add(1, Relaxed);
     c.direct_fill_bytes.fetch_add(len as u64, Relaxed);
-    attempt.success = true;
     Ok(Filled {
         allocation: acquired.allocation,
         owner: acquired.owner,
+        offset,
+        captured_len: len,
     })
 }
 

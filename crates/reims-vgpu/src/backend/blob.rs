@@ -37,7 +37,7 @@
 
 #![cfg_attr(not(feature = "backend-metal"), allow(dead_code))]
 
-use crate::backend::hash::hash_bytes;
+use std::hash::{DefaultHasher, Hasher};
 use std::sync::Arc;
 
 /// A blob a caller is asking about, borrowed, beside the digest that buckets it.
@@ -54,8 +54,13 @@ pub struct BlobKey<'a> {
 
 impl<'a> BlobKey<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
+        // This process-local bucket key is not a wire or persisted identity.
+        // Hash blocks rather than serially folding every shader byte; the
+        // retained byte comparison below remains the authority on cache hits.
+        let mut hash = DefaultHasher::new();
+        hash.write(bytes);
         Self {
-            hash: hash_bytes(bytes),
+            hash: hash.finish(),
             bytes,
         }
     }

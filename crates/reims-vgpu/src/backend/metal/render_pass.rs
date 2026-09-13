@@ -58,6 +58,7 @@ pub(crate) struct PassLocalColorTarget {
     // is not CPU readiness: every CPU consumer must complete the batch first.
     initialized: bool,
     pub(crate) resident: Option<crate::runtime::draw::metal::ResidentPlan>,
+    pub(crate) store_pages: Option<crate::runtime::draw::StoreTargetPages>,
 }
 
 impl PassLocalColorTarget {
@@ -204,6 +205,7 @@ impl MetalRenderPass {
                     texture,
                     initialized: false,
                     resident: None,
+                    store_pages: None,
                 });
             }
         } else if request.colors.len() != self.targets.len()
@@ -253,6 +255,30 @@ impl MetalRenderPass {
             .iter_mut()
             .find(|target| target.attachment == Attachment::from(color))
             .ok_or("draw_mtl_render_pass_target_missing")
+    }
+
+    fn capture_store_pages<M: HostMemory>(
+        &mut self,
+        state: &DeviceState,
+        host: &M,
+        request: &DrawEncodeRequest,
+    ) {
+        for color in &request.colors {
+            let target = self.target_mut(color).expect("prepared pass attachment");
+            if !target.initialized && color.target_gva != 0 {
+                // Capture before the first draw, not the last draw's Store:
+                // deferred draws can span a guest rewire of this same GVA.
+                target.store_pages = Some(
+                    crate::runtime::draw::StoreTargetPages::capture(
+                        state,
+                        host,
+                        request.task_id,
+                        color.target_gva,
+                        u64::from(color.row_stride) * u64::from(color.height),
+                    ),
+                );
+            }
+        }
     }
 
     pub(crate) fn flush(&self, reason: &'static str) -> Result<(), super::util::Status> {
@@ -310,6 +336,7 @@ impl MetalRenderPass {
         force_full_store: bool,
     ) -> (EncodeStatus, Option<Vec<u8>>) {
         self.with_draw(request, |pass, request| {
+            pass.capture_store_pages(state, host, request);
             let result = crate::runtime::draw::metal::encode_draw_in_pass(
                 state,
                 host,

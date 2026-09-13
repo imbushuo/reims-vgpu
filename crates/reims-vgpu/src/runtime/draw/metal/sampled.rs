@@ -1,4 +1,4 @@
-//! Native packed or whole-surface planar uploads for Metal sampled bindings.
+//! Packed, planar, or leased published-resident Metal sampled bindings.
 
 use super::*;
 use crate::backend::metal::abi::{
@@ -19,6 +19,7 @@ pub(super) enum SampledUpload {
         bytes_per_row: u32,
     },
     Planar(Arc<SampledImage>),
+    Resident(crate::backend::metal::resident::PublishedSample),
 }
 
 impl SampledUpload {
@@ -26,12 +27,17 @@ impl SampledUpload {
         match self {
             Self::Packed { bytes, .. } => bytes.len() as u64,
             Self::Planar(image) => image.layout().planes.iter().map(|plane| plane.size).sum(),
+            Self::Resident(image) => image.byte_len(),
         }
     }
 
     pub fn image(&self, index: u32) -> ReimsVgpuSampledImage {
         let binding = REIMS_VGPU_BINDING_TEXTURE_BASE + index;
         match self {
+            Self::Resident(image) => ReimsVgpuSampledImage::Resident {
+                binding,
+                image: image.clone(),
+            },
             Self::Planar(image) => ReimsVgpuSampledImage::Planar {
                 binding,
                 image: image.clone(),
@@ -70,6 +76,12 @@ pub(super) fn load<M: HostMemory + HostOps>(
                 .fail();
             return None;
         }
+    }
+    // Only a direct, unreinterpreted mapper-ref surface can use this route.
+    // Views (including swizzles/format overrides), planar and native packed
+    // images keep their existing conversion/staging owners.
+    if let Some(image) = load_resident(state, host, task_id, texture_ref) {
+        return Some(SampledUpload::Resident(image));
     }
     let native_packed = objects::lookup_list_entry(state, host, task_id, texture_ref)
         .is_some_and(|entry| match entry.object_type {
@@ -145,6 +157,23 @@ pub(super) fn load<M: HostMemory + HostOps>(
     })
 }
 
+fn load_resident<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+) -> Option<crate::backend::metal::resident::PublishedSample> {
+    let mapping = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)?;
+    let (key, generation) = sampled_surface_frame(state, host, mapping, None)?;
+    if crate::runtime::surface_cache::get_shared(state, mapping, key.width, key.height).is_some() {
+        return None;
+    }
+    let image = crate::backend::metal::resident::sample_published_rgba8(&key, generation)?;
+    crate::runtime::drain::note_store_route("metal_sampled_native_resident");
+    crate::runtime::drain::note_store_route_n("metal_sampled_surface_bytes", image.byte_len());
+    Some(image)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +184,198 @@ mod tests {
     use crate::runtime::host::FakeHost;
     use reims_vgpu_wire::ops::texture::WideTextureDescriptorBody as W;
     use std::mem::offset_of;
+
+    #[test]
+    fn resident_sample_uses_readback_witness_and_preserves_fallbacks_and_lifetime() {
+        use crate::backend::metal::{resident, runtime::system_device};
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use foreign_types::ForeignType;
+        use objc::rc::{autoreleasepool, WeakPtr};
+
+        autoreleasepool(|| {
+            let device = system_device().expect("Metal device");
+            let mut host = FakeHost::new();
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+            assert!(state.set_object_list(1, 0, 32));
+            let mapping = 0xffff_a112;
+            let reference = 7;
+            let key = resident::ResidentColorKey::for_surface(mapping, 4, 4);
+            let mut desc = [0u8; 0x20];
+            st32(&mut desc, mapping);
+            st16(&mut desc[0x16..], pixel_format::MTL_FORMAT_BGRA8_UNORM);
+            st32(&mut desc[0x18..], 4);
+            st32(&mut desc[0x1c..], 4);
+            write_task_gva_arm64e(&mut host, &state.tasks[1], 0x200, &desc);
+            let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+            st32(
+                &mut entry,
+                u32::from(OBJECT_TYPE_MAPPER_REF_TEXTURE) | ((desc.len() as u32) << 8),
+            );
+            st64(&mut entry[4..], 0x200);
+            write_task_gva_arm64e(
+                &mut host,
+                &state.tasks[1],
+                list_object_entry_offset(reference, 32).unwrap(),
+                &entry,
+            );
+            assert!(state.map_surface(mapping));
+            let mapped = state.mappings.get_mut(&mapping).unwrap();
+            mapped.mapped = true;
+            mapped.mapping_internal = 1;
+            mapped.page_entries = vec![(9 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            assert!(state.set_mapping_geom(mapping, 4, 4, pixel_format::MTL_FORMAT_BGRA8_UNORM));
+            let guest_bgra = [3, 17, 91, 255].repeat(16);
+            let guest_rgba = swap_rb_channels(&guest_bgra);
+            let guest_page = 9 << PAGE_SHIFT_ARM64E;
+            host.write_gpa(
+                guest_page,
+                &[3, 17, 91, 255].repeat(state.page_size() as usize / 4),
+            )
+            .unwrap();
+            assert!(crate::runtime::surface_cache::cede_surface_to_resident(
+                &mut state, mapping, 4, 4,
+            ));
+            let generation =
+                crate::runtime::surface_cache::frame_generation(&state, mapping, 4, 4).unwrap();
+            let pixels: Vec<_> = (0..64).map(|i| (i * 3) as u8).collect();
+            let weak = autoreleasepool(|| {
+                let texture =
+                    resident::create(device, &key, ::metal::MTLPixelFormat::RGBA8Unorm, 4).unwrap();
+                texture.replace_region(
+                    ::metal::MTLRegion::new_2d(0, 0, 4, 4),
+                    0,
+                    pixels.as_ptr().cast(),
+                    16,
+                );
+                resident::published(&key, generation);
+                unsafe { WeakPtr::new(texture.as_ptr().cast()) }
+            });
+            let packed_bytes = |upload| match upload {
+                SampledUpload::Packed { bytes, .. } => bytes,
+                _ => panic!("unproven resident must use the existing packed fallback"),
+            };
+            assert_eq!(
+                packed_bytes(load(&mut state, &mut host, 1, reference).unwrap()),
+                guest_rgba
+            );
+            let token =
+                crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mapping)
+                    .unwrap();
+            state
+                .mappings
+                .get_mut(&mapping)
+                .unwrap()
+                .guest_write_gen_at_store = host.guest_write_gen(token).unwrap();
+            let upload = load(&mut state, &mut host, 1, reference).unwrap();
+            assert!(matches!(&upload, SampledUpload::Resident(_)));
+            assert_eq!(upload.byte_len(), 64);
+            assert_eq!(
+                load_sampled_rgba(&mut state, &mut host, 1, reference)
+                    .unwrap()
+                    .2,
+                pixels,
+                "the native sample and the original readback share one witness",
+            );
+            let image = upload.image(3);
+            assert_eq!(image.binding(), REIMS_VGPU_BINDING_TEXTURE_BASE + 3);
+            assert!(
+                !image.needs_completion(),
+                "a read lease preserves existing batching"
+            );
+            drop(upload);
+            assert!(
+                resident::take(&key, generation).is_none(),
+                "binding retains the read lease"
+            );
+
+            // A format/swizzle view must still pass through the original view
+            // interpreter, even though its base has an eligible resident.
+            let view_ref = 8;
+            let mut view = vec![0u8; TEXTURE_VIEW_MIN_SWIZZLE];
+            st32(
+                &mut view[TEXTURE_VIEW_DESC_OPCODE..],
+                TEXTURE_VIEW_OPCODE_SWIZZLE,
+            );
+            let view_len = view.len() as u32;
+            st32(&mut view[TEXTURE_VIEW_DESC_LEN..], view_len);
+            st32(&mut view[TEXTURE_VIEW_DESC_TEXTURE_REF..], view_ref);
+            st32(&mut view[TEXTURE_VIEW_DESC_BASE_REF..], reference);
+            st16(
+                &mut view[TEXTURE_VIEW_DESC_PIXEL_FORMAT..],
+                pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            );
+            st16(
+                &mut view[TEXTURE_VIEW_DESC_TEXTURE_TYPE..],
+                TEXTURE_VIEW_MTL_TYPE_2D,
+            );
+            st64(&mut view[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 1);
+            st64(&mut view[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
+            view[TEXTURE_VIEW_DESC_SWIZZLE..TEXTURE_VIEW_DESC_SWIZZLE + 4]
+                .copy_from_slice(&[4, 3, 2, 5]);
+            write_task_gva_arm64e(&mut host, &state.tasks[1], 0x300, &view);
+            st32(
+                &mut entry,
+                u32::from(OBJECT_TYPE_TEXTURE_VIEW) | (view_len << 8),
+            );
+            st64(&mut entry[4..], 0x300);
+            write_task_gva_arm64e(
+                &mut host,
+                &state.tasks[1],
+                list_object_entry_offset(view_ref, 32).unwrap(),
+                &entry,
+            );
+            assert!(load_resident(&mut state, &host, 1, view_ref).is_none());
+            assert_eq!(
+                packed_bytes(load(&mut state, &mut host, 1, view_ref).unwrap()),
+                load_sampled_rgba(&mut state, &mut host, 1, view_ref)
+                    .unwrap()
+                    .2,
+            );
+
+            // Neither a CPU repaint nor a new publication can serve this old
+            // native allocation as the new frame.
+            host.guest_wrote_page(guest_page);
+            assert_eq!(
+                packed_bytes(load(&mut state, &mut host, 1, reference).unwrap()),
+                guest_rgba
+            );
+            state
+                .mappings
+                .get_mut(&mapping)
+                .unwrap()
+                .guest_write_gen_at_store = host.guest_write_gen(token).unwrap();
+            assert!(crate::runtime::surface_cache::cede_surface_to_resident(
+                &mut state, mapping, 4, 4,
+            ));
+            assert_eq!(
+                packed_bytes(load(&mut state, &mut host, 1, reference).unwrap()),
+                guest_rgba
+            );
+            crate::runtime::surface_cache::store(
+                &mut state,
+                mapping,
+                4,
+                4,
+                [33, 44, 55, 255].repeat(16),
+            );
+            assert_eq!(
+                packed_bytes(load(&mut state, &mut host, 1, reference).unwrap()),
+                [55, 44, 33, 255].repeat(16),
+                "CPU-published bytes retain priority and BGRA-to-RGBA semantics",
+            );
+            resident::forget(mapping);
+            assert!(
+                !weak.load().is_null(),
+                "dropping the source registry cannot drop a binding"
+            );
+            drop(image);
+            assert!(
+                weak.load().is_null(),
+                "no native sample escapes its last owner"
+            );
+        });
+    }
 
     #[test]
     fn planar_sampled_binding_keeps_whole_surface_owned() {

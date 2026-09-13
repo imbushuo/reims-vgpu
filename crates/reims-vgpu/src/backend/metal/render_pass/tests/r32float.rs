@@ -183,15 +183,16 @@ fn memoryless_r32float_native_clear_fetch_and_blend_match_one_encoder() {
                         vert: BlobKey::new(SOURCE.as_bytes()),
                         frag: BlobKey::new(SOURCE.as_bytes()),
                     };
-                    let (pipeline, _, _, _) = get_render_pipeline_state(
-                        device, &vertex, &fragment, None, &lookup, (std::ptr::null_mut(), 0),
+                    let pipeline = get_render_pipeline_state(
+                        device, &lookup, (std::ptr::null_mut(), 0),
+                        || Ok((vertex.clone(), fragment.clone(), None)),
                     ).unwrap();
                     let pass = RenderPassDescriptor::new();
                     output_attachment(pass, &output, index == 0);
                     tile.attach(pass, target.texture());
                     let command = queue.new_command_buffer();
                     let encoder = command.new_render_command_encoder(pass);
-                    draw(encoder, &pipeline, index);
+                    draw(encoder, &pipeline.pso, index);
                     encoder.end_encoding();
                     command.commit();
                     command.wait_until_completed();

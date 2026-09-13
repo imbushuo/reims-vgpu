@@ -1246,7 +1246,7 @@ struct BufferReadWindow<'a, M: HostMemory> {
     state: &'a DeviceState,
     host: &'a M,
     task: u32,
-    base_gva: u64,
+    backing: BufferBacking,
     offset: u64,
     gva: u64,
     len: usize,
@@ -1268,7 +1268,7 @@ impl<M: HostMemory> BufferReadWindow<'_, M> {
         .inspect_err(|_| {
             crate::observe::fail(format!(
                 "load_buffer gva read fail task={} gva={:#x}+{} want={} shift={}",
-                self.task, self.base_gva, self.offset, self.len, self.state.page_shift,
+                self.task, self.backing.gva, self.offset, self.len, self.state.page_shift,
             ));
         })
     }
@@ -1339,7 +1339,7 @@ fn prepare_buffer_read<'a, M: HostMemory + HostOps>(
         state,
         host,
         task: task_id,
-        base_gva: gva,
+        backing: BufferBacking { gva, size },
         offset,
         gva: read_gva,
         len: want,
@@ -1352,6 +1352,17 @@ fn prepare_bound_buffer_read<'a, M: HostMemory + HostOps>(
     host: &'a mut M,
     task_id: u32,
     bind: &BufferBind,
+) -> Option<BufferReadWindow<'a, M>> {
+    prepare_bound_buffer_read_with_extent(state, host, task_id, bind, None)
+}
+
+#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+fn prepare_bound_buffer_read_with_extent<'a, M: HostMemory + HostOps>(
+    state: &'a mut DeviceState,
+    host: &'a mut M,
+    task_id: u32,
+    bind: &BufferBind,
+    extent_cap: Option<u64>,
 ) -> Option<BufferReadWindow<'a, M>> {
     let backing = resolve_buffer_backing(
         state,
@@ -1367,7 +1378,7 @@ fn prepare_bound_buffer_read<'a, M: HostMemory + HostOps>(
         bind.buffer_ref,
         &backing,
         bind.offset,
-        None,
+        extent_cap,
     )
 }
 
@@ -2963,6 +2974,7 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
 /// closed on its own terms, and refusing on an empty capture would drop live
 /// Stores whenever the capture failed for an unrelated reason. If that counter
 /// stays at zero it can be tightened with evidence.
+#[cfg(any(test, feature = "backend-vulkan"))]
 pub(crate) fn sync_store_target_pages<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -2977,24 +2989,13 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
         return None;
     }
     let span = (c.row_stride as u64).checked_mul(c.height as u64)?;
-    let ordered = crate::runtime::gva_mem::task_gva_page_gpas(
-        host,
-        &state.tasks,
-        task_id,
-        c.target_gva,
-        span,
-        state.page_shift,
-    );
-    if ordered.is_empty() {
+    let pages = StoreTargetPages::capture(state, host, task_id, c.target_gva, span);
+    if pages.ordered.is_empty() {
         crate::runtime::drain::note_store_route("sync_store_unbounded");
         return None;
     }
     crate::runtime::drain::note_store_route("sync_store_bound");
-    Some(StoreTargetPages {
-        set: ordered.iter().copied().collect(),
-        ordered,
-        span,
-    })
+    Some(pages)
 }
 
 /// The guest pages a synchronous GVA render Store may write, from one walk
@@ -3019,6 +3020,23 @@ pub(crate) struct StoreTargetPages {
 }
 
 impl StoreTargetPages {
+    pub(crate) fn capture<M: HostMemory>(
+        state: &DeviceState,
+        host: &M,
+        task: u32,
+        gva: u64,
+        span: u64,
+    ) -> Self {
+        let ordered = crate::runtime::gva_mem::task_gva_page_gpas(
+            host, &state.tasks, task, gva, span, state.page_shift,
+        );
+        Self {
+            set: ordered.iter().copied().collect(),
+            ordered,
+            span,
+        }
+    }
+
     /// Reconstitute a transfer destination from a live resource's retained
     /// backing. The entries are physical page identities; bounded guest slices
     /// are created only when the backend submits the transfer.

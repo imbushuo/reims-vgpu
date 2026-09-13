@@ -5728,6 +5728,7 @@ impl DeviceState {
 
     /// The same, for a writer that walked the guest page tables and so knows
     /// exactly which pages it landed in even though it names no mapping.
+    #[track_caller]
     pub fn note_host_wrote_pages(&mut self, pages: Vec<u64>) {
         self.host_writes.note_pages(pages);
     }
@@ -5771,6 +5772,7 @@ impl DeviceState {
     }
 
     /// The same, for a writer that knows which mapping's pages it is landing in.
+    #[track_caller]
     pub fn note_host_wrote_mapping(&mut self, mapping_id: u32) {
         let Some(entries) = self
             .mappings

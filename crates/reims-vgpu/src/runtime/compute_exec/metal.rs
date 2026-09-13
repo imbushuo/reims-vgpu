@@ -13,6 +13,8 @@
 
 use super::*;
 
+mod planar;
+
 /// This rail's half of a staged compute texture. See [`RailStage`].
 ///
 /// [`RailStage`]: crate::runtime::compute_exec::RailStage
@@ -28,6 +30,17 @@ pub(crate) struct MetalStage {
 
 impl RailStage for MetalStage {
     fn supports_planar_samples() -> bool { true }
+
+    fn stage_planar_source<M: HostMemory + HostOps>(
+        state: &mut DeviceState,
+        host: &mut M,
+        source: &PlanarSource,
+    ) -> Result<Self, ComputeStatus> {
+        Ok(Self {
+            texture_ref: source.texture_ref,
+            planar: Some(planar::stage(state, host, source)?),
+        })
+    }
 
     fn stage_planar(
         texture_ref: u32,
@@ -178,16 +191,13 @@ pub(crate) fn try_stage_planar_sampled<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
 ) -> Result<Option<std::sync::Arc<crate::backend::metal::planar::SampledImage>>, ComputeStatus> {
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
+    let Ok(resource) = objects::resolve_resource(state, host, task_id, texture_ref) else {
         return Ok(None);
     };
-    if entry.object_type != crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE {
+    if resource.entry.object_type != crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE {
         return Ok(None);
     }
-    let Some(descriptor) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return Ok(None);
-    };
-    if crate::protocol::planar::type11_sample_format(&descriptor).is_none() {
+    if crate::protocol::planar::type11_sample_format(&resource.descriptor).is_none() {
         return Ok(None);
     }
     let staged = stage_texture_raw::<MetalStage, _>(state, host, task_id, texture_ref, 0, false)?;

@@ -5,11 +5,11 @@ use crate::backend::hash::hash_bytes;
 use crate::backend::metal::abi::*;
 use crate::backend::metal::cache::{
     depth_stencil_insert, depth_stencil_lookup, render_pso_insert, render_pso_lookup,
-    DepthStencilKey,
+    DepthStencilKey, RenderPsoEntry,
 };
 use crate::backend::metal::constants::*;
 use crate::backend::metal::format::mtl_pixel_format_bpp;
-use crate::backend::metal::function::load_only_function;
+use crate::backend::metal::function::load_only_function_key;
 use crate::backend::metal::input::{self, Class as InputClass};
 use crate::backend::metal::mtl_enum;
 use crate::backend::metal::raw_metal::{
@@ -28,6 +28,7 @@ use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::*;
 use reims_vgpu_protocol::extent::tight_image_bytes;
 use std::ptr;
+use std::sync::Arc;
 
 #[derive(Default)]
 pub(crate) struct RenderBatch {
@@ -35,6 +36,7 @@ pub(crate) struct RenderBatch {
     encoder: Option<RenderCommandEncoder>,
     inputs: input::Submission,
     textures: Vec<Texture>,
+    published_samples: Vec<super::resident::PublishedSample>,
     vertex_buffer_slots: Vec<u64>,
     fragment_buffer_slots: Vec<u64>,
     vertex_texture_slots: Vec<u64>,
@@ -126,6 +128,7 @@ impl RenderBatch {
         command.commit();
         command.wait_until_completed();
         self.textures.clear();
+        self.published_samples.clear();
         if command.status() != MTLCommandBufferStatus::Completed {
             self.inputs.discard();
             let status = Status::execute("metal_render_command_buffer_failed");
@@ -729,20 +732,59 @@ pub(crate) struct RenderPipelineLayout<'a> {
     pub stencil_format: u32,
 }
 
-/// Reflect before staging resources, using the same functions, vertex layout,
-/// attachment formats and PSO cache as the draw. This renderer is single-sample.
-pub(crate) fn reflect_render_textures_mtlb(
-    vertex_mtlb: &[u8],
-    fragment_mtlb: &[u8],
-    layout: RenderPipelineLayout<'_>,
-) -> Result<std::sync::Arc<RenderTextureUsages>, Status> {
+/// One resolution owns both staging's reflection and encoding's pipeline.
+///
+/// The cache retains exact shader bytes and every specialization field. Draw
+/// inputs remain borrowed until encode; neither shader addresses nor guest
+/// object references establish identity. This renderer is single-sample.
+///
+/// Buffer capture reach comes from the separate AIR metadata cache using the
+/// same shader keys, before these data-bearing attributes exist. Native
+/// argument/pointee sizes are not evidence of bounded buffer reach.
+pub(crate) struct PreparedRenderPipeline<'a> {
+    entry: Arc<RenderPsoEntry>,
+    attrs: &'a [ReimsVgpuVertexAttr],
+    blend: Option<&'a ReimsVgpuBlendState>,
+}
+
+impl PreparedRenderPipeline<'_> {
+    pub(crate) fn texture_usages(&self) -> &RenderTextureUsages {
+        &self.entry.textures
+    }
+
+    fn validate_attachments(
+        &self,
+        colors: &[ColorRt<'_>],
+        depth_format: u32,
+        stencil_format: u32,
+    ) -> Result<(), Status> {
+        let key = &self.entry.id.key;
+        if colors.len() != key.color_count as usize
+            || depth_format != key.depth_pixel_format
+            || stencil_format != key.stencil_pixel_format
+            || colors.iter().enumerate().any(|(i, color)| {
+                color.slot != u32::from(key.color_slot[i])
+                    || color.native_pixel_format() != key.color_formats[i]
+            })
+        {
+            return Err(Status::args("metal_render_prepared_attachment_mismatch"));
+        }
+        Ok(())
+    }
+}
+
+/// Prepare before texture staging, then carry this exact pipeline through encoding.
+/// On a PSO hit no functions or Metal vertex descriptors need preparation.
+/// The caller's prehashed shader keys also serve early AIR buffer reflection.
+pub(crate) fn prepare_render_pipeline<'a>(
+    vertex_mtlb: BlobKey<'_>,
+    fragment_mtlb: BlobKey<'_>,
+    layout: RenderPipelineLayout<'a>,
+) -> Result<PreparedRenderPipeline<'a>, Status> {
     objc::rc::autoreleasepool(|| {
         let device =
             system_device().ok_or_else(|| Status::execute("metal_render_device_unavailable"))?;
         let err = (std::ptr::null_mut(), 0);
-        let vertex = load_only_function(device, vertex_mtlb, "vertex", err)?;
-        let fragment = load_only_function(device, fragment_mtlb, "fragment", err)?;
-        let descriptor = make_vertex_descriptor(layout.attrs, err)?;
         let key = fill_render_pso_key(
             layout.attrs,
             layout.blend,
@@ -752,18 +794,21 @@ pub(crate) fn reflect_render_textures_mtlb(
         );
         let lookup = RenderPsoLookup {
             desc: &key,
-            vert: BlobKey::new(vertex_mtlb),
-            frag: BlobKey::new(fragment_mtlb),
+            vert: vertex_mtlb,
+            frag: fragment_mtlb,
         };
-        let (_, _, _, textures) = get_render_pipeline_state(
-            device,
-            &vertex,
-            &fragment,
-            descriptor.as_ref(),
-            &lookup,
-            err,
-        )?;
-        Ok(textures)
+        let entry = get_render_pipeline_state(device, &lookup, err, || {
+            Ok((
+                load_only_function_key(device, lookup.vert, "vertex", err)?,
+                load_only_function_key(device, lookup.frag, "fragment", err)?,
+                make_vertex_descriptor(layout.attrs, err)?,
+            ))
+        })?;
+        Ok(PreparedRenderPipeline {
+            entry,
+            attrs: layout.attrs,
+            blend: layout.blend,
+        })
     })
 }
 
@@ -888,29 +933,20 @@ pub(super) fn fill_render_pso_key(
 
 pub(super) fn get_render_pipeline_state(
     device: &Device,
-    vertex: &Function,
-    fragment: &Function,
-    vertex_descriptor: Option<&VertexDescriptor>,
     lookup: &RenderPsoLookup<'_>,
     err: ErrOut<'_>,
-) -> Result<
-    (
-        RenderPipelineState,
-        u32,
-        u32,
-        std::sync::Arc<RenderTextureUsages>,
-    ),
-    Status,
-> {
+    functions: impl FnOnce() -> Result<(Function, Function, Option<VertexDescriptor>), Status>,
+) -> Result<Arc<RenderPsoEntry>, Status> {
     if let Some(hit) = render_pso_lookup(lookup) {
         return Ok(hit);
     }
+    let (vertex, fragment, vertex_descriptor) = functions()?;
     let key = lookup.desc;
 
     let pipeline_descriptor = RenderPipelineDescriptor::new();
-    pipeline_descriptor.set_vertex_function(Some(vertex));
-    pipeline_descriptor.set_fragment_function(Some(fragment));
-    if let Some(vd) = vertex_descriptor {
+    pipeline_descriptor.set_vertex_function(Some(&vertex));
+    pipeline_descriptor.set_fragment_function(Some(&fragment));
+    if let Some(vd) = vertex_descriptor.as_ref() {
         pipeline_descriptor.set_vertex_descriptor(Some(vd));
     }
     for i in 0..key.color_count as usize {
@@ -1115,7 +1151,8 @@ fn validate_render_texture_bindings(
 }
 
 /// An immutable native snapshot with no escaping CPU view. Sealing moves its
-/// unique lease into the command buffer's completion owner.
+/// unique lease into the command buffer's completion owner. Its bind offset
+/// comes from the filled suffix owner, not a separately supplied length/offset.
 pub(crate) struct NativeBuffer {
     pub binding: u32,
     pub attribute_stride: Option<u64>,
@@ -1158,6 +1195,7 @@ fn bind_storage_buffers(
                         .field("binding", buffer.binding)
                         .field("limit", REIMS_VGPU_METAL_MAX_BUFFERS);
                 }
+                let offset = buffer.bytes.binding_offset();
                 let native = match retained.seal(buffer.bytes) {
                     Ok(buffer) => buffer,
                     Err(status) => return status,
@@ -1167,6 +1205,7 @@ fn bind_storage_buffers(
                     buffer.binding,
                     buffer.attribute_stride,
                     &native,
+                    offset,
                     fragment_stage,
                     err,
                 );
@@ -1254,6 +1293,7 @@ fn bind_storage_buffers(
             buffer.binding,
             (buffer.has_attribute_stride != 0).then_some(buffer.attribute_stride),
             &mtl_buffer,
+            0,
             fragment_stage,
             err,
         );
@@ -1269,11 +1309,12 @@ fn bind_native_storage_buffer(
     binding: u32,
     attribute_stride: Option<u64>,
     buffer: &metal::Buffer,
+    offset: u64,
     fragment_stage: bool,
     err: ErrOut<'_>,
 ) -> Status {
     if fragment_stage {
-        encoder.set_fragment_buffer(binding as u64, Some(buffer), 0);
+        encoder.set_fragment_buffer(binding as u64, Some(buffer), offset);
     } else if let Some(stride) = attribute_stride {
         // `setVertexBuffer:offset:attributeStride:atIndex:` is only legal
         // where the pipeline's `MTLVertexBufferLayoutDescriptor.stride` for
@@ -1303,7 +1344,7 @@ fn bind_native_storage_buffer(
             .field("binding", binding)
             .field("stride", stride);
     } else {
-        encoder.set_vertex_buffer(binding as u64, Some(buffer), 0);
+        encoder.set_vertex_buffer(binding as u64, Some(buffer), offset);
     }
     Status::OK
 }
@@ -1322,6 +1363,19 @@ fn bind_sampled_images(
     for source in images {
         let image = match source {
             ReimsVgpuSampledImage::Packed(image) => image,
+            ReimsVgpuSampledImage::Resident { binding, image } => {
+                let Some(index) = texture_index(*binding) else {
+                    return Status::args("metal_render_sampled_binding_invalid")
+                        .field("binding", *binding);
+                };
+                if fragment_stage {
+                    encoder.set_fragment_texture(index as u64, Some(image.texture()));
+                } else {
+                    encoder.set_vertex_texture(index as u64, Some(image.texture()));
+                }
+                retained.push(image.texture().to_owned());
+                continue;
+            }
             ReimsVgpuSampledImage::Native { binding, texture } => {
                 let Some(index) = texture_index(*binding) else {
                     return Status::args("metal_render_sampled_binding_invalid")
@@ -2350,15 +2404,31 @@ pub(crate) fn render_core_mrt(
     batch: &mut RenderBatch,
     defer: bool,
 ) -> Status {
+    let color_keys: Vec<_> = colors
+        .iter()
+        .map(|color| color.pipeline_key(color.native_pixel_format()))
+        .collect();
+    let pipeline = match prepare_render_pipeline(
+        BlobKey::new(vert_mtlb),
+        BlobKey::new(frag_mtlb),
+        RenderPipelineLayout {
+            attrs,
+            blend,
+            colors: &color_keys,
+            depth_format: depth_attachment.as_ref().map_or(0, |a| a.pixel_format),
+            stencil_format: stencil_attachment.as_ref().map_or(0, |a| a.pixel_format),
+        },
+    ) {
+        Ok(pipeline) => pipeline,
+        Err(status) => return status,
+    };
     render_core_mrt_inputs(
-        vert_mtlb,
-        frag_mtlb,
+        &pipeline,
         width,
         height,
         draw,
         primitive_indirect,
         indexed,
-        attrs,
         RenderBuffers::Host(buffers),
         RenderBuffers::Host(frag_buffers),
         vertex_images,
@@ -2373,7 +2443,6 @@ pub(crate) fn render_core_mrt(
         stencil_reference,
         depth_attachment,
         stencil_attachment,
-        blend,
         colors,
         visibility,
         err,
@@ -2393,16 +2462,16 @@ pub(crate) fn render_core_mrt(
 ///
 /// The public pointer-bearing records remain host sources; native snapshots
 /// are moved through this Rust-only route, never disguised as those pointers.
+/// Shader, vertex-layout and blend/write-mask specialization come from the
+/// prepared pipeline; actual attachments must match its slots and formats.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_core_mrt_inputs(
-    vert_mtlb: &[u8],
-    frag_mtlb: &[u8],
+    pipeline: &PreparedRenderPipeline<'_>,
     width: u32,
     height: u32,
     draw: crate::protocol::draw::DrawArgs,
     primitive_indirect: Option<&ReimsVgpuPrimitiveIndirectDraw>,
     indexed: Option<&ReimsVgpuIndexedDraw>,
-    attrs: &[ReimsVgpuVertexAttr],
     buffers: RenderBuffers<'_>,
     frag_buffers: RenderBuffers<'_>,
     vertex_images: &[ReimsVgpuSampledImage],
@@ -2417,7 +2486,6 @@ pub(crate) fn render_core_mrt_inputs(
     stencil_reference: Option<&ReimsVgpuStencilReferenceState>,
     depth_attachment: Option<&mut ReimsVgpuDepthAttachment>,
     stencil_attachment: Option<&mut ReimsVgpuStencilAttachment>,
-    blend: Option<&ReimsVgpuBlendState>,
     colors: &mut [ColorRt<'_>],
     visibility: Option<&mut VisibilityQuery>,
     err: ErrOut<'_>,
@@ -2425,6 +2493,8 @@ pub(crate) fn render_core_mrt_inputs(
     defer: bool,
 ) -> Status {
     use crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_COLOR_RTS;
+    let attrs = pipeline.attrs;
+    let blend = pipeline.blend;
     // Widened here rather than at the call, so the `as usize` on each of these
     // happens once and the caller passes the decoded draw whole. These were five
     // positional parameters, four of them `usize`; the sole caller reached them
@@ -2445,6 +2515,14 @@ pub(crate) fn render_core_mrt_inputs(
         return Status::args("metal_render_color_target_count_exceeded")
             .field("count", colors.len())
             .field("limit", REIMS_VGPU_METAL_MAX_COLOR_RTS);
+    }
+    if let Err(status) = pipeline.validate_attachments(
+        colors,
+        depth_attachment.as_ref().map_or(0, |a| a.pixel_format),
+        stencil_attachment.as_ref().map_or(0, |a| a.pixel_format),
+    ) {
+        set_err(err, "render attachments differ from the prepared pipeline");
+        return status;
     }
     // Resolve per-RT format + bpp; require uniform dimensions (Metal pass rule).
     let mut color_meta: Vec<(u32, u32, usize, MTLPixelFormat)> = Vec::with_capacity(colors.len());
@@ -2567,20 +2645,9 @@ pub(crate) fn render_core_mrt_inputs(
     // They are contiguous and non-overlapping, so their sum is `engine_us` less
     // the argument validation above and the depth/stencil readback below.
     // Checking that sum is the first thing to do with a reading.
+    // Pipeline/reflection preparation already ran before resource staging.
+    // Keep this census for the remaining per-draw input/binding validation.
     let span_pso = crate::runtime::chain_phase::CostSpan::new("metal_pso_us");
-    let vertex = match load_only_function(device, vert_mtlb, "vertex", err) {
-        Ok(f) => f,
-        Err(st) => return st,
-    };
-    let fragment = match load_only_function(device, frag_mtlb, "fragment", err) {
-        Ok(f) => f,
-        Err(st) => return st,
-    };
-
-    let vertex_descriptor = match make_vertex_descriptor(attrs, err) {
-        Ok(v) => v,
-        Err(st) => return st,
-    };
     let mut attr_slots = Vec::new();
     for attr in attrs
         .iter()
@@ -2602,43 +2669,10 @@ pub(crate) fn render_core_mrt_inputs(
             Err(st) => return st,
         };
 
-    let color_rt_keys: Vec<ColorRtKey> = colors
-        .iter()
-        .zip(color_meta.iter())
-        .map(|(c, &(_, fmt, _, _))| c.pipeline_key(fmt))
-        .collect();
-    let pso_key = fill_render_pso_key(
-        attrs,
-        blend,
-        &color_rt_keys,
-        depth_attachment
-            .as_ref()
-            .map(|d| d.pixel_format)
-            .unwrap_or(0),
-        stencil_attachment
-            .as_ref()
-            .map(|s| s.pixel_format)
-            .unwrap_or(0),
-    );
-    // The shaders join the descriptor here rather than inside it: the cache
-    // retains their bytes and compares them, so they must reach it as bytes.
-    let pso_lookup = RenderPsoLookup {
-        desc: &pso_key,
-        vert: BlobKey::new(vert_mtlb),
-        frag: BlobKey::new(frag_mtlb),
-    };
-    let (pso, vert_sampler_mask, frag_sampler_mask, texture_usages) =
-        match get_render_pipeline_state(
-            device,
-            &vertex,
-            &fragment,
-            vertex_descriptor.as_ref(),
-            &pso_lookup,
-            err,
-        ) {
-            Ok(v) => v,
-            Err(st) => return st,
-        };
+    let pso = &pipeline.entry.pso;
+    let vert_sampler_mask = pipeline.entry.vert_sampler_mask;
+    let frag_sampler_mask = pipeline.entry.frag_sampler_mask;
+    let texture_usages = pipeline.texture_usages();
     for (images, usages, vertex) in [
         (vertex_images, texture_usages.vertex.as_slice(), true),
         (images, texture_usages.fragment.as_slice(), false),
@@ -2654,7 +2688,7 @@ pub(crate) fn render_core_mrt_inputs(
         || vertex_images
             .iter()
             .chain(images)
-            .any(|image| matches!(image, ReimsVgpuSampledImage::Native { .. }))
+            .any(ReimsVgpuSampledImage::needs_completion)
         || texture_usages
             .vertex
             .iter()
@@ -2832,6 +2866,14 @@ pub(crate) fn render_core_mrt_inputs(
         Ok(encoder) => encoder,
         Err(status) => return status,
     };
+    // Hold the read lease, not just the Metal handle, until real completion.
+    // A later registry writer must not reuse pixels this command still samples.
+    batch.published_samples.extend(
+        vertex_images.iter().chain(images).filter_map(|image| match image {
+            ReimsVgpuSampledImage::Resident { image, .. } => Some(image.clone()),
+            _ => None,
+        }),
+    );
     // Error arms below end this draw's encoder. Only successful deferred draws
     // return an open encoder to the batch; refusal then submits the closed one.
     batch.encoder.take();
@@ -2854,7 +2896,7 @@ pub(crate) fn render_core_mrt_inputs(
             .iter()
             .filter_map(|image| texture_index(image.binding()).map(|index| index as u64)),
     );
-    encoder.set_render_pipeline_state(&pso);
+    encoder.set_render_pipeline_state(pso);
     if let Some(mode) = visibility_mode {
         encoder.set_visibility_result_mode(mode, 0);
     }

@@ -203,6 +203,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     force_full_store: bool,
     pass: &mut crate::backend::metal::render_pass::MetalRenderPass,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
+    use crate::backend::blob::BlobKey;
     use crate::backend::metal::abi::{
         ReimsVgpuBlendState, ReimsVgpuBuffer, ReimsVgpuDepthAttachment, ReimsVgpuDepthBiasState,
         ReimsVgpuIndexedDraw, ReimsVgpuRasterState, ReimsVgpuSampledImage, ReimsVgpuSampler,
@@ -210,12 +211,13 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         ReimsVgpuViewport, REIMS_VGPU_BINDING_SAMPLER_BASE,
         REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT, REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8,
     };
+    use crate::backend::metal::buffer_extent::{self, Stage};
     use crate::backend::metal::input::Class as InputClass;
     use crate::backend::metal::render::{
         render_core_mrt_inputs, ColorRt, ColorTarget, RenderBuffers, VisibilityQuery,
     };
     use crate::backend::metal::util::ErrOut;
-    use inputs::PreparedInput;
+    use inputs::{Capture, PreparedInput};
 
     // Opened before the first refusal check, so a chain that declines is charged
     // to whichever phase was open rather than vanishing from the division. See
@@ -295,19 +297,6 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     }) {
         return (EncodeStatus::BadArgs("draw_mtl_mrt_geom_mismatch"), None);
     }
-    // Pages each attachment's GVA Store may reach, resolved here rather than at
-    // writeback: `render_core_mrt` below submits and waits, and the guest keeps
-    // running on its own vCPUs across that. Indexed by attachment because MRT
-    // stores every color target, not just slot 0.
-    chain_phase::enter(chain_phase::Phase::PrepPages);
-    let sync_store_pages: Vec<Option<StoreTargetPages>> = if writeback_guest {
-        color_list
-            .iter()
-            .map(|c| sync_store_target_pages(state, host, req.task_id, c))
-            .collect()
-    } else {
-        Vec::new()
-    };
     let is_indexed = req
         .indexed
         .as_ref()
@@ -394,6 +383,9 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             None,
         );
     };
+    // Reuse these same immutable-byte keys for early AIR metadata and the PSO.
+    let vertex_key = BlobKey::new(&vert);
+    let fragment_key = BlobKey::new(&frag);
     // Both stages loaded. On this rail there is no further step that is about
     // the *pipeline* rather than about one draw's resources — the MTLBs go to
     // the shim, which builds the pipeline state as part of encoding — so the
@@ -413,6 +405,14 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     chain_phase::enter(chain_phase::Phase::Binds);
     let input_plan = inputs::InputPlan::new(req, &pipeline);
     let direct_inputs = input_plan.native_plain;
+    let vertex_extents = req
+        .vertex_buffers
+        .iter()
+        .any(|bind| bind.buffer_ref != 0 && input_plan.native_vertex(bind.index))
+        .then(|| buffer_extent::cached(vertex_key, Stage::Vertex));
+    let fragment_extents = (direct_inputs
+        && req.fragment_buffers.iter().any(|bind| bind.buffer_ref != 0))
+    .then(|| buffer_extent::cached(fragment_key, Stage::Fragment));
     let mut vtx_storage: Vec<Vec<u8>> = Vec::new();
     let mut frag_storage: Vec<Vec<u8>> = Vec::new();
     let mut native_vtx = Vec::new();
@@ -429,7 +429,15 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             req.task_id,
             b,
             InputClass::Vertex,
-            input_plan.native_vertex(b.index),
+            if input_plan.native_vertex(b.index) {
+                Capture::Native(
+                    vertex_extents
+                        .as_ref()
+                        .and_then(|extents| extents.bound(b.index)),
+                )
+            } else {
+                Capture::Cpu
+            },
             "draw_mtl_vertex_buffer_miss",
         ) {
             Ok(PreparedInput::Native(buffer)) => native_vtx.push(buffer),
@@ -456,7 +464,15 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             req.task_id,
             b,
             InputClass::Fragment,
-            direct_inputs,
+            if direct_inputs {
+                Capture::Native(
+                    fragment_extents
+                        .as_ref()
+                        .and_then(|extents| extents.bound(b.index)),
+                )
+            } else {
+                Capture::Cpu
+            },
             "draw_mtl_fragment_buffer_miss",
         ) {
             Ok(PreparedInput::Native(buffer)) => native_frag.push(buffer),
@@ -1100,14 +1116,14 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         });
     }
 
-    use crate::backend::metal::render::{reflect_render_textures_mtlb, RenderPipelineLayout};
+    use crate::backend::metal::render::{prepare_render_pipeline, RenderPipelineLayout};
     let color_keys: Vec<_> = color_rts
         .iter()
         .map(|color| color.pipeline_key(color.native_pixel_format()))
         .collect();
-    let texture_usages = match reflect_render_textures_mtlb(
-        &vert,
-        &frag,
+    let prepared_pipeline = match prepare_render_pipeline(
+        vertex_key,
+        fragment_key,
         RenderPipelineLayout {
             attrs: &attrs,
             blend: blend_opt,
@@ -1116,9 +1132,10 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             stencil_format: stencil_attach_api.as_ref().map_or(0, |a| a.pixel_format),
         },
     ) {
-        Ok(usages) => usages,
+        Ok(pipeline) => pipeline,
         Err(reason) => return (EncodeStatus::RailRefused(reason), None),
     };
+    let texture_usages = prepared_pipeline.texture_usages();
     let mut writable = storage::StorageTextures::default();
     if texture_usages
         .vertex
@@ -1228,8 +1245,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             .chain(&texture_usages.fragment)
             .any(|usage| usage.access.writes());
     let st = render_core_mrt_inputs(
-        &vert,
-        &frag,
+        &prepared_pipeline,
         width,
         height,
         crate::protocol::draw::DrawArgs {
@@ -1241,7 +1257,6 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         },
         None,
         indexed_draw.as_ref(),
-        &attrs,
         if direct_inputs {
             RenderBuffers::Native(native_vtx)
         } else {
@@ -1264,7 +1279,6 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         stencil_ref_opt,
         depth_attach_api.as_mut(),
         stencil_attach_api.as_mut(),
-        blend_opt,
         &mut color_rts,
         visibility.as_mut(),
         err,
@@ -1388,10 +1402,13 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
                 )
             }
         } else if c.target_gva != 0 {
-            let allowed = sync_store_pages
-                .get(i)
-                .and_then(|p| p.as_ref())
-                .map(StoreTargetPages::membership);
+            let Ok(target) = pass.target(c) else {
+                return (EncodeStatus::BadArgs("draw_mtl_render_pass_target_missing"), None);
+            };
+            let Some(pages) = target.store_pages.as_ref() else {
+                return (EncodeStatus::BadArgs("draw_mtl_store_pages_missing"), None);
+            };
+            let allowed = Some(pages.membership());
             if gva_partial {
                 let r = store_rect.expect("gva_partial implies exactly one narrowing rect");
                 write_gva_rgba8_rect(
@@ -2114,6 +2131,28 @@ fn sampled_from_published_surface<M: HostMemory + HostOps>(
     mapping_id: u32,
     format_override: Option<u16>,
 ) -> Option<(u32, u32, Vec<u8>)> {
+    let (key, generation) = sampled_surface_frame(state, host, mapping_id, format_override)?;
+    let (w, h) = (key.width, key.height);
+    // Preserve the source order: CPU-published bytes take priority over a
+    // resident allocation, even when one is still retained for this mapping.
+    if let Some(bgra) = crate::runtime::surface_cache::get_shared(state, mapping_id, w, h) {
+        crate::runtime::drain::note_store_route("metal_sampled_from_surface");
+        crate::runtime::drain::note_store_route_n("metal_sampled_surface_bytes", bgra.len() as u64);
+        return Some((w, h, swap_rb_channels(&bgra)));
+    }
+    let rgba = crate::backend::metal::resident::read_published_rgba8(&key, generation)?;
+    crate::runtime::drain::note_store_route("metal_sampled_from_resident");
+    crate::runtime::drain::note_store_route_n("metal_sampled_surface_bytes", rgba.len() as u64);
+    Some((w, h, rgba))
+}
+
+/// One currency/geometry witness for both CPU readback and retained sampling.
+fn sampled_surface_frame<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    format_override: Option<u16>,
+) -> Option<(crate::backend::metal::resident::ResidentColorKey, u64)> {
     use crate::runtime::draw::NoPublishedFrame;
     use crate::runtime::surface_currency::SurfaceCurrency;
 
@@ -2156,24 +2195,10 @@ fn sampled_from_published_surface<M: HostMemory + HostOps>(
                 return None;
             }
         };
-    // Two sources for one frame, in the order of what they cost. The cache hands
-    // over an `Arc` and a whole-frame channel exchange; the resident hands over a
-    // GPU readback and no exchange. Which one holds the frame is decided by the
-    // Store that published it — see `mapping_write::FramePublication` — and both
-    // are gated on the *same* generation the door above just read, so neither can
-    // serve a frame the other has superseded.
-    if let Some(bgra) = crate::runtime::surface_cache::get_shared(state, mapping_id, w, h) {
-        crate::runtime::drain::note_store_route("metal_sampled_from_surface");
-        crate::runtime::drain::note_store_route_n("metal_sampled_surface_bytes", bgra.len() as u64);
-        return Some((w, h, swap_rb_channels(&bgra)));
-    }
-    let rgba = crate::backend::metal::resident::read_published_rgba8(
-        &crate::backend::metal::resident::ResidentColorKey::for_surface(mapping_id, w, h),
+    Some((
+        crate::backend::metal::resident::ResidentColorKey::for_surface(mapping_id, w, h),
         published.generation,
-    )?;
-    crate::runtime::drain::note_store_route("metal_sampled_from_resident");
-    crate::runtime::drain::note_store_route_n("metal_sampled_surface_bytes", rgba.len() as u64);
-    Some((w, h, rgba))
+    ))
 }
 
 /// normal-texture linear texture at mip `level`: strided guest rows → tight RGBA8.

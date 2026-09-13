@@ -133,6 +133,7 @@ mod planar_staging {
                 u64::from(BACKING_PFN) << PAGE_SHIFT_ARM64E,
                 &vec![0x6b; 1 << PAGE_SHIFT_ARM64E],
             ).unwrap();
+            host.guest_wrote_page(u64::from(BACKING_PFN) << PAGE_SHIFT_ARM64E);
             let after = try_stage_planar_sampled(&mut state, &mut host, 1, 11).unwrap().unwrap();
             for plane in 0..2 {
                 assert_eq!(before.plane_bytes(plane), &[0x5a; 1024]);

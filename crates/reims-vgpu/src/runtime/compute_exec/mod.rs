@@ -1386,6 +1386,21 @@ fn staged_span_pages<M: HostMemory>(
 pub(crate) trait RailStage: Sized {
     fn supports_planar_samples() -> bool { false }
 
+    /// The checked source and its resource lifetime, for rails that retain a
+    /// staged snapshot. Copy-only rails keep the same plane-fill contract.
+    fn stage_planar_source<M: HostMemory + HostOps>(
+        state: &mut DeviceState,
+        host: &mut M,
+        source: &PlanarSource,
+    ) -> Result<Self, ComputeStatus> {
+        Self::stage_planar(
+            source.texture_ref,
+            source.description,
+            source.layout.clone(),
+            |planes| source.fill(state, host, planes),
+        )
+    }
+
     fn stage_planar(
         _texture_ref: u32,
         _description: crate::protocol::planar::TextureDescription,
@@ -1413,6 +1428,42 @@ pub(crate) trait RailStage: Sized {
         residency: Option<ComputeStorageResidencyCandidate>,
         serve: Option<ResidentServe>,
     ) -> Self;
+}
+
+/// One fully decoded composite source, shared by fragment and compute staging.
+/// The resource owns immutable construction bytes; the mapping owns replaceable
+/// backing. Plane reads remain in the mapping reader, including all padding.
+pub(crate) struct PlanarSource {
+    resource: std::sync::Arc<crate::model::TaskResource>,
+    texture_ref: u32,
+    description: crate::protocol::planar::TextureDescription,
+    layout: crate::protocol::planar::Layout,
+    map_generation: u32,
+}
+
+impl PlanarSource {
+    fn fill<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        planes: [&mut dyn reims_vgpu_memory::ReadDestination; 2],
+    ) -> Result<(), ComputeStatus> {
+        let mapping_id = self.description.mapping_id;
+        for (plane, bytes) in self.layout.planes.iter().zip(planes) {
+            if bytes.len() as u64 != plane.size {
+                return Err(ComputeStatus::GuestIo("planar_plane_destination"));
+            }
+            if !mapper::read_mapping_into(state, host, mapping_id, plane.base, bytes) {
+                return Err(ComputeStatus::GuestIo("planar_mapping_read"));
+            }
+        }
+        if state.mappings.get(&mapping_id).map(|m| m.map_generation)
+            != Some(self.map_generation)
+        {
+            return Err(ComputeStatus::GuestIo("planar_mapping_changed"));
+        }
+        Ok(())
+    }
 }
 
 /// The storage-mirror window a staged binding corresponds to.
@@ -2003,11 +2054,11 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     }
     if let Some(mapping_id) = mapping_id_opt {
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
-        if let Some(entry) = stage_entry.filter(|entry|
+        if stage_entry.is_some_and(|entry|
             entry.object_type == crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE
         ) {
-            if let Some(descriptor) = objects::read_descriptor(state, host, task_id, &entry) {
-                if crate::protocol::planar::type11_sample_format(&descriptor).is_some() {
+            if let Ok(resource) = objects::resolve_resource(state, host, task_id, stage_ref) {
+                if crate::protocol::planar::type11_sample_format(&resource.descriptor).is_some() {
                     if is_storage {
                         return Err(ComputeStatus::Unsupported("planar_storage_binding"));
                     }
@@ -2015,7 +2066,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                         return Err(ComputeStatus::Unsupported("planar_texture_view"));
                     }
                     return stage_planar_texture::<R, _>(
-                        state, host, task_id, texture_ref, stage_ref, mapping_id, binding, &descriptor,
+                        state, host, task_id, texture_ref, stage_ref, mapping_id, binding, resource,
                     );
                 }
             }
@@ -2400,7 +2451,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         descriptor_ref: u32,
         mapping_id: u32,
         binding: u32,
-        descriptor: &[u8],
+        resource: std::sync::Arc<crate::model::TaskResource>,
     ) -> Result<StagedTexture<R>, ComputeStatus> {
         use crate::protocol::planar::{Layout, TextureDescription};
         if !R::supports_planar_samples() {
@@ -2415,9 +2466,23 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 .fail();
             ComputeStatus::Unsupported(reason.slug())
         };
-        let description = TextureDescription::decode(descriptor, descriptor_ref).map_err(refusal)?;
-        if description.mapping_id != mapping_id {
+        let description = TextureDescription::decode(&resource.descriptor, descriptor_ref)
+            .map_err(refusal)?;
+        if description.mapping_id != mapping_id
+            || objects::resolve_mapper_ref_texture_resource(
+                state, task_id, descriptor_ref, &resource,
+            ) != Some(mapping_id)
+        {
             return Err(ComputeStatus::Unsupported("planar_mapping_identity"));
+        }
+        // A cache hit is a CPU read too: pay and settle before either a witness
+        // audit or a retained image can bypass read_mapping_into's obligation.
+        crate::runtime::writeback_debt::settle_for_mapping(
+            state, host, mapping_id,
+            crate::runtime::render_writeback::SettleSite::MappingBytesRead,
+        );
+        if !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
+            return Err(ComputeStatus::MissingTexture("planar_mapping_unmapped"));
         }
         let mapping = state.mappings.get(&mapping_id)
             .ok_or(ComputeStatus::MissingTexture("planar_mapping_missing"))?;
@@ -2441,22 +2506,12 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 return Err(ComputeStatus::Unsupported("planar_host_length"));
             }
         }
-        let plane_specs = layout.planes;
-        let rail = R::stage_planar(texture_ref, description, layout, |planes| {
-            for (plane, bytes) in plane_specs.iter().zip(planes) {
-                if bytes.len() as u64 != plane.size {
-                    return Err(ComputeStatus::GuestIo("planar_plane_destination"));
-                }
-                // This reader owns guest import bounds and pending GPU writeback.
-                // Fill the whole plane, including leading, row and extended padding.
-                if !mapper::read_mapping_into(state, host, mapping_id, plane.base, bytes) {
-                    return Err(ComputeStatus::GuestIo("planar_mapping_read"));
-                }
-            }
-            if state.mappings.get(&mapping_id).map(|m| m.map_generation) != Some(generation) {
-                return Err(ComputeStatus::GuestIo("planar_mapping_changed"));
-            }
-            Ok(())
+        let rail = R::stage_planar_source(state, host, &PlanarSource {
+            resource,
+            texture_ref,
+            description,
+            layout,
+            map_generation: generation,
         })?;
         Ok(StagedTexture {
             binding,

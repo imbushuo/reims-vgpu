@@ -111,3 +111,20 @@ the way a drag probe can: there is no "the window never moved" check, because
 there is no host-driven motion to check. Confirm the page is live from the
 screenshot the surrounding harness takes, and from `present_hz` being nowhere
 near zero.
+
+## Window state and idle controls
+
+Close Safari's address-field/Favorites popover before scoring the page. Its
+translucent backdrop adds a different compositing workload. Verify the requested
+windowed or full-screen state in a host-owned capture: sending a shortcut is not
+confirmation, and pressing Escape after entering full screen can leave it again.
+
+For long performance runs, record the **guest's** display-idle setting. Host
+`caffeinate` does not prevent guest display sleep. A disposable guest overlay can
+use `sudo pmset -a displaysleep 0` without changing the backing image.
+
+The page's on-screen FPS counter measures `requestAnimationFrame`, not delivery
+to the host display. On the arm64 Cocoa path, use display-FIFO `present_arrived`
+progress and actual host captures; `window_publish` measures the separate
+host-window path. Record any recovery input as a stall, not as a successful
+uninterrupted interval.

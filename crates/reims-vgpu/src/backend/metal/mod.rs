@@ -14,6 +14,8 @@ pub mod error;
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
+pub(crate) mod buffer_extent;
+#[cfg(target_os = "macos")]
 mod cache;
 /// The census lines only this rail can answer. Reached through
 /// [`crate::backend::Backend::emit_census`], never through a `cfg`.
