@@ -3095,6 +3095,7 @@ pub struct DeviceState {
     /// [`crate::runtime::parked::ParkedStore`], which owns the identity of a
     /// parked position and deliberately not its readiness.
     pub parked: crate::runtime::parked::ParkedStore,
+    pub(crate) fifo_progress: crate::runtime::drain::census::fifo_progress::FifoProgress,
     /// Child channels whose head `EXEC_INDIRECT2` packet is held while an
     /// immutable AIR translation is still loading. The packet head and stamp
     /// remain untouched until retry, so this is scheduler state rather than a
@@ -3616,6 +3617,7 @@ impl DeviceState {
                 reims_vgpu_core::identity::SessionId(id.0 as u32),
             )),
             parked: crate::runtime::parked::ParkedStore::new(),
+            fifo_progress: Default::default(),
             translation_deferred_mask: 0,
             translation_order_hold_mask: 0,
             translation_order_holds: 0,

@@ -29,6 +29,7 @@ use reims_vgpu_core::control::{self, ControlKind};
 use reims_vgpu_core::query::{self, QueryKind, RequestWords};
 
 pub(crate) mod census;
+use census::fifo_progress::{Stage as FifoStage, StampWrite};
 pub use census::*;
 
 // The Vulkan rail's completion-stamp publication, named rather than
@@ -1949,12 +1950,18 @@ fn write_root_stamp<H: HostMemory + HostOps>(
         crate::runtime::render_writeback::SettleSite::RootStamp,
     ) == crate::backend::StampOrdering::Queued
     {
+        state
+            .fifo_progress
+            .stamp(0, value, StampWrite::Queued, crate::observe::elapsed_us());
         note_store_route("root_stamp_ordered_gpu");
         state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
         return false;
     }
     let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
     if gpa_map::write_u32(host, gpa, value, state.page_size() as usize).is_ok() {
+        state
+            .fifo_progress
+            .stamp(0, value, StampWrite::Inline, crate::observe::elapsed_us());
         note_stamp_visible(state, 0, value, "stamp_visible_root");
         // A window armed after this point has outlived a fence the moment it is
         // still armed at the next one. The counter is what `armed_stamp_seq` is
@@ -1965,6 +1972,9 @@ fn write_root_stamp<H: HostMemory + HostOps>(
     }
     // The guest waits on this root completion stamp; a silent writeback failure
     // hangs it forever with no trace (drain.rs Rank-2 audit).
+    state
+        .fifo_progress
+        .stamp(0, value, StampWrite::Failed, crate::observe::elapsed_us());
     state.record_fail(FailEvent::MalformedRootPacket {
         fault: PacketFault::RootStampWriteback,
         head: state
@@ -2112,6 +2122,12 @@ fn admit_and_park<H: HostMemory + HostOps>(
 ) {
     use reims_vgpu_core::identity::StampSlot;
 
+    state.fifo_progress.packet(
+        fifo.domain().0,
+        &packet,
+        FifoStage::Arrived,
+        crate::observe::elapsed_us(),
+    );
     let arrived = arrival_work(state, host, fifo, &packet);
     let session = state.session_generation();
     let built = crate::runtime::ingress::device_packet(
@@ -2240,6 +2256,12 @@ fn admit_and_park<H: HostMemory + HostOps>(
             return;
         }
     };
+    state.fifo_progress.packet(
+        fifo.domain().0,
+        &packet,
+        FifoStage::Admitted,
+        crate::observe::elapsed_us(),
+    );
     let mut transaction = admission.admitted.transaction;
     let ingress = transaction.identity.ingress;
     // The resolved records move out of the transaction the model just handed
@@ -2571,6 +2593,12 @@ fn run_parked<H: HostMemory + HostOps>(
 ) {
     census::checkpoints::packet_started(state);
     let domain = work.domain();
+    state.fifo_progress.packet(
+        domain,
+        work.packet(),
+        FifoStage::Started,
+        crate::observe::elapsed_us(),
+    );
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
         process_root_packet(state, host, work.packet());
     } else {
@@ -2586,7 +2614,15 @@ fn run_parked<H: HostMemory + HostOps>(
         state.draining_channel = domain;
         state.draining_mask |= bit;
         let started = std::time::Instant::now();
-        let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
+        let disposition = process_child_packet(state, host, domain, work.packet(), work.retained());
+        if disposition == ChildPacketDisposition::Deferred {
+            state.fifo_progress.packet(
+                domain,
+                work.packet(),
+                FifoStage::Deferred,
+                crate::observe::elapsed_us(),
+            );
+        }
         census::note_drain_proc(work.packet().opcode, started.elapsed().as_nanos() as u64);
         if was_draining == 0 {
             state.draining_mask &= !bit;
@@ -2595,6 +2631,12 @@ fn run_parked<H: HostMemory + HostOps>(
     }
     match state.complete_transaction(work.epoch(), ingress) {
         Ok(released) => {
+            state.fifo_progress.packet(
+                domain,
+                work.packet(),
+                FifoStage::ModelRetired,
+                crate::observe::elapsed_us(),
+            );
             for release in released {
                 // **Counted here because the model cannot count it, and a
                 // publisher nobody counts reads exactly like one that never
@@ -2725,6 +2767,12 @@ fn note_unadmitted<H: HostMemory + HostOps>(
     detail: impl FnOnce() -> String,
 ) {
     note_store_route("packet_unadmitted");
+    state.fifo_progress.packet(
+        fifo.domain().0,
+        packet,
+        FifoStage::Refused,
+        crate::observe::elapsed_us(),
+    );
     note_store_route(reason);
     // Latched under the *refusal's* own slug rather than under
     // `packet_unadmitted`, because `first_sight` keys on the reason it is given
@@ -3111,6 +3159,12 @@ pub fn write_stamp<H: HostMemory + HostOps>(
         crate::runtime::render_writeback::SettleSite::CompletionStamp,
     ) == crate::backend::StampOrdering::Queued
     {
+        state.fifo_progress.stamp(
+            index,
+            stamp_value,
+            StampWrite::Queued,
+            crate::observe::elapsed_us(),
+        );
         // Advanced at submit, not at completion. From here the guest may see the
         // word at any moment, so a window still armed has already outlived this
         // fence — which is what `armed_stamp_seq` is compared against, and
@@ -3125,6 +3179,12 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     let page_size = state.page_size() as usize;
     note_stamp_direction(host, gpa, index, stamp_value);
     if gpa_map::write_u32(host, gpa, stamp_value, page_size).is_ok() {
+        state.fifo_progress.stamp(
+            index,
+            stamp_value,
+            StampWrite::Inline,
+            crate::observe::elapsed_us(),
+        );
         // The word is in the page: from here the guest can read it, which is
         // the event the ordering plane's stamp waits are about.
         note_stamp_visible(state, index, stamp_value, "stamp_visible_inline");
@@ -3138,6 +3198,13 @@ pub fn write_stamp<H: HostMemory + HostOps>(
             .interrupt_status_gpu
             .fetch_or(1u32 << (index & 0x1f), std::sync::atomic::Ordering::AcqRel);
         host.enqueue(HostAction::irq_gfx());
+    } else {
+        state.fifo_progress.stamp(
+            index,
+            stamp_value,
+            StampWrite::Failed,
+            crate::observe::elapsed_us(),
+        );
     }
 }
 
@@ -4028,7 +4095,17 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
             .gfx
             .fifo_read
             .load(std::sync::atomic::Ordering::Acquire);
-        match arrival(&ring, host, head, state.gfx.fifo_written) {
+        let tail = state.gfx.fifo_written;
+        let arrived = arrival(&ring, host, head, tail);
+        state.fifo_progress.ring(
+            0,
+            head,
+            tail,
+            ROOT_STAMP_SLOT,
+            &arrived,
+            crate::observe::elapsed_us(),
+        );
+        match arrived {
             Arrival::Nothing => break,
             Arrival::Fault(fault) => {
                 state.record_fail(FailEvent::MalformedRootPacket { fault, head });
@@ -6719,7 +6796,16 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
             capacity: ring_length,
             page_shift: state.page_shift,
         };
-        match arrival(&ring, host, head, tail) {
+        let arrived = arrival(&ring, host, head, tail);
+        state.fifo_progress.ring(
+            channel_id,
+            head,
+            tail,
+            stamp_slot_index(stamp_index),
+            &arrived,
+            crate::observe::elapsed_us(),
+        );
+        match arrived {
             Arrival::Nothing => break,
             Arrival::Fault(fault) => {
                 state.record_fail(FailEvent::MalformedChildPacket {
