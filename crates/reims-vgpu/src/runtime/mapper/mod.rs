@@ -11,7 +11,7 @@ use crate::backend::Backend as _;
 use crate::model::{DeviceState, MapperCapture};
 use crate::protocol::iosurface_pages::{
     self, build_table_plan, decode_device_surface, decode_mapper_request_entry, guest_kernel_va,
-    mapper_request_published_entry_offset, mapping_span_bound, read_internal_desc_ptr,
+    mapping_span_bound, read_internal_desc_ptr,
     read_mapper_identity, validate_mapper_internal, PagesMemory,
     DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE, MAPPER_CAPTURE_REG_MAPPING_INTERNAL,
     MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
@@ -197,12 +197,27 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
     host: &H,
     producer: u32,
 ) -> Option<MapperCapture> {
-    if producer == 0 || state.iosfc.ring_base() == 0 {
+    if producer == state.iosfc.consumer() || state.iosfc.ring_base() == 0 {
         return None;
     }
-    let entry_off = mapper_request_published_entry_offset(producer)?;
+    let ring = match iosurface_pages::MapperRing::new(state.iosfc.capacity()) {
+        Ok(ring) => ring,
+        Err(error) => {
+            report_ring_error(state, error);
+            return None;
+        }
+    };
+    if let Err(error) = ring.pending(producer, state.iosfc.consumer()) {
+        report_ring_error(state, error);
+        return None;
+    }
+    let entry_off = ring.published_entry_offset(producer);
     let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
-    host.read_gpa(state.iosfc.ring_base() + entry_off, &mut e)
+    let Some(address) = state.iosfc.ring_base().checked_add(entry_off) else {
+        crate::observe::Emit::decline("mapper_capture_ring_address", &MemError::Overflow).fail();
+        return None;
+    };
+    host.read_gpa(address, &mut e)
         .ok()?;
     let request = decode_mapper_request_entry(&e).ok()?;
     if request.request_type != MAPPER_REQUEST_MAP && request.request_type != MAPPER_REQUEST_UNMAP {
@@ -327,6 +342,15 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
         request_type: rtype,
         mapping_internal: internal,
     })
+}
+
+pub(super) fn report_ring_error(state: &DeviceState, error: iosurface_pages::MapperRingError) {
+    crate::runtime::drain::note_store_route(crate::observe::Decline::slug(&error));
+    crate::observe::Emit::decline("mapper_ring", &error)
+        .field("capacity", state.iosfc.capacity())
+        .field("producer", state.iosfc.producer())
+        .field("consumer", state.iosfc.consumer())
+        .fail_once(u64::from(state.iosfc.capacity()));
 }
 
 /// Apply a capture to the mapping named by the just-drained ring entry.
@@ -1865,14 +1889,15 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
             return Some((gpa, "root_fifo"));
         }
     }
-    // Still the first page only. `iosfc.capacity` would give the ring's extent
-    // the way `fifo_length` does above, but nothing in this crate consumes it —
-    // it is written and read back over MMIO and never bounds anything — so its
-    // units are not established, and sizing a rejection window from a field
-    // whose meaning is a guess is how a legitimate surface gets refused. Bound
-    // it when a consumer settles whether it counts entries or bytes.
-    if state.iosfc.ring_base() != 0 && holds(state.iosfc.ring_base()) {
-        return Some((page_base(state.iosfc.ring_base()), "iosfc_ring"));
+    if state.iosfc.ring_base() != 0 {
+        // Before capacity is programmed only the published base is known.
+        let bytes = iosurface_pages::MapperRing::new(state.iosfc.capacity())
+            .map_or(1, iosurface_pages::MapperRing::byte_len);
+        let base = page_base(state.iosfc.ring_base());
+        let extent = bytes.saturating_add(state.iosfc.ring_base() - base);
+        if let Some(gpa) = holds_range(base, extent) {
+            return Some((gpa, "iosfc_ring"));
+        }
     }
     for ring in &state.child_rings {
         for &gpa in &ring.page_gpas {

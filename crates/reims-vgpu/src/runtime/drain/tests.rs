@@ -348,6 +348,100 @@ fn the_snapshot_rule_reads_the_same_for_both_rings() {
 }
 
 #[test]
+fn iosfc_ring_wrap_does_not_read_the_adjacent_allocation() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let base = 0x7000_0000;
+    let capacity = 4;
+    state.iosfc.set_ring_base(base);
+    state.iosfc.set_capacity(capacity);
+    host.map_range(base, 5 * MAPPER_REQUEST_ENTRY_LEN, 0);
+    state.map_surface(99);
+    let mut entry = [0u8; MAPPER_REQUEST_ENTRY_LEN];
+    st32(&mut entry, MAPPER_REQUEST_UNMAP);
+    st32(&mut entry[4..], 99);
+    host.write_gpa(base + 4 * MAPPER_REQUEST_ENTRY_LEN as u64, &entry).unwrap();
+    for sequence in 0..12u32 {
+        st32(&mut entry, MAPPER_REQUEST_MAP);
+        st32(&mut entry[4..], sequence + 1);
+        host.write_gpa(
+            base + u64::from(sequence % capacity) * MAPPER_REQUEST_ENTRY_LEN as u64,
+            &entry,
+        ).unwrap();
+        state.iosfc.set_producer(sequence + 1);
+        drain_iosfc(&mut state, &mut host);
+        assert_eq!(state.iosfc.consumer(), sequence + 1);
+        assert!(state.mappings[&(sequence + 1)].mapped);
+        assert!(state.mappings[&99].mapped, "bytes after the ring are not requests");
+        assert!(!state.pending.iosfc);
+    }
+}
+
+#[test]
+fn iosfc_ring_drains_across_u32_counter_rollover() {
+    use crate::model::MapperCapture;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let base = 0x7100_0000;
+    state.iosfc.set_ring_base(base);
+    state.iosfc.set_capacity(4);
+    state.iosfc.set_consumer(u32::MAX);
+    state.iosfc.set_producer(1);
+    host.map_range(base, 4 * MAPPER_REQUEST_ENTRY_LEN, 0);
+    for (slot, id) in [(3, 7), (0, 8)] {
+        state.map_surface(id);
+        let mut entry = [0u8; MAPPER_REQUEST_ENTRY_LEN];
+        st32(&mut entry, MAPPER_REQUEST_UNMAP);
+        st32(&mut entry[4..], id);
+        host.write_gpa(base + slot * MAPPER_REQUEST_ENTRY_LEN as u64, &entry).unwrap();
+    }
+    state.mapper_capture = Some(MapperCapture {
+        producer: 0,
+        request_type: MAPPER_REQUEST_UNMAP,
+        mapper_device_kva: 0,
+        mapping_internal: 0,
+    });
+    drain_iosfc(&mut state, &mut host);
+    assert_eq!(state.iosfc.consumer(), 1);
+    assert!(!state.mappings[&7].mapped);
+    assert!(!state.mappings[&8].mapped);
+    assert!(state.mapper_capture.is_none());
+    assert!(!state.pending.iosfc);
+}
+
+#[test]
+fn iosfc_invalid_ring_and_unreadable_entry_do_not_acknowledge_unprocessed_work() {
+    let base = 0x7200_0000;
+    for (capacity, producer) in [(0, 1), (2, 3)] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        state.iosfc.set_ring_base(base);
+        state.iosfc.set_capacity(capacity);
+        state.iosfc.set_producer(producer);
+        drain_iosfc(&mut state, &mut host);
+        assert_eq!(state.iosfc.consumer(), 0);
+        assert!(state.pending.iosfc);
+        assert!(host.actions.is_empty());
+    }
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.iosfc.set_ring_base(base);
+    state.iosfc.set_capacity(2);
+    state.iosfc.set_producer(2);
+    host.map_range(base, 2 * MAPPER_REQUEST_ENTRY_LEN, 0);
+    let mut entry = [0u8; MAPPER_REQUEST_ENTRY_LEN];
+    st32(&mut entry, MAPPER_REQUEST_MAP);
+    st32(&mut entry[4..], 7);
+    host.write_gpa(base, &entry).unwrap();
+    host.mark_non_ram(base + MAPPER_REQUEST_ENTRY_LEN as u64, MAPPER_REQUEST_ENTRY_LEN as u64);
+    drain_iosfc(&mut state, &mut host);
+    assert_eq!(state.iosfc.consumer(), 1);
+    assert!(state.mappings[&7].mapped);
+    assert!(state.pending.iosfc);
+    assert!(host.actions.is_empty());
+}
+
+#[test]
 fn display_descriptor_advertises_four_modes_incl_4k() {
     let mut host = FakeHost::new();
     let gpa = 0x7a000000u64;

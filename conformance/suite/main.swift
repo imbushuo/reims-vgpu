@@ -26,6 +26,11 @@ if CommandLine.arguments.contains("--integer-clear-only") {
     finish()
 }
 
+if CommandLine.arguments.contains("--mapper-ring-wrap-only") {
+    mapperRingWrapCase()
+    finish()
+}
+
 if CommandLine.arguments.contains("--topology-only") {
     _ = library
     report("shader_compile", true, "runtime library built")
@@ -312,6 +317,8 @@ blitIOSurfaceSourceCase(1024, 768, frames: 8)
 blitIOSurfaceSourceCase(1920, 1080, frames: 4)
 
 blitBufferBackedCase(512, 512)
+
+mapperRingWrapCase()
 
 // A device-wide waiter-first scheduling defect can stop all later work, so
 // this bounded probe deliberately closes the battery.

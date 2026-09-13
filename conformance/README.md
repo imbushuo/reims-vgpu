@@ -15,6 +15,12 @@ CASE <name> PASS|FAIL|SKIP <detail>
 SUMMARY cases=N failures=N skipped=N
 ```
 
+`--mapper-ring-wrap-only` runs a shaderless IOSurface lifetime regression: 2,048
+distinct targets are allocated, cleared, read back, and released. This exercises
+repeated mapper-ring revolutions without depending on browser animation timing.
+The IOSFC capacity counts entries; growing producer/consumer counters must not
+be used as linear memory indices.
+
 ## Reading a result
 
 `verdict.py` applies the table below to a pair of runs and exits non-zero when

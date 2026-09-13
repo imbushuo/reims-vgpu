@@ -52,6 +52,7 @@ pub const GFX_REG_EFI_DISPLAY_PORTS: u64 = 0x122c;
 pub const GFX_REG_EFI_BUILTIN_CONNECTED: u64 = 0x1234;
 
 pub const IOSFC_REG_RING_BASE: u64 = 0x1000;
+/// Number of mapper request entries; producer and consumer are publication counters.
 pub const IOSFC_REG_CAPACITY: u64 = 0x1008;
 pub const IOSFC_REG_DESC_TABLE: u64 = 0x1010;
 pub const IOSFC_REG_PRODUCER: u64 = 0x1018;

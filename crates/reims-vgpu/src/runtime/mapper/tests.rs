@@ -656,6 +656,7 @@ fn capture_validates_identity_and_ring() {
     let mut host = FakeHost::new();
     let ring = 0x7000_0000u64;
     state.iosfc.set_ring_base(ring);
+    state.iosfc.set_capacity(1);
 
     // producer=1 → entry 0: MAP mapping_id=7
     let mut entry = [0u8; 16];
@@ -701,6 +702,13 @@ fn capture_validates_identity_and_ring() {
         .actions
         .iter()
         .any(|action| action.kind == crate::runtime::host::HostActionKind::IrqIosfcPulse));
+    for consumer in [1, 1024, u32::MAX] {
+        state.iosfc.set_consumer(consumer);
+        let producer = consumer.wrapping_add(1);
+        let capture = capture_at_producer(&state, &host, producer).expect("wrapped capture");
+        assert_eq!(capture.producer, producer);
+        assert_eq!(capture.mapping_internal, internal);
+    }
 }
 
 #[test]
@@ -713,6 +721,7 @@ fn capture_handoff_mismatch_is_fail_visible_and_latched() {
     let mut host = FakeHost::new();
     let ring = 0x7100_0000u64;
     state.iosfc.set_ring_base(ring);
+    state.iosfc.set_capacity(1);
 
     // producer=1 → entry 0: MAP mapping_id=9
     let mut entry = [0u8; 16];
@@ -1714,6 +1723,24 @@ fn an_object_list_gva_is_not_compared_against_surface_physical_pages() {
 /// control structures at once names the same one it always did. The walk is
 /// per task, so task 1's directory is reported before task 2's — which a
 /// flat "collect every control page then sort" would silently lose.
+#[test]
+fn every_page_of_the_declared_mapper_ring_is_control_storage() {
+    for shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        let state = DeviceState::new(DeviceId(1), shift);
+        let page = state.page_size();
+        let base = 0x300_000;
+        state.iosfc.set_ring_base(base);
+        state.iosfc.set_capacity((2 * page / MAPPER_REQUEST_ENTRY_LEN as u64) as u32);
+        assert_eq!(
+            first_control_page_collision(&state, &[base + page]),
+            Some((base + page, "iosfc_ring")),
+        );
+        assert_eq!(first_control_page_collision(&state, &[base + 2 * page]), None);
+        state.iosfc.set_ring_base(base + 16);
+        assert_eq!(first_control_page_collision(&state, &[base]), Some((base, "iosfc_ring")));
+    }
+}
+
 #[test]
 fn a_surface_colliding_with_several_control_structures_names_the_first() {
     let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);

@@ -545,15 +545,53 @@ pub fn entry_gpa_shift(entry: u32, page_shift: u32) -> Option<u64> {
     Some(((entry >> PAGE_ENTRY_PFN_SHIFT) as u64) << page_shift)
 }
 
-pub fn mapper_request_entry_offset(index: u32) -> u64 {
-    (index as u64) * MAPPER_REQUEST_ENTRY_LEN as u64
+/// IOSFC request storage is circular; producer/consumer count publications,
+/// while capacity counts fixed-size entries, not bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapperRing {
+    capacity: core::num::NonZeroU32,
 }
 
-pub fn mapper_request_published_entry_offset(producer: u32) -> Option<u64> {
-    if producer == 0 {
-        None
-    } else {
-        Some(mapper_request_entry_offset(producer - 1))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapperRingError {
+    ZeroCapacity,
+    Overrun { capacity: u32, pending: u32 },
+}
+
+impl reims_vgpu_observe::Decline for MapperRingError {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::ZeroCapacity => "mapper_ring_zero_capacity",
+            Self::Overrun { .. } => "mapper_ring_overrun",
+        }
+    }
+}
+
+impl MapperRing {
+    pub fn new(capacity: u32) -> Result<Self, MapperRingError> {
+        core::num::NonZeroU32::new(capacity)
+            .map(|capacity| Self { capacity })
+            .ok_or(MapperRingError::ZeroCapacity)
+    }
+
+    pub fn pending(self, producer: u32, consumer: u32) -> Result<u32, MapperRingError> {
+        let pending = producer.wrapping_sub(consumer);
+        if pending > self.capacity.get() {
+            return Err(MapperRingError::Overrun { capacity: self.capacity.get(), pending });
+        }
+        Ok(pending)
+    }
+
+    pub fn entry_offset(self, sequence: u32) -> u64 {
+        u64::from(sequence % self.capacity.get()) * MAPPER_REQUEST_ENTRY_LEN as u64
+    }
+
+    pub fn byte_len(self) -> u64 {
+        u64::from(self.capacity.get()) * MAPPER_REQUEST_ENTRY_LEN as u64
+    }
+
+    pub fn published_entry_offset(self, producer: u32) -> u64 {
+        self.entry_offset(producer.wrapping_sub(1))
     }
 }
 
@@ -825,6 +863,26 @@ pub fn build_table_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mapper_ring_offsets_wrap_storage_and_publication_counters() {
+        let ring = MapperRing::new(1024).unwrap();
+        for sequence in 0..3072u32 {
+            assert_eq!(ring.entry_offset(sequence), u64::from(sequence % 1024) * 16);
+            assert!(ring.entry_offset(sequence) < 16384);
+        }
+        assert_eq!(ring.published_entry_offset(2282), 233 * 16);
+        assert_eq!(ring.published_entry_offset(0), 1023 * 16);
+        assert_eq!(ring.pending(0, u32::MAX), Ok(1));
+        assert_eq!(ring.pending(2, u32::MAX), Ok(3));
+        assert_eq!(ring.pending(1024, 0), Ok(1024));
+        assert_eq!(
+            ring.pending(1025, 0),
+            Err(MapperRingError::Overrun { capacity: 1024, pending: 1025 }),
+        );
+        assert_eq!(MapperRing::new(0), Err(MapperRingError::ZeroCapacity));
+    }
+
     use crate::gva::PAGE_SHIFT_ARM64E;
     use crate::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 

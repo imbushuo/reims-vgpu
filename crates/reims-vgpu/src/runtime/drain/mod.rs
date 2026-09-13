@@ -6892,23 +6892,43 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
     }
 
     // Process requests between consumer and producer when ring is programmed.
-    if state.iosfc.ring_base() != 0 && producer > consumer {
-        let start = consumer;
-        let end = producer;
-        for idx in start..end {
-            let entry_off = (idx as u64) * MAPPER_REQUEST_ENTRY_LEN as u64;
+    if state.iosfc.ring_base() != 0 {
+        let ring = match crate::protocol::iosurface_pages::MapperRing::new(state.iosfc.capacity()) {
+            Ok(ring) => ring,
+            Err(error) => {
+                crate::runtime::mapper::report_ring_error(state, error);
+                state.pending.iosfc = true;
+                return;
+            }
+        };
+        let pending = match ring.pending(producer, consumer) {
+            Ok(pending) => pending,
+            Err(error) => {
+                crate::runtime::mapper::report_ring_error(state, error);
+                state.pending.iosfc = true;
+                return;
+            }
+        };
+        for _ in 0..pending {
+            let idx = consumer;
+            let entry_off = ring.entry_offset(idx);
+            let Some(address) = state.iosfc.ring_base().checked_add(entry_off) else {
+                crate::observe::Emit::decline("mapper_ring_address", &MemError::Overflow).fail();
+                break;
+            };
             let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
-            if host
-                .read_gpa(state.iosfc.ring_base() + entry_off, &mut e)
-                .is_err()
-            {
+            if let Err(error) = host.read_gpa(address, &mut e) {
+                crate::observe::Emit::decline("mapper_ring_read", &error)
+                    .field("sequence", idx)
+                    .field("address", address)
+                    .fail();
                 break;
             }
             let rtype = ld32(&e[MAPPER_REQUEST_TYPE..]);
             let mapping_id = ld32(&e[MAPPER_REQUEST_MAPPING_ID..]);
             // Capture was taken at producer write for published entry (idx+1).
             let cap = match state.mapper_capture {
-                Some(c) if c.producer == idx + 1 => state.mapper_capture.take(),
+                Some(c) if c.producer == idx.wrapping_add(1) => state.mapper_capture.take(),
                 _ => None,
             };
             match rtype {
@@ -6971,7 +6991,7 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
     if state.iosfc.consumer() == state.iosfc.producer() {
         host.enqueue(HostAction::irq_iosfc());
     }
-    state.pending.iosfc = false;
+    state.pending.iosfc = state.iosfc.consumer() != state.iosfc.producer();
 }
 
 /// Display-side present completion: after `presentFrame` retains the surface,
