@@ -2190,24 +2190,20 @@ fn select() -> SelectedBackend {
 /// one — but a total `match` still has to say what it would do, and it says the
 /// same thing the selection already decided rather than panicking.
 fn build(rail: Rail) -> SelectedBackend {
-    #[cfg(feature = "backend-metal")]
-    let metal = SelectedBackend::Metal(metal::MetalBackend::probe());
-    #[cfg(feature = "backend-vulkan")]
-    let vulkan = SelectedBackend::Vulkan(vulkan::VulkanBackend::new());
     #[cfg(all(feature = "backend-metal", feature = "backend-vulkan"))]
     match rail {
-        Rail::Metal => metal,
-        Rail::Vulkan => vulkan,
+        Rail::Metal => SelectedBackend::Metal(metal::MetalBackend::probe()),
+        Rail::Vulkan => SelectedBackend::Vulkan(vulkan::VulkanBackend::new()),
     }
     #[cfg(all(feature = "backend-metal", not(feature = "backend-vulkan")))]
     {
         let _ = rail;
-        metal
+        SelectedBackend::Metal(metal::MetalBackend::probe())
     }
     #[cfg(all(feature = "backend-vulkan", not(feature = "backend-metal")))]
     {
         let _ = rail;
-        vulkan
+        SelectedBackend::Vulkan(vulkan::VulkanBackend::new())
     }
 }
 

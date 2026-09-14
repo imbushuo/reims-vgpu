@@ -22,6 +22,10 @@
 // here mentions a rail.
 use super::DISPLAY_VBL_MIN_INTERVAL_US;
 use crate::backend::{Backend as _, CensusSite};
+
+pub(crate) mod checkpoints;
+pub(crate) mod fifo_progress;
+
 /// Delivered-VBL rate, reported from the branch that decides it.
 ///
 /// VBL is what paces the guest's compositor: WindowServer produces a frame off
@@ -2806,6 +2810,7 @@ pub fn note_drain_tranche(
 ) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
+        fifo_progress::emit(state);
         // The rail this device is running on, asked four times below at the
         // points its lines have to be read from. Taken once so the four asks
         // cannot land on two different rails.

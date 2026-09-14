@@ -11,12 +11,21 @@ pub fn load_only_function(
     label: &str,
     err: ErrOut<'_>,
 ) -> Result<Function, Status> {
-    validate_mtlb(mtlb, label, err)?;
-    let key = BlobKey::new(mtlb);
+    load_only_function_key(device, BlobKey::new(mtlb), label, err)
+}
+
+/// Reuse the digest of the immutable bytes already keyed by a pipeline lookup.
+pub(super) fn load_only_function_key(
+    device: &Device,
+    key: BlobKey<'_>,
+    label: &str,
+    err: ErrOut<'_>,
+) -> Result<Function, Status> {
+    validate_mtlb(key.bytes, label, err)?;
     if let Some(hit) = fn_cache_lookup(&key) {
         return Ok(hit);
     }
-    let function = load_only_function_uncached(device, mtlb, label, err)?;
+    let function = load_only_function_uncached(device, key.bytes, label, err)?;
     Ok(fn_cache_insert(&key, function))
 }
 

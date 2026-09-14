@@ -374,6 +374,24 @@ pub fn new_linear_texture(
     }
 }
 
+pub(super) fn new_linear_texture_with_storage(
+    device: &DeviceRef,
+    descriptor: &TextureDescriptorRef,
+    bytes_per_pixel: usize,
+) -> Option<Texture> {
+    let alignment =
+        device.minimum_linear_texture_alignment_for_pixel_format(descriptor.pixel_format());
+    let tight = descriptor.width().checked_mul(bytes_per_pixel as u64)?;
+    let pitch = if alignment == 0 {
+        tight
+    } else {
+        tight.div_ceil(alignment).checked_mul(alignment)?
+    };
+    let length = pitch.checked_mul(descriptor.height())?;
+    let buffer = new_buffer(device, length, MTLResourceOptions::StorageModeShared)?;
+    new_linear_texture(&buffer, descriptor, 0, pitch)
+}
+
 /// This texture's pixels as host bytes, when it is a linear texture over a
 /// CPU-visible buffer laid out exactly `bytes_per_row` by `height`.
 ///
@@ -452,9 +470,9 @@ pub unsafe fn new_buffer_with_data(
 /// `newBufferWithBytesNoCopy:length:options:deallocator:`, with the nil an
 /// exhausted device returns.
 ///
-/// The deallocator is always nil: this device keeps every no-copy buffer's bytes
-/// alive for the command buffer's lifetime itself, which is the contract
-/// [`super::runtime::new_buffer_from_host`] states for its caller.
+/// This host-staging helper uses a nil deallocator; its caller owns the bytes.
+/// Guest imports use [`new_buffer_no_copy_with_release`] so host unmapping waits
+/// for Metal's final reference instead.
 ///
 /// # Safety
 ///
@@ -487,6 +505,29 @@ pub unsafe fn new_buffer_no_copy(
     }
 }
 
+/// No-copy import whose owner learns when Metal has released its final reference.
+///
+/// # Safety
+/// The page-aligned allocation must remain mapped until `deallocator` runs.
+/// The callback reports release; it must not free guest RAM itself.
+pub unsafe fn new_buffer_no_copy_with_release(
+    device: &DeviceRef,
+    bytes: *mut std::ffi::c_void,
+    length: NSUInteger,
+    deallocator: &block::Block<(*mut std::ffi::c_void, NSUInteger), ()>,
+) -> Option<Buffer> {
+    unsafe {
+        let ptr: *mut Object = msg_send![
+            device,
+            newBufferWithBytesNoCopy: bytes
+            length: length
+            options: MTLResourceOptions::StorageModeShared
+            deallocator: deallocator
+        ];
+        (!ptr.is_null()).then(|| Buffer::from_ptr(ptr as *mut _))
+    }
+}
+
 /// `[MTLCommandQueue commandBuffer]`, with the nil it can answer.
 ///
 /// **Borrowed, exactly as metal-0.33 returns it.** The object is autoreleased,
@@ -501,6 +542,15 @@ pub fn new_command_buffer(queue: &CommandQueueRef) -> Option<&CommandBufferRef> 
     unsafe {
         let ptr: *mut Object = msg_send![queue, commandBuffer];
         (!ptr.is_null()).then(|| CommandBufferRef::from_ptr(ptr as *mut _))
+    }
+}
+
+/// Compare the command's actual originating queue without extending its borrow.
+pub fn command_buffer_uses_queue(command: &CommandBufferRef, queue: &CommandQueueRef) -> bool {
+    // SAFETY: commandQueue is a borrowed native object retained by command.
+    unsafe {
+        let actual: *mut Object = msg_send![command, commandQueue];
+        actual == queue.as_ptr().cast()
     }
 }
 

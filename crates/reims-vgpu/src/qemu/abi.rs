@@ -96,7 +96,8 @@ use std::slice;
 /// shim falls back to QEMU's own display.
 /// v21 replaces IOSFC writes with ordered begin/try/wait/finish admission.
 /// Only wait may run without BQL; tickets retain no HostOps context.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 21;
+/// v22 separates owned-until-unmap aliases from legacy map_pages stability.
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 23;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -960,6 +961,21 @@ mod tests {
             REIMS_VGPU_QEMU_ABI_VERSION,
             "the shim header and the staticlib disagree on the ABI version"
         );
+    }
+
+    #[test]
+    fn owned_page_alias_capability_is_appended_to_the_host_table() {
+        use crate::qemu::host_ops::ReimsVgpuHostOps;
+        assert_eq!(
+            std::mem::offset_of!(ReimsVgpuHostOps, map_pages_owned),
+            std::mem::offset_of!(ReimsVgpuHostOps, page_alias_census) + std::mem::size_of::<usize>(),
+        );
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(std::mem::offset_of!(ReimsVgpuHostOps, map_pages_owned), 152);
+            assert_eq!(std::mem::offset_of!(ReimsVgpuHostOps, guest_write_gen_current), 160);
+            assert_eq!(std::mem::size_of::<ReimsVgpuHostOps>(), 168);
+        }
     }
 
     #[test]

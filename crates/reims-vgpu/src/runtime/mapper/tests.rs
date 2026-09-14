@@ -656,6 +656,7 @@ fn capture_validates_identity_and_ring() {
     let mut host = FakeHost::new();
     let ring = 0x7000_0000u64;
     state.iosfc.set_ring_base(ring);
+    state.iosfc.set_capacity(1);
 
     // producer=1 → entry 0: MAP mapping_id=7
     let mut entry = [0u8; 16];
@@ -701,6 +702,13 @@ fn capture_validates_identity_and_ring() {
         .actions
         .iter()
         .any(|action| action.kind == crate::runtime::host::HostActionKind::IrqIosfcPulse));
+    for consumer in [1, 1024, u32::MAX] {
+        state.iosfc.set_consumer(consumer);
+        let producer = consumer.wrapping_add(1);
+        let capture = capture_at_producer(&state, &host, producer).expect("wrapped capture");
+        assert_eq!(capture.producer, producer);
+        assert_eq!(capture.mapping_internal, internal);
+    }
 }
 
 #[test]
@@ -713,6 +721,7 @@ fn capture_handoff_mismatch_is_fail_visible_and_latched() {
     let mut host = FakeHost::new();
     let ring = 0x7100_0000u64;
     state.iosfc.set_ring_base(ring);
+    state.iosfc.set_capacity(1);
 
     // producer=1 → entry 0: MAP mapping_id=9
     let mut entry = [0u8; 16];
@@ -758,11 +767,20 @@ fn capture_handoff_mismatch_is_fail_visible_and_latched() {
 ///
 /// Returns `(state, host, page_gpa)`.
 fn span_fixture(pfn: u32) -> (DeviceState, FakeHost, u64) {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    span_fixture_with_shift(pfn, PAGE_SHIFT_ARM64E, 1)
+}
+
+fn span_fixture_with_shift(
+    pfn: u32,
+    page_shift: u32,
+    page_count: usize,
+) -> (DeviceState, FakeHost, u64) {
+    let mut state = DeviceState::new(DeviceId(1), page_shift);
     let mut host = FakeHost::new();
     let internal = KVA;
     let mapper = KVA + 0x1000;
-    let page_gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    let page_size = 1usize << page_shift;
+    let page_gpa = (pfn as u64) << page_shift;
 
     put_u64(&mut host, internal + MAPPING_INTERNAL_BACKPTR, mapper);
     put_u32(&mut host, internal + MAPPING_INTERNAL_ID, 3);
@@ -779,22 +797,372 @@ fn span_fixture(pfn: u32) -> (DeviceState, FakeHost, u64) {
     let mut desc = [0u8; DEVICE_DESC_LEN];
     st32(
         &mut desc[iosurface_pages::DEVICE_DESC_PAGE_TABLE..],
-        ((TABLE_GPA >> PAGE_SHIFT_ARM64E) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID,
+        ((TABLE_GPA >> page_shift) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID,
     );
     st32(
         &mut desc[iosurface_pages::DEVICE_DESC_ALLOC_SIZE..],
-        PAGE_SIZE_ARM64E as u32,
+        (page_size * page_count) as u32,
     );
     host.map_range(DESC_KVA, DEVICE_DESC_LEN, 0);
     host.write_gpa(DESC_KVA, &desc).unwrap();
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    put_u32(&mut host, TABLE_GPA, entry);
-    // one page of guest RAM for the surface
-    host.map_range(page_gpa, PAGE_SIZE_ARM64E as usize, 0x55);
+    for index in 0..page_count {
+        let entry = ((pfn + index as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        put_u32(&mut host, TABLE_GPA + 4 * index as u64, entry);
+    }
+    host.map_range(page_gpa, page_size * page_count, 0x55);
 
     state.mapper_device_kva = mapper;
     assert!(state.attach_mapping_internal(3, internal));
     (state, host, page_gpa)
+}
+
+fn replaced_plan_fixture(
+    page_shift: u32,
+    packed: bool,
+    cached: bool,
+) -> (DeviceState, FakeHost, PagesVouched, [u64; 4]) {
+    let old_pfn = 0x6110;
+    let new_pfn = 0x6120;
+    let page_size = 1usize << page_shift;
+    let (mut state, mut host, old_gpa) = span_fixture_with_shift(old_pfn, page_shift, 2);
+    host.strict_linux_map = !packed;
+    let pfns = [
+        old_pfn,
+        old_pfn + 1,
+        new_pfn,
+        new_pfn + if packed { 1 } else { 2 },
+    ];
+    let pages = pfns.map(|pfn| (pfn as u64) << page_shift);
+    assert_eq!(old_gpa, pages[0]);
+    if packed {
+        host.map_range(pages[2], 2 * page_size, 0x55);
+    } else {
+        for gpa in &pages[2..] {
+            host.map_range(*gpa, page_size, 0x55);
+        }
+    }
+    assert!(resolve_mapping_backing(&mut state, &host, 3));
+    if cached {
+        assert!(ensure_contig_view(&mut state, &mut host, 3).is_some());
+    }
+    let vouched = vouch_mapping_pages_verdict(&mut state, &host, 3)
+        .1
+        .expect("the original plan has a token");
+    for (index, pfn) in pfns[2..].iter().enumerate() {
+        put_u32(
+            &mut host,
+            TABLE_GPA + 4 * index as u64,
+            (*pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+        );
+    }
+    assert!(
+        vouched.covers(&state, 3),
+        "the guest changed its table, not the cached plan"
+    );
+    (state, host, vouched, pages)
+}
+
+fn assert_plan_pages_untouched(host: &FakeHost, pages: &[u64]) {
+    for &gpa in pages {
+        let mut bytes = [0; 16];
+        host.read_gpa(gpa, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x55; 16], "the refused write touched GPA {gpa:#x}");
+    }
+}
+
+#[test]
+fn mapping_copy_refuses_page_plan_refreshed_after_vouch() {
+    for page_shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        for packed in [true, false] {
+            for cached in [false, true] {
+                let (mut state, mut host, vouched, pages) =
+                    replaced_plan_fixture(page_shift, packed, cached);
+                let capture = crate::observe::sink::FailCapture::start();
+                let wrote = write_mapping_bytes(&mut state, &mut host, 3, 0, &[0x41; 16], &vouched);
+                assert!(
+                    !vouched.covers(&state, 3),
+                    "the resolver must discover the replacement"
+                );
+                assert!(
+                    !wrote,
+                    "old write authority crossed a refresh: shift={page_shift} packed={packed} cached={cached}"
+                );
+                assert!(
+                    capture
+                        .lines()
+                        .iter()
+                        .any(|line| line.contains("reason=vouch_stale"))
+                );
+                assert_plan_pages_untouched(&host, &pages);
+                let current = vouch_mapping_pages_verdict(&mut state, &host, 3).1.unwrap();
+                assert!(write_mapping_bytes(
+                    &mut state,
+                    &mut host,
+                    3,
+                    0,
+                    &[0x42; 16],
+                    &current
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn mapped_rect_refuses_page_plan_refreshed_after_vouch() {
+    for page_shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        for packed in [true, false] {
+            for cached in [false, true] {
+                let (mut state, mut host, vouched, pages) =
+                    replaced_plan_fixture(page_shift, packed, cached);
+                let capture = crate::observe::sink::FailCapture::start();
+                let wrote = crate::runtime::mapping_write::write_full_rect_raw_at(
+                    &mut state,
+                    &mut host,
+                    3,
+                    0,
+                    16,
+                    1u64 << page_shift,
+                    4,
+                    1,
+                    4,
+                    &[0x41; 16],
+                    16,
+                );
+                assert!(
+                    !vouched.covers(&state, 3),
+                    "the resolver must discover the replacement"
+                );
+                assert!(
+                    !wrote,
+                    "the view exposed a replacement plan: shift={page_shift} packed={packed} cached={cached}"
+                );
+                assert!(
+                    capture
+                        .lines()
+                        .iter()
+                        .any(|line| line.contains("reason=vouch_stale"))
+                );
+                assert_plan_pages_untouched(&host, &pages);
+            }
+        }
+    }
+}
+
+#[test]
+fn unchanged_pixels_cannot_publish_a_page_plan_refreshed_after_vouch() {
+    for page_shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        for packed in [true, false] {
+            for cached in [false, true] {
+                let (mut state, mut host, vouched, pages) =
+                    replaced_plan_fixture(page_shift, packed, cached);
+                let mapping = state.mappings.get_mut(&3).unwrap();
+                mapping.has_geom = true;
+                mapping.width = 4;
+                mapping.height = 1;
+                mapping.format = crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+                let desc = &mut mapping.device_desc;
+                st32(
+                    &mut desc[iosurface_pages::DEVICE_DESC_PIXEL_FORMAT..],
+                    crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM as u32,
+                );
+                let dims = 0x0000_0100_0000_0400u64;
+                assert_eq!(iosurface_pages::dims_extent(dims), (4, 1));
+                desc[iosurface_pages::DEVICE_DESC_DIMS..iosurface_pages::DEVICE_DESC_DIMS + 8]
+                    .copy_from_slice(&dims.to_le_bytes());
+                st32(&mut desc[iosurface_pages::DEVICE_DESC_BPR..], 128);
+                desc[iosurface_pages::DEVICE_DESC_BPE..iosurface_pages::DEVICE_DESC_BPE + 2]
+                    .copy_from_slice(&4u16.to_le_bytes());
+                host.write_gpa(DESC_KVA, desc).unwrap();
+                assert!(crate::runtime::surface_cache::frame_generation(&state, 3, 4, 1).is_none());
+                let pixels = [0x55; 16];
+                let wrote = crate::runtime::mapping_write::write_rgba8_image_changed(
+                    &mut state,
+                    &mut host,
+                    3,
+                    &pixels,
+                    Some(&pixels),
+                    4,
+                    1,
+                    crate::runtime::mapping_write::FramePublication::HostCache,
+                );
+                assert!(!vouched.covers(&state, 3));
+                assert!(
+                    !wrote,
+                    "unchanged bytes do not authorize replacement pages: shift={page_shift} packed={packed} cached={cached}"
+                );
+                assert_plan_pages_untouched(&host, &pages);
+                assert!(
+                    crate::runtime::surface_cache::frame_generation(&state, 3, 4, 1).is_none(),
+                    "a refused Store cannot publish a frame for the replacement mapping"
+                );
+                assert!(crate::runtime::mapping_write::write_rgba8_image_changed(
+                    &mut state,
+                    &mut host,
+                    3,
+                    &pixels,
+                    Some(&pixels),
+                    4,
+                    1,
+                    crate::runtime::mapping_write::FramePublication::HostCache,
+                ));
+                assert!(crate::runtime::surface_cache::frame_generation(&state, 3, 4, 1).is_some());
+                assert_plan_pages_untouched(&host, &pages);
+            }
+        }
+    }
+}
+
+#[test]
+fn mapping_read_certifies_full_packed_and_fragmented_destinations() {
+    use reims_vgpu_memory::{ReadBuffer, ReadDestination};
+    use std::mem::MaybeUninit;
+    for shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        let page_size = 1usize << shift;
+        for packed in [false, true] {
+            for cached in [false, true] {
+                let (mut state, mut host, _, pages) =
+                    replaced_plan_fixture(shift, packed, cached);
+                host.write_gpa(pages[2], &vec![0x63; page_size]).unwrap();
+                host.write_gpa(pages[3], &vec![0x64; page_size]).unwrap();
+                let mut storage = vec![MaybeUninit::uninit(); 2 * page_size - 6];
+                let mut destination = ReadBuffer::new(&mut storage);
+                assert!(read_mapping_into(&mut state, &mut host, 3, 3, &mut destination));
+                let bytes = destination.initialized().unwrap();
+                assert_eq!(&bytes[..page_size - 3], vec![0x63; page_size - 3]);
+                assert_eq!(&bytes[page_size - 3..], vec![0x64; page_size - 3]);
+            }
+        }
+    }
+}
+
+#[test]
+fn mapping_read_failure_cannot_certify_a_partial_destination() {
+    use reims_vgpu_memory::{ReadBuffer, ReadDestination};
+    use std::mem::MaybeUninit;
+    for shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        let page_size = 1usize << shift;
+        let (mut state, inner, _, pages) = replaced_plan_fixture(shift, false, false);
+        let mut host = RefuseAndRebindHost {
+            inner,
+            replacement_entry: None,
+            refused_gpa: Some(pages[3]),
+        };
+        let mut storage = vec![MaybeUninit::uninit(); 2 * page_size];
+        let mut destination = ReadBuffer::new(&mut storage);
+        assert!(!read_mapping_into(&mut state, &mut host, 3, 0, &mut destination));
+        assert_eq!(destination.initialized_len(), page_size);
+        assert!(destination.initialized().is_none());
+    }
+}
+
+#[test]
+fn mapping_read_rejects_short_backing_before_certifying_destination() {
+    use reims_vgpu_memory::{ReadBuffer, ReadDestination};
+    use std::mem::MaybeUninit;
+    for shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        let page_size = 1usize << shift;
+        let (mut state, mut host, _) = span_fixture_with_shift(0x6150, shift, 1);
+        let mut storage = vec![MaybeUninit::uninit(); page_size + 1];
+        let mut destination = ReadBuffer::new(&mut storage);
+        assert!(!read_mapping_into(&mut state, &mut host, 3, 0, &mut destination));
+        assert_eq!(destination.initialized_len(), 0);
+        assert!(destination.initialized().is_none());
+    }
+}
+
+struct RefuseAndRebindHost {
+    inner: FakeHost,
+    replacement_entry: Option<u32>,
+    refused_gpa: Option<u64>,
+}
+
+impl HostMemory for RefuseAndRebindHost {
+    fn read_gpa(&self, gpa: u64, buf: &mut [u8]) -> Result<(), MemError> {
+        self.inner.read_gpa(gpa, buf)
+    }
+
+    fn write_gpa(&mut self, gpa: u64, buf: &[u8]) -> Result<(), MemError> {
+        self.inner.write_gpa(gpa, buf)
+    }
+}
+
+impl HostOps for RefuseAndRebindHost {
+    fn mono_ns(&self) -> u64 {
+        0
+    }
+
+    fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
+
+    fn schedule_bh(&mut self) {}
+
+    fn read_kva(&self, kva: u64, buf: &mut [u8]) -> Result<(), MemError> {
+        self.inner.read_kva(kva, buf)
+    }
+
+    fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
+        if self.refused_gpa.is_some_and(|gpa| gpas.contains(&gpa)) {
+            return None;
+        }
+        if let Some(entry) = self.replacement_entry.take() {
+            self.inner
+                .write_gpa(TABLE_GPA, &entry.to_le_bytes())
+                .unwrap();
+            return None;
+        }
+        self.inner.map_pages(gpas, page_size)
+    }
+
+    fn unmap_pages(&mut self, ptr: usize, len: usize) {
+        self.inner.unmap_pages(ptr, len);
+    }
+
+    fn is_ram_gpa(&self, gpa: u64) -> bool {
+        self.inner.is_ram_gpa(gpa)
+    }
+}
+
+#[test]
+fn mapping_copy_refuses_page_plan_refreshed_after_contig_refusal() {
+    for page_shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        let (mut state, mut inner, old_gpa) = span_fixture_with_shift(0x6130, page_shift, 1);
+        let new_pfn = 0x6140;
+        let new_gpa = (new_pfn as u64) << page_shift;
+        inner.map_range(new_gpa, 1usize << page_shift, 0x55);
+        assert!(resolve_mapping_backing(&mut state, &inner, 3));
+        let vouched = vouch_mapping_pages_verdict(&mut state, &inner, 3)
+            .1
+            .unwrap();
+        let mut host = RefuseAndRebindHost {
+            inner,
+            replacement_entry: Some((new_pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID),
+            refused_gpa: None,
+        };
+        let capture = crate::observe::sink::FailCapture::start();
+        assert!(!write_mapping_bytes(
+            &mut state,
+            &mut host,
+            3,
+            0,
+            &[0x41; 16],
+            &vouched
+        ));
+        assert!(
+            host.replacement_entry.is_none(),
+            "the failed import must perform the rebind"
+        );
+        assert!(
+            !vouched.covers(&state, 3),
+            "the fallback must discover the replacement"
+        );
+        assert!(
+            capture
+                .lines()
+                .iter()
+                .any(|line| line.contains("reason=vouch_stale"))
+        );
+        assert_plan_pages_untouched(&host.inner, &[old_gpa, new_gpa]);
+    }
 }
 
 #[test]
@@ -1355,6 +1723,24 @@ fn an_object_list_gva_is_not_compared_against_surface_physical_pages() {
 /// control structures at once names the same one it always did. The walk is
 /// per task, so task 1's directory is reported before task 2's — which a
 /// flat "collect every control page then sort" would silently lose.
+#[test]
+fn every_page_of_the_declared_mapper_ring_is_control_storage() {
+    for shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        let state = DeviceState::new(DeviceId(1), shift);
+        let page = state.page_size();
+        let base = 0x300_000;
+        state.iosfc.set_ring_base(base);
+        state.iosfc.set_capacity((2 * page / MAPPER_REQUEST_ENTRY_LEN as u64) as u32);
+        assert_eq!(
+            first_control_page_collision(&state, &[base + page]),
+            Some((base + page, "iosfc_ring")),
+        );
+        assert_eq!(first_control_page_collision(&state, &[base + 2 * page]), None);
+        state.iosfc.set_ring_base(base + 16);
+        assert_eq!(first_control_page_collision(&state, &[base]), Some((base, "iosfc_ring")));
+    }
+}
+
 #[test]
 fn a_surface_colliding_with_several_control_structures_names_the_first() {
     let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);

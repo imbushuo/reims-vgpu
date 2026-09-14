@@ -111,3 +111,126 @@ the way a drag probe can: there is no "the window never moved" check, because
 there is no host-driven motion to check. Confirm the page is live from the
 screenshot the surrounding harness takes, and from `present_hz` being nowhere
 near zero.
+
+## Window state and idle controls
+
+Close Safari's address-field/Favorites popover before scoring the page. Its
+translucent backdrop adds a different compositing workload. Verify the requested
+windowed or full-screen state in a host-owned capture: sending a shortcut is not
+confirmation, and pressing Escape after entering full screen can leave it again.
+
+For long performance runs, record the **guest's** display-idle setting. Host
+`caffeinate` does not prevent guest display sleep. A disposable guest overlay can
+use `sudo pmset -a displaysleep 0` without changing the backing image.
+
+The page's on-screen FPS counter measures `requestAnimationFrame`, not delivery
+to the host display. On the arm64 Cocoa path, use display-FIFO `present_arrived`
+progress and actual host captures; `window_publish` measures the separate
+host-window path. Record any recovery input as a stall, not as a successful
+uninterrupted interval.
+
+Device present arrival is not proof of host delivery. On Cocoa,
+`reims_vgpu_mmio_scanout` records a completed copy into the console surface;
+`cocoa_frame_update` records a notification reaching the main thread, and
+`cocoa_frame_draw` records the corresponding bitmap drawing work. Count distinct
+nonzero draw sequences, not every draw callback: cursor or exposure redraws can
+repeat the same sequence. `console_refresh` reports the listener interval.
+These distinguish a renderer bottleneck from host coalescing; Cocoa drawing
+still is not a measurement of physical panel scanout.
+
+## Comparing Metal data-movement changes
+
+Keep cold-start and warmed measurements separate, and record the VM's age and
+actual window bounds for each interval. A later, warmed interval is not a
+matched control for a freshly opened page. Keep compilation and other host
+loads outside scored windows.
+
+`REIMS_VGPU_METAL_GPU_WRITEBACK=off` disables mapped GPU Stores for a same-binary
+comparison. Check `metal_gpu_writebacks` on the animation itself: a passing
+standalone Store case does not prove the page uses that route.
+
+`metal_packed_sampled_reuses` and `metal_packed_sampled_reuse_bytes` describe
+native texture-upload reuse, not necessarily avoided guest reads. The
+exact-byte comparison path still reads and converts the guest image. Likewise,
+native input direct fills remove an intermediate copy, not every source read
+or initialization write. Compare their byte counters and total draw cost.
+Upload preparation can move between `engine_us` and `sampled_us`; a smaller
+single phase is not by itself a reduction in total work.
+
+The direct mapped-texture read-elision route has separate
+`metal_packed_mapping_guest_bytes_avoided` and
+`metal_packed_mapping_extra_audit_bytes` counters. Subtract the latter to obtain
+net guest traffic saved: audits on cache misses, including post-fill audits,
+are additional reads rather than savings. The ordinary full-staging fallback
+still applies when the mapping or freshness proof is unavailable.
+
+`REIMS_VGPU_METAL_INPUT_SNAPSHOT_REUSE=off` disables private native input
+snapshot reuse for a same-binary comparison. Its reuse capability is confined
+to a live decoded render pass; an unchanged dirty-harvest observation alone
+does not establish freshness across completed commands. Unscoped requests
+retain ordinary capture.
+
+Hosts that cannot report guest writes immediately now use fresh native input
+captures by default, without the snapshot cache's repeated page walks and
+content audits. Allocation and known-zero reuse still apply. Setting the
+snapshot switch to `on` cannot widen that host capability.
+
+Mapped half-float samples use the existing byte-exact RGBA8 conversion kernel
+on the render batch's command buffer. This preserves the CPU loader's clamping,
+rounding, NaN, and signed-zero behavior without a CPU image round trip. Read
+leases survive until actual GPU completion, and mapping retirement is checked
+before submission. `metal_mapped_sample_gpu_conversions` records activation.
+Non-importable samples still use the ordinary checked reader; that reader can
+produce RGBA directly instead of converting through a full BGRA image.
+
+The arm64 console remembers a refresh that found no completed frame. Delivery
+of the next completed action batch satisfies that request without waiting for
+another timer tick. It still coalesces completed frames, never re-reads live
+guest pixels on the refresh clock, and does not make idle screenshots wait for
+future guest work.
+
+For passes with exclusively mapped GPU Stores and no CPU results, rendering
+is submitted before writeback without an intervening CPU wait. Both commands
+use the same Metal queue; writeback completion orders the producer, whose
+status is checked before publication. The submitted render owner retains its
+inputs and waits on error/drop paths. Queries, CPU readbacks, partial Stores,
+and writable texture fallbacks retain synchronous completion.
+`metal_render_store_pipelined` counts the eligible passes.
+
+The HVF host offers a separate current-write observation over its existing
+dirty bitmap. It reads bitmap words, not image bytes, and never clears bits or
+reprotects memory from the rendering thread. A dirty set remains unavailable
+until its generation has advanced and reprotection has completed. All sets
+overlapping the shared dirty-page union are advanced before any bits are
+cleared; unrelated clean sets remain readable during that work. A retained
+address-space view prevents a topology change from passing as unchanged RAM.
+
+This stronger observation permits planar snapshot reuse across render passes.
+When it is unavailable, reuse retains the original command-local bounds;
+changes of observation quality require a fresh capture. Unscoped compute reads
+remain fresh. Other accelerators keep the original delayed-observation path.
+
+Dismiss transient notifications before scoring and retain setup captures.
+In particular, the guest's first-run Tips notification adds its own translucent
+backdrop and a large set of non-mapped GPU readbacks. Its presence is a different
+workload, not a slow interval of the unobstructed animation. Do not click an
+empty menu bar and leave it in menu tracking: it blocks AppleScript replies.
+
+## Apple M2 verification, 2026-09-14
+
+Metal rail, macOS 15 guest, 4 vCPUs, 6 GiB guest RAM, 1920x1080 at 60 Hz.
+The unmodified animation was measured for 90 seconds per interval after
+60-second warm-ups, with QEMU visible and transient notifications dismissed
+before scoring:
+
+| Guest window | Device presents/s | Distinct Cocoa draws/s |
+|---|---:|---:|
+| Desktop, 1280x860 | 53.32 | 52.67 |
+| Full-screen, 1920x1080 | 59.73 | 59.42 |
+| Return to desktop, 1280x860 | 55.55 | 54.17 |
+
+These are interval averages, not physical-panel scanout measurements. There
+were no zero-progress intervals or recovery inputs in these scored windows.
+An earlier independent clean run measured 50.58 host draws/s on the warmed
+desktop and 57.51 in full-screen mode. Cold-start shader work is not included
+in the warmed-rate claim.

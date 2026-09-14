@@ -209,6 +209,8 @@ pub struct ReleasedWrite {
     pub released_at: u64,
     /// Write census epoch of the write that landed on it afterwards.
     pub wrote_at: u64,
+    pub writer: &'static std::panic::Location<'static>,
+    pub task_span: Option<(u32, u64, u64)>,
 }
 
 /// How many findings the report queue holds between drains.
@@ -228,6 +230,8 @@ struct HitSink<'a> {
     hits: &'a mut Vec<ReleasedWrite>,
     hits_dropped: &'a mut u64,
     page_shift: u32,
+    writer: &'static std::panic::Location<'static>,
+    task_span: Option<(u32, u64, u64)>,
 }
 
 impl HitSink<'_> {
@@ -252,6 +256,8 @@ impl HitSink<'_> {
                     gpa: page << self.page_shift,
                     released_at,
                     wrote_at: at,
+                    writer: self.writer,
+                    task_span: self.task_span,
                 });
             } else {
                 *self.hits_dropped += 1;
@@ -261,6 +267,7 @@ impl HitSink<'_> {
 }
 
 impl PageEpochs {
+    #[track_caller]
     fn note_page_range(&mut self, mut page: u64, mut count: usize, epoch: u64, page_shift: u32) {
         let Self {
             chunks,
@@ -274,6 +281,8 @@ impl PageEpochs {
             hits,
             hits_dropped,
             page_shift,
+            writer: std::panic::Location::caller(),
+            task_span: None,
         };
         while count != 0 {
             let chunk_key = page / EPOCHS_PER_CHUNK as u64;
@@ -340,7 +349,14 @@ impl PageEpochs {
         }
     }
 
-    fn note_pages<I>(&mut self, pages: I, epoch: u64, page_shift: u32)
+    #[track_caller]
+    fn note_pages<I>(
+        &mut self,
+        pages: I,
+        epoch: u64,
+        page_shift: u32,
+        task_span: Option<(u32, u64, u64)>,
+    )
     where
         I: IntoIterator<Item = u64>,
     {
@@ -356,6 +372,8 @@ impl PageEpochs {
             hits,
             hits_dropped,
             page_shift,
+            writer: std::panic::Location::caller(),
+            task_span,
         };
         let mut pages = pages.into_iter().peekable();
         while let Some(gpa) = pages.next() {
@@ -477,36 +495,47 @@ impl HostWrites {
     /// The mapping id is not stored. It was, while the record was a ring that
     /// resolved the page list again at read time and had to refuse once the
     /// mapping moved; capturing the pages here is what retired that refusal.
+    #[track_caller]
     pub fn note_mapping(&mut self, pages: Option<&[u64]>) {
         self.epoch = self.epoch.wrapping_add(1);
         match pages {
             Some(p) => self
                 .pages
-                .note_pages(p.iter().copied(), self.epoch, self.page_shift),
+                .note_pages(p.iter().copied(), self.epoch, self.page_shift, None),
             None => self.pages.note_unknown(self.epoch),
         }
     }
 
     /// Record a write covering exactly `pages` (page-aligned guest addresses).
+    #[track_caller]
     pub fn note_pages(&mut self, pages: Vec<u64>) {
         self.epoch = self.epoch.wrapping_add(1);
-        self.pages.note_pages(pages, self.epoch, self.page_shift);
+        self.pages.note_pages(pages, self.epoch, self.page_shift, None);
+    }
+
+    #[track_caller]
+    pub fn note_task_span(&mut self, task: u32, gva: u64, length: u64, pages: Vec<u64>) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.pages
+            .note_pages(pages, self.epoch, self.page_shift, Some((task, gva, length)));
     }
 
     /// Record an already-resolved page iterator without materializing a second
     /// allocation. The caller retains ownership of the allocation identity;
     /// this type owns only its page-exact epochs.
+    #[track_caller]
     pub fn note_page_iter<I>(&mut self, pages: I)
     where
         I: IntoIterator<Item = u64>,
     {
         self.epoch = self.epoch.wrapping_add(1);
-        self.pages.note_pages(pages, self.epoch, self.page_shift);
+        self.pages.note_pages(pages, self.epoch, self.page_shift, None);
     }
 
     /// Record the exact page runs retained with an admitted guest allocation.
     /// The run partition was derived once with the resource, so a repeated
     /// Store updates slices rather than rebuilding adjacency page by page.
+    #[track_caller]
     pub fn note_footprint(&mut self, footprint: &crate::runtime::guest_ram::GuestPageFootprint) {
         self.epoch = self.epoch.wrapping_add(1);
         if footprint.page_size() != (1u64 << self.page_shift) {
@@ -592,6 +621,34 @@ mod tests {
     use super::*;
 
     const P: u64 = 4096;
+
+    #[test]
+    fn released_write_keeps_the_recording_site_through_iterator_and_range_paths() {
+        let mut writes = HostWrites::default();
+        writes.release_page(P);
+        let iterator_line = line!() + 1;
+        writes.note_page_iter([P]);
+        let hit = writes.take_released_writes().pop().unwrap();
+        assert_eq!(hit.writer.file(), file!());
+        assert_eq!(hit.writer.line(), iterator_line);
+
+        writes.release_page(P);
+        let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(
+            std::sync::Arc::from([P]),
+            P,
+        )
+        .unwrap();
+        let footprint_line = line!() + 1;
+        writes.note_footprint(&footprint);
+        let hit = writes.take_released_writes().pop().unwrap();
+        assert_eq!(hit.writer.file(), file!());
+        assert_eq!(hit.writer.line(), footprint_line);
+
+        writes.release_page(P);
+        writes.note_task_span(7, 0x1234, 32, vec![P]);
+        let hit = writes.take_released_writes().pop().unwrap();
+        assert_eq!(hit.task_span, Some((7, 0x1234, 32)));
+    }
 
     /// The record rules a window in and out by page, and a reader that already
     /// saw a write is not invalidated by it.

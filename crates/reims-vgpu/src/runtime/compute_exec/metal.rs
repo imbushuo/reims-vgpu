@@ -13,6 +13,8 @@
 
 use super::*;
 
+mod planar;
+
 /// This rail's half of a staged compute texture. See [`RailStage`].
 ///
 /// [`RailStage`]: crate::runtime::compute_exec::RailStage
@@ -29,14 +31,34 @@ pub(crate) struct MetalStage {
 impl RailStage for MetalStage {
     fn supports_planar_samples() -> bool { true }
 
+    fn stage_planar_source<M: HostMemory + HostOps>(
+        state: &mut DeviceState,
+        host: &mut M,
+        source: &PlanarSource,
+    ) -> Result<Self, ComputeStatus> {
+        Ok(Self {
+            texture_ref: source.texture_ref,
+            planar: Some(planar::stage(state, host, source)?),
+        })
+    }
+
     fn stage_planar(
         texture_ref: u32,
         description: crate::protocol::planar::TextureDescription,
         layout: crate::protocol::planar::Layout,
-        planes: [Vec<u8>; 2],
+        fill: impl FnOnce([&mut dyn reims_vgpu_memory::ReadDestination; 2])
+            -> Result<(), ComputeStatus>,
     ) -> Result<Self, ComputeStatus> {
-        let image = crate::backend::metal::planar::SampledImage::new(description, layout, planes)
-            .map_err(|reason| ComputeStatus::Unsupported(reason.slug()))?;
+        use crate::backend::metal::planar::{FillError, SampledImage};
+        let device = crate::backend::metal::runtime::system_device()
+            .ok_or(ComputeStatus::NoMetal("metal_planar_device_unavailable"))?;
+        let image = SampledImage::fill(device, description, layout, fill).map_err(|error| {
+            match error {
+                FillError::Layout(reason) => ComputeStatus::Unsupported(reason.slug()),
+                FillError::Native(reason) => ComputeStatus::RailRefused(reason),
+                FillError::Source(reason) => reason,
+            }
+        })?;
         Ok(Self { texture_ref, planar: Some(std::sync::Arc::new(image)) })
     }
 
@@ -163,25 +185,37 @@ pub(crate) fn split_staged_textures(
 
 /// A fragment binding can reuse precisely the compute rail's checked whole-
 /// surface staging. `None` means this is not a direct composite type11 texture.
+#[cfg(test)]
 pub(crate) fn try_stage_planar_sampled<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
 ) -> Result<Option<std::sync::Arc<crate::backend::metal::planar::SampledImage>>, ComputeStatus> {
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
+    try_stage_planar_sampled_in_scope(state, host, task_id, texture_ref, None)
+}
+
+/// Rendering can carry the issuing pass's revocable snapshot permission.
+/// Without it, the same checked plane reader runs but cannot reuse an old copy.
+pub(crate) fn try_stage_planar_sampled_in_scope<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    scope: Option<&crate::runtime::draw::SnapshotScopeRef>,
+) -> Result<Option<std::sync::Arc<crate::backend::metal::planar::SampledImage>>, ComputeStatus> {
+    let Ok(resource) = objects::resolve_resource(state, host, task_id, texture_ref) else {
         return Ok(None);
     };
-    if entry.object_type != crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE {
+    if resource.entry.object_type != crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE {
         return Ok(None);
     }
-    let Some(descriptor) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return Ok(None);
-    };
-    if crate::protocol::planar::type11_sample_format(&descriptor).is_none() {
+    if crate::protocol::planar::type11_sample_format(&resource.descriptor).is_none() {
         return Ok(None);
     }
-    let staged = stage_texture_raw::<MetalStage, _>(state, host, task_id, texture_ref, 0, false)?;
+    let staged = stage_texture_raw_in_scope::<MetalStage, _>(
+        state, host, task_id, texture_ref, 0, false, scope,
+    )?;
     staged.rail.planar.map(Some)
         .ok_or(ComputeStatus::Unsupported("planar_staging_missing"))
 }

@@ -26,6 +26,26 @@ if CommandLine.arguments.contains("--integer-clear-only") {
     finish()
 }
 
+if CommandLine.arguments.contains("--mapper-ring-wrap-only") {
+    mapperRingWrapCase()
+    finish()
+}
+
+if CommandLine.arguments.contains("--mapped-store-cpu-only") {
+    mappedStoreCpuVisibilityCase()
+    finish()
+}
+
+if CommandLine.arguments.contains("--cpu-surface-sampling-only") {
+    cpuSurfaceSamplingCases()
+    finish()
+}
+
+if CommandLine.arguments.contains("--gpu-published-cpu-surface-sampling-only") {
+    cpuSurfaceSamplingCases(gpuSeeded: true)
+    finish()
+}
+
 if CommandLine.arguments.contains("--topology-only") {
     _ = library
     report("shader_compile", true, "runtime library built")
@@ -72,6 +92,19 @@ if CommandLine.arguments.contains("--indexed-draw-only") {
     finish()
 }
 
+if CommandLine.arguments.contains("--render-input-buffers-only") {
+    _ = library
+    report("shader_compile", true, "runtime library built")
+    vertexBufferCase()
+    fragmentBufferCase()
+    indexedDrawCases()
+    renderBarrierCase()
+    encoderBindingLifetimeCase()
+    defaultCommandBufferRetainsResourceCase()
+    indirectCommandMutationCase()
+    finish()
+}
+
 // Shaderless by construction. A mismatch in either case is driver-owned, and
 // still runs if a later shader-library build exposes a translator failure.
 integerClearCases()
@@ -84,6 +117,10 @@ report("shader_compile", true, "runtime library built")
 topologyCases()
 
 floatSamplingCases()
+
+cpuSurfaceSamplingCases()
+
+cpuSurfaceSamplingCases(gpuSeeded: true)
 
 alphaSurfaceRenderCases(64, 32)
 alphaSurfaceRenderCases(702, 576)
@@ -299,6 +336,9 @@ blitIOSurfaceSourceCase(1024, 768, frames: 8)
 blitIOSurfaceSourceCase(1920, 1080, frames: 4)
 
 blitBufferBackedCase(512, 512)
+
+mapperRingWrapCase()
+mappedStoreCpuVisibilityCase()
 
 // A device-wide waiter-first scheduling defect can stop all later work, so
 // this bounded probe deliberately closes the battery.

@@ -53,10 +53,11 @@
 
 use crate::backend::metal::raw_metal;
 use metal::{
-    DeviceRef, MTLPixelFormat, MTLResourceOptions, MTLStorageMode, MTLTextureType, MTLTextureUsage,
+    DeviceRef, MTLPixelFormat, MTLStorageMode, MTLTextureType, MTLTextureUsage,
     Texture, TextureDescriptor,
 };
 use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// How many colour attachments this rail keeps textures for at once.
 ///
@@ -150,6 +151,7 @@ struct Slot<T> {
     /// Use order, for eviction. Not a timestamp: a counter cannot go backwards
     /// and needs no clock.
     used: u64,
+    readers: Arc<()>,
 }
 
 struct Registry<T> {
@@ -184,6 +186,10 @@ impl<T: Clone> Registry<T> {
         let now = self.tick();
         let idx = self.position(key)?;
         let entry = &mut self.entries[idx];
+        if Arc::strong_count(&entry.readers) != 1 {
+            crate::runtime::drain::note_store_route("metal_resident_sample_held");
+            return None;
+        }
         entry.used = now;
         let holds_prior = content_gen != 0 && entry.content_gen == content_gen;
         entry.content_gen = 0;
@@ -208,22 +214,34 @@ impl<T: Clone> Registry<T> {
         Some(entry.payload.clone())
     }
 
+    fn sample_published(&mut self, key: &ResidentColorKey, content_gen: u64) -> Option<(T, Arc<()>)> {
+        let payload = self.borrow_published(key, content_gen)?;
+        let entry = &self.entries[self.position(key)?];
+        Some((payload, entry.readers.clone()))
+    }
+
     fn admit(&mut self, key: ResidentColorKey, payload: T, bytes: u64) {
         let now = self.tick();
-        if let Some(idx) = self.position(&key) {
+        let readers = if let Some(idx) = self.position(&key) {
             // A key whose target was evicted between a caller's lookup and
             // here, or a geometry this rail re-created. Replace rather than
             // duplicate: two entries under one key would make `current` answer
             // from whichever the scan reached first.
             let old = self.entries.swap_remove(idx);
             self.bytes = self.bytes.saturating_sub(old.bytes);
-        }
+            // `retain_completed` can re-admit the same allocation. Replacing
+            // its entry must not bypass outstanding sampling leases.
+            old.readers
+        } else {
+            Arc::new(())
+        };
         self.entries.push(Slot {
             key,
             payload,
             bytes,
             content_gen: 0,
             used: now,
+            readers,
         });
         self.bytes = self.bytes.saturating_add(bytes);
         self.trim();
@@ -297,6 +315,8 @@ static REGISTRY: Mutex<Registry<Texture>> = Mutex::new(Registry::new());
 /// whose *content* is not, which is the pass that uploads a seed into a target
 /// it did not have to allocate. Spending one answer for the other is the whole
 /// hazard, so they arrive together and neither can be read without the other.
+/// An outstanding sampled read lease returns `None`: a writer must use a
+/// different allocation rather than mutate pixels a submitted draw may read.
 ///
 /// `content_gen` must be a generation the caller read from the surface cache
 /// *and* found current under the seed door's evidence standard. A caller that
@@ -341,6 +361,84 @@ pub fn borrow_published(key: &ResidentColorKey, content_gen: u64) -> Option<Text
     REGISTRY.lock().borrow_published(key, content_gen)
 }
 
+/// Read-only published pixels retained until the sampling command completes.
+///
+/// A live reader prevents `take` from lending this allocation to a writer.
+/// Replacement/eviction can remove the registry entry but not these pixels:
+/// a subsequent render must allocate its own target while this lease is held.
+/// A packed snapshot is immutable by construction instead: it has no registry
+/// writer to exclude, and its Arc is the entire publication lease.
+#[derive(Clone, Debug)]
+pub(crate) struct PublishedSample {
+    source: PublishedSource,
+}
+
+#[derive(Clone, Debug)]
+enum PublishedSource {
+    Resident {
+        texture: Texture,
+        _reader: Arc<()>,
+        byte_len: u64,
+    },
+    Packed(Arc<super::packed::SampledImage>),
+}
+
+impl PublishedSample {
+    pub(crate) fn packed(image: Arc<super::packed::SampledImage>) -> Self {
+        Self { source: PublishedSource::Packed(image) }
+    }
+
+    pub(crate) fn texture(&self) -> &metal::TextureRef {
+        match &self.source {
+            PublishedSource::Resident { texture, .. } => texture,
+            PublishedSource::Packed(image) => image.texture(),
+        }
+    }
+
+    pub(crate) fn byte_len(&self) -> u64 {
+        match &self.source {
+            PublishedSource::Resident { byte_len, .. } => *byte_len,
+            PublishedSource::Packed(image) => image.byte_len(),
+        }
+    }
+}
+
+fn is_rgba8_frame(key: &ResidentColorKey, texture: &metal::TextureRef) -> bool {
+    key.pixel_format == 0
+        && key.width != 0
+        && key.height != 0
+        && texture.pixel_format() == MTLPixelFormat::RGBA8Unorm
+        && texture.texture_type() == MTLTextureType::D2
+        && texture.width() == u64::from(key.width)
+        && texture.height() == u64::from(key.height)
+        && texture.depth() == 1
+        && texture.mipmap_level_count() == 1
+        && texture.array_length() == 1
+        && texture.sample_count() == 1
+}
+
+/// The same completed frame as `read_published_rgba8`, without linearizing or
+/// copying it. The caller must establish the identical currency witness first.
+pub(crate) fn sample_published_rgba8(
+    key: &ResidentColorKey,
+    content_gen: u64,
+) -> Option<PublishedSample> {
+    let (texture, reader) = REGISTRY.lock().sample_published(key, content_gen)?;
+    if !is_rgba8_frame(key, &texture) || !texture.usage().contains(MTLTextureUsage::ShaderRead) {
+        return None;
+    }
+    let byte_len = u64::from(key.width)
+        .checked_mul(u64::from(key.height))?
+        .checked_mul(4)?;
+    Some(PublishedSample {
+        source: PublishedSource::Resident {
+            texture,
+            _reader: reader,
+            byte_len,
+        },
+    })
+}
+
 /// This mapping's published frame, read out of the resident colour target as
 /// tight RGBA8.
 ///
@@ -382,6 +480,9 @@ fn read_published_rgba8_pooled(key: &ResidentColorKey, content_gen: u64) -> Opti
     let stride = (key.width as usize).checked_mul(RGBA8_BPP as usize)?;
     let need = stride.checked_mul(key.height as usize)?;
     let texture = borrow_published(key, content_gen)?;
+    if !is_rgba8_frame(key, &texture) {
+        return None;
+    }
     // Priced, because `getBytes:` on a tiled texture is not a memcpy — it
     // linearizes — and this readback replaced a `copy_from_slice` of a host
     // `Vec` for two callers that run about once a frame each. A rail that spends
@@ -433,7 +534,7 @@ pub fn create(
     descriptor.set_height(u64::from(key.height));
     descriptor.set_storage_mode(MTLStorageMode::Shared);
     descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-    let texture = linear_target(device, key, format, bpp, &descriptor)
+    let texture = linear_target(device, bpp, &descriptor)
         .or_else(|| raw_metal::new_texture(device, &descriptor))?;
     REGISTRY.lock().admit(*key, texture.clone(), key.bytes(bpp));
     Some(texture)
@@ -458,21 +559,10 @@ pub fn create(
 /// and a correctness requirement at the ones that do not.
 fn linear_target(
     device: &DeviceRef,
-    key: &ResidentColorKey,
-    format: MTLPixelFormat,
     bpp: usize,
     descriptor: &metal::TextureDescriptorRef,
 ) -> Option<Texture> {
-    let alignment = device.minimum_linear_texture_alignment_for_pixel_format(format);
-    let tight = u64::from(key.width).checked_mul(bpp as u64)?;
-    let bytes_per_row = if alignment == 0 {
-        tight
-    } else {
-        tight.div_ceil(alignment).checked_mul(alignment)?
-    };
-    let length = bytes_per_row.checked_mul(u64::from(key.height))?;
-    let buffer = raw_metal::new_buffer(device, length, MTLResourceOptions::StorageModeShared)?;
-    let texture = raw_metal::new_linear_texture(&buffer, descriptor, 0, bytes_per_row);
+    let texture = raw_metal::new_linear_texture_with_storage(device, descriptor, bpp);
     crate::runtime::drain::note_store_route(if texture.is_some() {
         "metal_resident_linear"
     } else {
@@ -526,6 +616,53 @@ pub fn levels() -> (usize, u64, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampled_publication_prevents_writable_reuse_until_last_reader_drops() {
+        let mut reg = Registry::new();
+        reg.admit(key(1), 11, 64);
+        reg.publish(&key(1), 7);
+        let (_, reader) = reg.sample_published(&key(1), 7).unwrap();
+        let held = reader.clone();
+        assert_eq!(reg.take(&key(1), 7), None);
+        assert_eq!(reg.borrow_published(&key(1), 7), Some(11));
+        drop(reader);
+        assert_eq!(reg.take(&key(1), 7), None);
+        drop(held);
+        assert_eq!(reg.take(&key(1), 7), Some((11, true)));
+
+        reg.publish(&key(1), 8);
+        let (pixels, reader) = reg.sample_published(&key(1), 8).unwrap();
+        reg.admit(key(1), 22, 64);
+        reg.publish(&key(1), 9);
+        assert_eq!(pixels, 11, "replacement must not change a held publication");
+        assert_eq!(reg.take(&key(1), 9), None);
+        drop(reader);
+        assert_eq!(reg.take(&key(1), 9), Some((22, true)));
+    }
+
+    #[test]
+    fn sampled_publication_requires_exact_generation_geometry_and_rgba8_format() {
+        objc::rc::autoreleasepool(|| {
+            let device = crate::backend::metal::runtime::system_device().expect("Metal device");
+            let key = key(0xffff_a111);
+            let texture = create(device, &key, MTLPixelFormat::RGBA8Unorm, 4).unwrap();
+            assert!(sample_published_rgba8(&key, 7).is_none());
+            published(&key, 7);
+            for generation in [0, 8] {
+                assert!(sample_published_rgba8(&key, generation).is_none());
+            }
+            let wrong_geometry = ResidentColorKey { width: 8, ..key };
+            assert!(sample_published_rgba8(&wrong_geometry, 7).is_none());
+            // Even an incorrectly admitted payload cannot reinterpret pixels.
+            let wrong_format = create(device, &key, MTLPixelFormat::RGBA16Float, 8).unwrap();
+            published(&key, 8);
+            assert!(sample_published_rgba8(&key, 8).is_none());
+            assert!(read_published_rgba8(&key, 8).is_none());
+            drop((texture, wrong_format));
+            forget(key.mapping_id);
+        });
+    }
 
     #[test]
     fn autorelease_scanout_readback_keeps_only_the_registered_texture_alive() {

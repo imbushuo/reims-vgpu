@@ -376,9 +376,9 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
 /// The guard is the same question `resolve` asks first, and asking it here
 /// leaves the lazy path to handle a backend that is genuinely late.
 ///
-/// The device-side half is Vulkan-only because only Vulkan has a device-side
-/// half: the Metal-direct arm builds a `newBufferWithBytesNoCopy` per call
-/// against unified memory and holds no per-RAMBlock import to warm.
+/// Whole-RAMBlock device warming is currently Vulkan-only. Metal imports
+/// checked mapped-surface aliases lazily and caches them for their mapping
+/// lifetimes; it does not pin every RAMBlock during this handshake.
 pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
     if granularity().is_none() {
         return;

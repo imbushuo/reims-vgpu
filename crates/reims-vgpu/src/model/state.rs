@@ -3095,6 +3095,7 @@ pub struct DeviceState {
     /// [`crate::runtime::parked::ParkedStore`], which owns the identity of a
     /// parked position and deliberately not its readiness.
     pub parked: crate::runtime::parked::ParkedStore,
+    pub(crate) fifo_progress: crate::runtime::drain::census::fifo_progress::FifoProgress,
     /// Child channels whose head `EXEC_INDIRECT2` packet is held while an
     /// immutable AIR translation is still loading. The packet head and stamp
     /// remain untouched until retry, so this is scheduler state rather than a
@@ -3616,6 +3617,7 @@ impl DeviceState {
                 reims_vgpu_core::identity::SessionId(id.0 as u32),
             )),
             parked: crate::runtime::parked::ParkedStore::new(),
+            fifo_progress: Default::default(),
             translation_deferred_mask: 0,
             translation_order_hold_mask: 0,
             translation_order_holds: 0,
@@ -4634,6 +4636,14 @@ impl DeviceState {
     #[must_use = "a position taken off the ready list and not run is a packet that never runs"]
     pub fn take_ready(&self) -> Vec<reims_vgpu_core::identity::IngressOrdinal> {
         self.session.lock().expect("session").take_ready()
+    }
+
+    /// Measurement only. Contention/poisoning is unknown, never a drained model.
+    pub(crate) fn pending_transactions_for_observation(&self) -> Option<usize> {
+        self.session
+            .try_lock()
+            .ok()
+            .map(|session| session.scheduler().pending())
     }
 
     /// A transaction finished on the host.
@@ -5718,6 +5728,7 @@ impl DeviceState {
 
     /// The same, for a writer that walked the guest page tables and so knows
     /// exactly which pages it landed in even though it names no mapping.
+    #[track_caller]
     pub fn note_host_wrote_pages(&mut self, pages: Vec<u64>) {
         self.host_writes.note_pages(pages);
     }
@@ -5761,6 +5772,7 @@ impl DeviceState {
     }
 
     /// The same, for a writer that knows which mapping's pages it is landing in.
+    #[track_caller]
     pub fn note_host_wrote_mapping(&mut self, mapping_id: u32) {
         let Some(entries) = self
             .mappings
@@ -6164,6 +6176,16 @@ mod device_access_tests {
     const TASK: u32 = 3;
     const DOMAIN: ChannelId = ChannelId(1);
     const BACKING: BackingId = BackingId(0x4000);
+
+    #[test]
+    fn checkpoint_pending_snapshot_is_nonblocking() {
+        let state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let held = state.session.lock().unwrap();
+        assert_eq!(state.pending_transactions_for_observation(), None);
+        assert_eq!(held.scheduler().pending(), 0);
+        drop(held);
+        assert_eq!(state.pending_transactions_for_observation(), Some(0));
+    }
 
     /// A device with one task holding one dedicated resource, and that
     /// resource's name.

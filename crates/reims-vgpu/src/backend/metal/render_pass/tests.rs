@@ -4,6 +4,93 @@ use metal::*;
 
 mod r32float;
 mod batching;
+mod gpu_store;
+
+#[test]
+fn deferred_pass_keeps_initial_store_pages_after_guest_rewire() {
+    use crate::runtime::draw::buffer_read_tests::Fixture;
+    use crate::model::PAGE_SHIFT_ARM64E;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_STORE;
+    let mut fixture = Fixture::new(PAGE_SHIFT_ARM64E);
+    let mut req = DrawEncodeRequest {
+        task_id: 1,
+        render_pass_continues: true,
+        colors: vec![ColorRtRequest {
+            texture_ref: 7,
+            storage: ColorStorage::GuestBacked,
+            target_gva: fixture.page,
+            width: 4,
+            height: 2,
+            row_stride: 16,
+            format: MTLPixelFormat::RGBA8Unorm as u16,
+            sample_count: 1,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: MTL_STORE_ACTION_STORE,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut pass = MetalRenderPass::default();
+    pass.prepare(&req).unwrap();
+    pass.capture_store_pages(&fixture.state, &fixture.host, &req);
+    pass.completed(&mut req, &mut None);
+    fixture.host.write_gpa(3 * fixture.page + 4, &13u32.to_le_bytes()).unwrap();
+    req.continues_render_pass = true;
+    req.render_pass_continues = false;
+    req.colors[0].load_action = MTL_LOAD_ACTION_LOAD;
+    pass.prepare(&req).unwrap();
+    pass.capture_store_pages(&fixture.state, &fixture.host, &req);
+    let pages = pass.target(&req.colors[0]).unwrap().store_pages.as_ref().unwrap();
+    assert!(pages.membership().contains(&(8 * fixture.page)));
+    assert!(!pages.membership().contains(&(13 * fixture.page)));
+    assert_eq!(
+        crate::runtime::draw::write_gva_rgba8_within(
+            &mut fixture.state, &mut fixture.host, 1, fixture.page, 4, 2, 16,
+            MTLPixelFormat::RGBA8Unorm as u16, &[0xff; 32], Some(pages.membership()),
+        ),
+        Err(crate::runtime::host::MemError::WriteOutsideWindow),
+    );
+    let mut untouched = [0; 32];
+    fixture.host.read_gpa(13 * fixture.page, &mut untouched).unwrap();
+    assert_eq!(untouched, [0x22; 32]);
+}
+
+#[test]
+fn deferred_pass_does_not_acquire_store_permission_from_a_later_mapping() {
+    use crate::runtime::draw::buffer_read_tests::Fixture;
+    use crate::model::PAGE_SHIFT_ARM64E;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_STORE;
+    let mut fixture = Fixture::new(PAGE_SHIFT_ARM64E);
+    let mut req = DrawEncodeRequest {
+        task_id: 1,
+        render_pass_continues: true,
+        colors: vec![ColorRtRequest {
+            texture_ref: 7,
+            target_gva: fixture.page * 4,
+            width: 4,
+            height: 2,
+            row_stride: 16,
+            format: MTLPixelFormat::RGBA8Unorm as u16,
+            sample_count: 1,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: MTL_STORE_ACTION_STORE,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut pass = MetalRenderPass::default();
+    pass.prepare(&req).unwrap();
+    pass.capture_store_pages(&fixture.state, &fixture.host, &req);
+    pass.completed(&mut req, &mut None);
+    fixture.host.write_gpa(3 * fixture.page + 4 * 4, &13u32.to_le_bytes()).unwrap();
+    req.continues_render_pass = true;
+    req.render_pass_continues = false;
+    req.colors[0].load_action = MTL_LOAD_ACTION_LOAD;
+    pass.prepare(&req).unwrap();
+    pass.capture_store_pages(&fixture.state, &fixture.host, &req);
+    let pages = pass.target(&req.colors[0]).unwrap().store_pages.as_ref().unwrap();
+    assert!(pages.membership().is_empty());
+}
 
 fn weak_texture(texture: &Texture) -> objc::rc::WeakPtr {
     use foreign_types::ForeignType;

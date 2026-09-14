@@ -15,6 +15,44 @@ CASE <name> PASS|FAIL|SKIP <detail>
 SUMMARY cases=N failures=N skipped=N
 ```
 
+`--mapper-ring-wrap-only` runs a shaderless IOSurface lifetime regression: 2,048
+distinct targets are allocated, cleared, read back, and released. This exercises
+repeated mapper-ring revolutions without depending on browser animation timing.
+The IOSFC capacity counts entries; growing producer/consumer counters must not
+be used as linear memory indices.
+
+`--mapped-store-cpu-only` renders 256 colors into an IOSurface-backed target and
+reads its CPU memory after command completion, without a GPU sampling/readback
+command that could hide delayed guest-memory publication.
+
+`--cpu-surface-sampling-only` updates BGRA8 and RGBA16Float IOSurfaces under
+CPU lock/unlock, samples each update in a separate command buffer, waits for
+completion, and checks all output pixels. Each format runs 256 updates. The
+shaders use no vertex or constant input buffers, isolating texture freshness
+from the input-snapshot cache. Matching harvested dirty generations alone do
+not establish freshness across these completed commands.
+
+`--gpu-published-cpu-surface-sampling-only` tests the separate publication path:
+each iteration first renders a genuine GPU frame into the source IOSurface and
+waits for completion, then CPU-locks/updates/unlocks it and samples the new
+pixels. No input buffers or synthetic frame stamps participate. On mismatch,
+`source_cpu_after` distinguishes an unchanged CPU source paired with stale
+sampling from source bytes overwritten by later device work. A native PASS
+alone does not establish which guest producer/invalidations route ran.
+
+`probes/current-planar-writes.m` exercises the native composite P010 formats
+`0x1f9` and `0x21f`. It alternates CPU-written luma 256 times and compares an
+existing texture with a newly constructed view of the same IOSurface, after
+each completed command. Both must agree and change on every iteration.
+Run the same binary on the native host and guest:
+
+```sh
+xcrun clang -fobjc-arc -O2 -mmacosx-version-min=15.0 \
+  -framework Foundation -framework Metal -framework CoreVideo -framework IOSurface \
+  conformance/probes/current-planar-writes.m -o /tmp/current-planar-writes
+/tmp/current-planar-writes
+```
+
 ## Reading a result
 
 `verdict.py` applies the table below to a pair of runs and exits non-zero when
@@ -210,6 +248,12 @@ self-dependency alone is not treated as synchronization.
 different shader constants. Each must finish a cold compute pipeline and render
 pipeline; a previous task's equal-numbered object references must not satisfy
 its translation waits or retire its pipelines.
+
+`--render-input-buffers-only` runs the existing vertex/fragment buffer, indexed
+draw, render barrier, encoder binding lifetime, command-buffer resource retention,
+and indirect-command mutation cases. This isolates input binding and lifetime
+coverage without first running the unrelated linear-texture cases. It changes
+neither case expectations nor the full suite's running order.
 
 `--corner-encoder-readiness-only` runs 24 cases: a 12-case corner restore sequence,
 then the same sequence with warm shader translations. It crosses BGRA8/RGBA16Float,

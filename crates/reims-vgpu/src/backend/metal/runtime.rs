@@ -20,11 +20,9 @@
 //! teardown, leaking a VA reservation each time. A RAMBlock-wide import has no
 //! remap view to retain.
 //!
-//! **No importer is wired here yet.** Nothing in this module turns a
-//! `GuestSlice` into an `MTLBuffer`, because no caller would use one — the
-//! staged `Vec` is filled from guest RAM further up, and the seam worth cutting
-//! is there rather than here. Landing an importer without that consumer would
-//! be untestable dead code on an arm no Linux host can run.
+//! Checked guest Store imports live in [`super::guest_writeback`], with mapping
+//! identity and Metal-deallocator retirement. This module's legacy no-copy
+//! helper still handles only caller-owned host staging, not guest imports.
 
 use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 use once_cell::sync::OnceCell;
@@ -32,11 +30,18 @@ use parking_lot::Mutex;
 use std::cell::RefCell;
 
 use crate::backend::metal::util::Status;
+use foreign_types::ForeignType;
 
 static DEVICE: OnceCell<Device> = OnceCell::new();
 static DEFAULT_SAMPLER: Mutex<Option<metal::SamplerState>> = Mutex::new(None);
 thread_local! {
-    static QUEUE: RefCell<Option<CommandQueue>> = const { RefCell::new(None) };
+    static QUEUE: RefCell<Option<ThreadQueue>> = const { RefCell::new(None) };
+}
+
+struct ThreadQueue {
+    device: Device,
+    queue: CommandQueue,
+    inputs: super::input::Owner,
 }
 
 pub fn system_device() -> Option<&'static Device> {
@@ -61,13 +66,28 @@ pub fn system_device_name() -> Option<String> {
 
 /// Per-worker-thread command queue (never one shared process-global queue).
 pub fn thread_queue(device: &Device) -> CommandQueue {
-    QUEUE.with(|q| {
-        if let Some(existing) = q.borrow().as_ref() {
-            return existing.clone();
+    with_thread_queue(device, |owner| owner.queue.clone())
+}
+
+pub(super) fn thread_input_pool(device: &Device) -> super::input::Owner {
+    with_thread_queue(device, |owner| owner.inputs.clone())
+}
+
+fn with_thread_queue<T>(device: &Device, f: impl FnOnce(&ThreadQueue) -> T) -> T {
+    QUEUE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot
+            .as_ref()
+            .is_none_or(|owner| owner.device.as_ptr() != device.as_ptr())
+        {
+            let queue = device.new_command_queue();
+            *slot = Some(ThreadQueue {
+                device: device.clone(),
+                inputs: super::input::Pool::new(queue.clone()),
+                queue,
+            });
         }
-        let queue = device.new_command_queue();
-        *q.borrow_mut() = Some(queue.clone());
-        queue
+        f(slot.as_ref().unwrap())
     })
 }
 

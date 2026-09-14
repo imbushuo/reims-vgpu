@@ -12,6 +12,7 @@ use crate::protocol::fnv::FNV_OFFSET_BASIS;
 use metal::{ComputePipelineState, DepthStencilState, Function, RenderPipelineState, SamplerState};
 use parking_lot::Mutex;
 use reims_vgpu_protocol::compute::TextureWriteRoundingMode;
+use std::sync::Arc;
 
 pub struct FnEntry {
     pub blob: BlobIdentity,
@@ -27,6 +28,9 @@ pub struct FnEntry {
 /// — the ones asking whether two different pipelines can be served as one — ran
 /// nowhere while they sat here. This type is what is left: the identity beside
 /// the objects Metal built from it.
+///
+/// The cache and each prepared draw share one immutable entry, so staging's
+/// reflection and encoding's PSO cannot come from separate resolutions.
 pub struct RenderPsoEntry {
     pub id: RenderPsoIdentity,
     pub pso: RenderPipelineState,
@@ -187,7 +191,7 @@ impl CacheEntry for ComputePsoEntry {
     }
 }
 
-impl CacheEntry for RenderPsoEntry {
+impl CacheEntry for Arc<RenderPsoEntry> {
     type Key<'a> = RenderPsoLookup<'a>;
     fn lookup_key(&self) -> RenderPsoLookup<'_> {
         self.id.as_lookup()
@@ -241,7 +245,7 @@ impl CacheEntry for ReflectEntry {
 
 struct GlobalCaches {
     fn_cache: ContentCache<FnEntry>,
-    render_pso: ContentCache<RenderPsoEntry>,
+    render_pso: ContentCache<Arc<RenderPsoEntry>>,
     compute_pso: ContentCache<ComputePsoEntry>,
     sampler: ContentCache<SamplerCacheEntry>,
     depth_stencil: ContentCache<DepthStencilEntry>,
@@ -329,12 +333,8 @@ pub fn compute_pso_insert(
     })
 }
 
-pub fn render_pso_lookup(key: &RenderPsoLookup<'_>) -> Option<(RenderPipelineState, u32, u32, std::sync::Arc<super::abi::RenderTextureUsages>)> {
-    with_caches(|c| {
-        c.render_pso
-            .find(key)
-            .map(|e| (e.pso.clone(), e.vert_sampler_mask, e.frag_sampler_mask, e.textures.clone()))
-    })
+pub fn render_pso_lookup(key: &RenderPsoLookup<'_>) -> Option<Arc<RenderPsoEntry>> {
+    with_caches(|c| c.render_pso.find(key).cloned())
 }
 
 pub fn render_pso_insert(
@@ -343,21 +343,16 @@ pub fn render_pso_insert(
     vert_mask: u32,
     frag_mask: u32,
     textures: std::sync::Arc<super::abi::RenderTextureUsages>,
-) -> (RenderPipelineState, u32, u32, std::sync::Arc<super::abi::RenderTextureUsages>) {
+) -> Arc<RenderPsoEntry> {
     with_caches(|c| {
-        let entry = c.render_pso.insert_unique(RenderPsoEntry {
+        let entry = c.render_pso.insert_unique(Arc::new(RenderPsoEntry {
             id: RenderPsoIdentity::of(key),
             pso,
             frag_sampler_mask: frag_mask,
             vert_sampler_mask: vert_mask,
             textures,
-        });
-        (
-            entry.pso.clone(),
-            entry.vert_sampler_mask,
-            entry.frag_sampler_mask,
-            entry.textures.clone(),
-        )
+        }));
+        entry.clone()
     })
 }
 

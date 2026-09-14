@@ -167,6 +167,16 @@ pub trait HostMemory {
     fn write_gpa(&mut self, gpa: u64, buf: &[u8]) -> Result<(), MemError>;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The stronger, optional alternative to a delayed dirty-harvest observation.
+/// `Current` carries a nonzero generation; `Unavailable` must never authorize
+/// cross-command reuse. Token zero probes support without observing memory.
+pub enum CurrentGuestWrite {
+    Unsupported,
+    Unavailable,
+    Current(u64),
+}
+
 /// Typed actions for the QEMU main loop (or FakeHost log).
 ///
 /// `#[repr(u32)]` because this enum *is* the `kind` word of the C
@@ -454,19 +464,29 @@ pub trait HostOps {
     /// Release a view obtained from [`HostOps::map_pages`].
     fn unmap_pages(&mut self, _ptr: usize, _len: usize) {}
 
-    /// True when [`HostOps::map_pages`] returns an alias that remains valid
-    /// until its matching [`HostOps::unmap_pages`] call, so it may back a
-    /// retained GPU import.
+    /// Legacy stability guarantee used by borrowed-run and generic import
+    /// consumers. An explicitly owned view must not widen this answer: those
+    /// consumers do not necessarily carry its matching retirement obligation.
     ///
     /// This is a claim about a CPU-side *view* only, and says nothing about the
-    /// GPU rail: guest RAM reaches the GPU by importing the spans
+    /// GPU rail: base RAMBlock imports use the spans
     /// [`HostOps::guest_ram_regions`] names, which are QEMU's own RAMBlock
-    /// mappings and never a view this call built.
+    /// mappings, independently of either page-view capability.
     ///
     /// Default `false` — the conservative answer, so a host that has not
     /// declared stability keeps the portable CPU writeback.
     fn map_pages_stable(&self) -> bool {
         false
+    }
+
+    /// Every successful `map_pages` view remains valid until its matching
+    /// `unmap_pages`. A retaining caller must own that release and defer it
+    /// until the backend has relinquished every GPU reference.
+    ///
+    /// Unlike `map_pages_stable`, this permits caller-owned remaps that must
+    /// be explicitly destroyed. Unknown providers remain copy-backed.
+    fn map_pages_owned(&self) -> bool {
+        self.map_pages_stable()
     }
 
     /// Current packed-alias levels and cumulative lifetime totals. `None`
@@ -603,6 +623,19 @@ pub trait HostOps {
         None
     }
 
+    /// Whether generation reads observe guest writes immediately, rather than
+    /// at a later harvest. Snapshot reuse must not pay repeated page walks and
+    /// byte audits for a host that cannot supply a current freshness witness.
+    fn guest_write_gen_is_current(&self) -> bool {
+        false
+    }
+
+    /// A non-consuming observation excluding writes not yet harvested.
+    /// Token zero probes support only and must never return a current version.
+    fn guest_write_gen_current(&self, _token: u64) -> CurrentGuestWrite {
+        CurrentGuestWrite::Unsupported
+    }
+
     /// Which pages of `token`'s set the host has observed written since
     /// `since_gen`, in ascending GPA order.
     ///
@@ -705,6 +738,8 @@ pub struct FakeHost {
     /// from `strict_linux_map`: packed shape and pointer lifetime are distinct
     /// host contracts.
     pub stable_map_pages: bool,
+    /// Explicit until-unmap ownership, independent of legacy VM stability.
+    pub owned_map_pages: bool,
     /// Number of HostOps page-import attempts (test proxy for import amplification).
     pub map_pages_calls: u64,
     /// Number of page views the runtime explicitly retired.
@@ -755,6 +790,9 @@ pub struct FakeHost {
     /// hundred existing tests are asserting about; a rail that latches a
     /// baseline should turn it on and prove it recovers.
     pub guest_write_startup_window: bool,
+    pub guest_write_deferred: bool,
+    pub guest_write_current_supported: bool,
+    pub guest_write_current_unavailable: bool,
 }
 
 #[cfg(test)]
@@ -1128,6 +1166,11 @@ impl FakeHost {
         }
     }
 
+    /// Actual owned map-pages views, for lifetime/retirement regressions.
+    pub fn owned_page_views(&self) -> &[(usize, usize)] {
+        &self.views
+    }
+
     /// Write a LE u32 at GPA.
     pub fn put_u32(&mut self, gpa: u64, v: u32) {
         let b = v.to_le_bytes();
@@ -1311,6 +1354,22 @@ impl HostMemory for FakeHost {
 
 #[cfg(test)]
 impl HostOps for FakeHost {
+    fn guest_write_gen_current(&self, token: u64) -> CurrentGuestWrite {
+        if !self.guest_write_current_supported {
+            return CurrentGuestWrite::Unsupported;
+        }
+        if self.guest_write_current_unavailable {
+            return CurrentGuestWrite::Unavailable;
+        }
+        self.guest_write_gen(token).map_or(
+            CurrentGuestWrite::Unavailable, CurrentGuestWrite::Current,
+        )
+    }
+
+    fn guest_write_gen_is_current(&self) -> bool {
+        !self.guest_write_deferred
+    }
+
     /// The real ranges this fixture has mapped, as RAMBlocks.
     ///
     /// The default trait impl answers `CallbackMissing`, which puts the guest-RAM
@@ -1382,6 +1441,10 @@ impl HostOps for FakeHost {
 
     fn map_pages_stable(&self) -> bool {
         self.stable_map_pages
+    }
+
+    fn map_pages_owned(&self) -> bool {
+        self.owned_map_pages || self.stable_map_pages
     }
 
     fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {
@@ -1554,6 +1617,9 @@ impl HostOps for FakeHost {
                     })
                 });
             if !remappable {
+                if self.owned_map_pages {
+                    return None;
+                }
                 return self.bounce_view(gpas, page_size);
             }
             let mut srcs = Vec::with_capacity(gpas.len());
@@ -1628,6 +1694,9 @@ impl HostOps for FakeHost {
                 }
             }
             // Scattered pages: bounce + write-back on unmap (test convenience).
+            if self.owned_map_pages {
+                return None;
+            }
             self.bounce_view(gpas, page_size)
         }
     }

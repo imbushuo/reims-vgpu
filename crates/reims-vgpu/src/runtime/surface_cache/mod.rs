@@ -273,6 +273,11 @@ pub fn take_frame_buffer(
 /// The generation of the frame this cache would serve for `surface_id` at this
 /// geometry, without taking the frame.
 ///
+/// This names a historical publication. It is not a currency proof for guest
+/// RAM after command completion: CPU IOSurface updates can precede a dirty
+/// harvest. Current-guest readers go through `draw::published_mapping_frame`,
+/// which refuses a publication without an actual live execution owner.
+///
 /// The identity half of [`get_shared_with_gen`], for a caller that does not want
 /// the bytes. A rail that retains its own copy of a surface's pixels asks this
 /// to decide whether the copy it holds is still the frame the cache holds —

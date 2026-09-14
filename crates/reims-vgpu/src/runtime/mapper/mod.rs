@@ -11,7 +11,7 @@ use crate::backend::Backend as _;
 use crate::model::{DeviceState, MapperCapture};
 use crate::protocol::iosurface_pages::{
     self, build_table_plan, decode_device_surface, decode_mapper_request_entry, guest_kernel_va,
-    mapper_request_published_entry_offset, mapping_span_bound, read_internal_desc_ptr,
+    mapping_span_bound, read_internal_desc_ptr,
     read_mapper_identity, validate_mapper_internal, PagesMemory,
     DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE, MAPPER_CAPTURE_REG_MAPPING_INTERNAL,
     MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
@@ -197,12 +197,27 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
     host: &H,
     producer: u32,
 ) -> Option<MapperCapture> {
-    if producer == 0 || state.iosfc.ring_base() == 0 {
+    if producer == state.iosfc.consumer() || state.iosfc.ring_base() == 0 {
         return None;
     }
-    let entry_off = mapper_request_published_entry_offset(producer)?;
+    let ring = match iosurface_pages::MapperRing::new(state.iosfc.capacity()) {
+        Ok(ring) => ring,
+        Err(error) => {
+            report_ring_error(state, error);
+            return None;
+        }
+    };
+    if let Err(error) = ring.pending(producer, state.iosfc.consumer()) {
+        report_ring_error(state, error);
+        return None;
+    }
+    let entry_off = ring.published_entry_offset(producer);
     let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
-    host.read_gpa(state.iosfc.ring_base() + entry_off, &mut e)
+    let Some(address) = state.iosfc.ring_base().checked_add(entry_off) else {
+        crate::observe::Emit::decline("mapper_capture_ring_address", &MemError::Overflow).fail();
+        return None;
+    };
+    host.read_gpa(address, &mut e)
         .ok()?;
     let request = decode_mapper_request_entry(&e).ok()?;
     if request.request_type != MAPPER_REQUEST_MAP && request.request_type != MAPPER_REQUEST_UNMAP {
@@ -327,6 +342,15 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
         request_type: rtype,
         mapping_internal: internal,
     })
+}
+
+pub(super) fn report_ring_error(state: &DeviceState, error: iosurface_pages::MapperRingError) {
+    crate::runtime::drain::note_store_route(crate::observe::Decline::slug(&error));
+    crate::observe::Emit::decline("mapper_ring", &error)
+        .field("capacity", state.iosfc.capacity())
+        .field("producer", state.iosfc.producer())
+        .field("consumer", state.iosfc.consumer())
+        .fail_once(u64::from(state.iosfc.capacity()));
 }
 
 /// Apply a capture to the mapping named by the just-drained ring entry.
@@ -1446,10 +1470,9 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
 
 /// Release contiguous views whose page tables changed.
 ///
-/// A GPU object can retain a view only when [`HostOps::map_pages_stable`]
-/// promises the address until explicit retirement. A transient view is never
-/// admitted to a backend import, so its only users are CPU copies that finish
-/// inside their own call.
+/// Mapping-owned GPU imports may retain an owned-until-unmap view; borrowed-run
+/// clients still require `map_pages_stable`. Either retained import must release
+/// its GPU references before this owner calls the matching host unmap.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
@@ -1865,14 +1888,15 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
             return Some((gpa, "root_fifo"));
         }
     }
-    // Still the first page only. `iosfc.capacity` would give the ring's extent
-    // the way `fifo_length` does above, but nothing in this crate consumes it —
-    // it is written and read back over MMIO and never bounds anything — so its
-    // units are not established, and sizing a rejection window from a field
-    // whose meaning is a guess is how a legitimate surface gets refused. Bound
-    // it when a consumer settles whether it counts entries or bytes.
-    if state.iosfc.ring_base() != 0 && holds(state.iosfc.ring_base()) {
-        return Some((page_base(state.iosfc.ring_base()), "iosfc_ring"));
+    if state.iosfc.ring_base() != 0 {
+        // Before capacity is programmed only the published base is known.
+        let bytes = iosurface_pages::MapperRing::new(state.iosfc.capacity())
+            .map_or(1, iosurface_pages::MapperRing::byte_len);
+        let base = page_base(state.iosfc.ring_base());
+        let extent = bytes.saturating_add(state.iosfc.ring_base() - base);
+        if let Some(gpa) = holds_range(base, extent) {
+            return Some((gpa, "iosfc_ring"));
+        }
     }
     for ring in &state.child_rings {
         for &gpa in &ring.page_gpas {
@@ -1989,7 +2013,7 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
 /// it. The import therefore follows the mapping lifetime and is reused by all
 /// of those views. Hosts whose page aliases are transient or backends that did
 /// not publish host-pointer import limits retain the copy-backed paths.
-#[cfg(feature = "backend-vulkan")]
+#[cfg(any(feature = "backend-vulkan", feature = "backend-metal"))]
 pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2001,6 +2025,38 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     if !host.map_pages_stable() {
         return None;
     }
+    checked_contig_import_with_footprint(state, host, mapping_id)
+}
+
+/// The owning counterpart to the legacy stable-view import entry point.
+///
+/// `MappingEntry` retains the view and import identity, and its retirement path
+/// retires that import before unmapping. Metal's import deallocator completes
+/// the release handshake; generic borrowed-run consumers do not use this door.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+pub(crate) fn ensure_owned_contig_import_with_footprint<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<(
+    std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    crate::runtime::guest_ram::GuestPageFootprint,
+)> {
+    if !host.map_pages_owned() {
+        return None;
+    }
+    checked_contig_import_with_footprint(state, host, mapping_id)
+}
+
+#[cfg(any(feature = "backend-vulkan", feature = "backend-metal"))]
+fn checked_contig_import_with_footprint<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<(
+    std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    crate::runtime::guest_ram::GuestPageFootprint,
+)> {
     let (ptr, len, _pages) = ensure_contig_view_with_pages(state, host, mapping_id)?;
     let footprint = state.mappings.get(&mapping_id)?.contig_footprint.clone()?;
     let len = u64::try_from(len).ok()?;
@@ -2061,7 +2117,7 @@ pub(crate) fn note_mapping_write_footprint(
 /// These are the pages admitted with a guest-backed GPU resource. Consuming
 /// them directly keeps Store publication tied to the allocation that actually
 /// rendered, even if mutable mapping state changes after admission.
-#[cfg(any(feature = "backend-vulkan", test))]
+#[cfg(any(feature = "backend-vulkan", feature = "backend-metal", test))]
 pub(crate) fn note_physical_page_write_footprint(
     footprint: &crate::runtime::guest_ram::GuestPageFootprint,
     off: u64,
@@ -2184,6 +2240,7 @@ impl RectStride {
 pub(crate) enum RunCopy<'a> {
     Write(&'a [u8]),
     Read(&'a mut [u8]),
+    ReadDestination(&'a mut dyn reims_vgpu_memory::ReadDestination),
     /// A packed buffer into a strided guest rectangle.
     WriteRect(&'a [u8], RectStride),
     /// A strided guest rectangle into a packed buffer.
@@ -2212,6 +2269,7 @@ impl RunCopy<'_> {
         match self {
             Self::Write(buf) => buf.len(),
             Self::Read(buf) => buf.len(),
+            Self::ReadDestination(buf) => buf.len(),
             Self::WriteRect(_, rect) | Self::ReadRect(_, rect) => rect.span(),
         }
     }
@@ -2255,6 +2313,9 @@ impl RunCopy<'_> {
                     buf.as_mut_ptr().add(buf_off),
                     n,
                 );
+            },
+            Self::ReadDestination(buf) => unsafe {
+                buf.copy_from_raw(buf_off, (host_ptr as *const u8).add(host_off), n);
             },
             Self::WriteRect(buf, rect) => {
                 rect.for_each_piece(buf_off, host_off, n, |packed_off, host_at, len| unsafe {
@@ -2353,6 +2414,14 @@ pub(crate) fn selected_within(
         )
 }
 
+/// Mapping writes carry their authority through every page-plan resolution.
+enum MappingCopy<'a> {
+    Write(&'a [u8], &'a PagesVouched),
+    Read(&'a mut [u8]),
+    ReadDestination(&'a mut dyn reims_vgpu_memory::ReadDestination),
+    ReadRect(&'a mut [u8], RectStride),
+}
+
 /// Copy `[off, off+len)` between a caller buffer and the mapping's guest pages.
 ///
 /// One packed contig view when the mapping has one that covers the range;
@@ -2376,17 +2445,23 @@ pub(crate) fn selected_within(
 /// caller's bytes, so all four are named; the read direction used to return a
 /// bare `false` on three of them and left the caller with no reason.
 ///
-/// Callers flush deferred writeback over the range first, and the write
-/// direction re-checks its [`PagesVouched`] after that flush.
+/// Callers flush deferred writeback over the range first. Writes retain their
+/// [`PagesVouched`] here because either resolver can replace the page plan.
 fn copy_mapping_runs<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     mapping_id: u32,
     off: u64,
-    mut copy: RunCopy<'_>,
+    copy: MappingCopy<'_>,
     only: Option<&[(u64, u64)]>,
     site: &str,
 ) -> bool {
+    let (mut copy, vouched) = match copy {
+        MappingCopy::Write(buf, vouched) => (RunCopy::Write(buf), Some(vouched)),
+        MappingCopy::Read(buf) => (RunCopy::Read(buf), None),
+        MappingCopy::ReadDestination(buf) => (RunCopy::ReadDestination(buf), None),
+        MappingCopy::ReadRect(buf, rect) => (RunCopy::ReadRect(buf, rect), None),
+    };
     if copy.is_write() {
         // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
         // witness. The read direction shares this walk and writes nothing.
@@ -2395,8 +2470,22 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     let page_size = state.page_size();
     let len = copy.len();
     let need_end = off.saturating_add(len as u64);
+    let authority_current = |state: &DeviceState| {
+        if vouched.is_some_and(|token| !token.covers(state, mapping_id)) {
+            crate::observe::fail(format!(
+                "{site} fail reason=vouch_stale mid={mapping_id} off={off:#x} len={len:#x} \
+                 (the page list was cleared or replaced while resolving this write)"
+            ));
+            return false;
+        }
+        true
+    };
     // Fast path: one packed view covering the whole range.
-    if let Some((ptr, view_len)) = ensure_contig_view(state, host, mapping_id) {
+    let view = ensure_contig_view(state, host, mapping_id);
+    if !authority_current(state) {
+        return false;
+    }
+    if let Some((ptr, view_len)) = view {
         if (view_len as u64) >= need_end && (off as usize) + len <= view_len {
             for (lo, hi) in selected_within(only, off, need_end) {
                 let buf_off = (lo - off) as usize;
@@ -2417,6 +2506,9 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         ));
         return false;
     };
+    if !authority_current(state) {
+        return false;
+    }
     let page_sz = page_size as usize;
     let span_end = (gpas.len() as u64).saturating_mul(page_size);
     if need_end > span_end {
@@ -2573,7 +2665,7 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
         host,
         mapping_id,
         off,
-        RunCopy::Write(buf),
+        MappingCopy::Write(buf, vouched),
         only,
         "mapping_write",
     )
@@ -2618,21 +2710,65 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     // an unnameable set (`None`) settles exactly as before. The page set comes
     // from the same `mapping_reach_pages` the writeback's own destination is
     // named with, so both ends of the comparison are one rule.
+    settle_mapping_read(state, host, mapping_id);
+    copy_mapping_runs(
+        state,
+        host,
+        mapping_id,
+        off,
+        MappingCopy::Read(buf),
+        None,
+        "mapping_read",
+    )
+}
+
+fn settle_mapping_read<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) {
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
         host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingBytesRead,
     );
-    copy_mapping_runs(
+}
+
+/// Read the whole destination through the same settling, mapping, and bounds
+/// checks as `read_mapping_bytes`, certifying initialization only after copying.
+pub(crate) fn read_mapping_into<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    destination: &mut dyn reims_vgpu_memory::ReadDestination,
+) -> bool {
+    if destination.is_empty() {
+        return destination.is_complete();
+    }
+    settle_mapping_read(state, host, mapping_id);
+    if !copy_mapping_runs(
         state,
         host,
         mapping_id,
         off,
-        RunCopy::Read(buf),
+        MappingCopy::ReadDestination(destination),
         None,
         "mapping_read",
-    )
+    ) {
+        return false;
+    }
+    if !destination.is_complete() {
+        crate::observe::fail(format!(
+            "mapping_read fail reason=incomplete_destination mid={mapping_id} \
+             initialized={} len={}",
+            destination.initialized_len(),
+            destination.len()
+        ));
+        return false;
+    }
+    true
 }
 
 /// Read a strided rectangle starting at mapping-linear `off` into a packed `dst`.
@@ -2645,8 +2781,7 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
 /// sample window first pays a plane-sized allocation and a second copy out of it.
 ///
 /// `dst` shorter than the rectangle's packed size is a refusal, not a partial
-/// read: the shape is checked at [`RunCopy::read_rect`] before any page is
-/// touched.
+/// read: the shape is checked here before any page is touched.
 pub(crate) fn read_mapping_rect<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2675,15 +2810,12 @@ pub(crate) fn read_mapping_rect<H: HostMemory + HostOps>(
         ));
         return false;
     }
-    let Some(copy) = RunCopy::read_rect(dst, rect) else {
-        return false;
-    };
     copy_mapping_runs(
         state,
         host,
         mapping_id,
         off,
-        copy,
+        MappingCopy::ReadRect(dst, rect),
         None,
         "mapping_read_rect",
     )

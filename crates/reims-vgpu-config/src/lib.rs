@@ -203,6 +203,21 @@ switches! {
 /// comparable across compositing regimes and only one pair matched.
 pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 
+/// `off` disables synchronous Metal compute writeback into checked guest aliases.
+/// It cannot enable imports on a host lacking stable, unified-memory support.
+pub const METAL_GPU_WRITEBACK: &str = "REIMS_VGPU_METAL_GPU_WRITEBACK";
+
+/// `off` keeps readonly mapped Metal samples on fresh CPU staging. This cannot
+/// admit an unowned alias, unsupported linear texture, or writable binding.
+pub const METAL_MAPPED_SAMPLING: &str = "REIMS_VGPU_METAL_MAPPED_SAMPLING";
+
+/// `off` disables private readonly Metal input snapshot reuse, retaining fresh
+/// native captures and allocation/known-zero reuse. No setting may extend reuse
+/// beyond its live decoded-command scope or bypass access/freshness checks.
+/// Hosts with deferred dirty harvesting always capture fresh inputs; this
+/// switch cannot turn a delayed observation into a current-generation witness.
+pub const METAL_INPUT_SNAPSHOT_REUSE: &str = "REIMS_VGPU_METAL_INPUT_SNAPSHOT_REUSE";
+
 /// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when
 /// the device advertises `VK_KHR_push_descriptor` and the layout fits its
 /// reported limit.

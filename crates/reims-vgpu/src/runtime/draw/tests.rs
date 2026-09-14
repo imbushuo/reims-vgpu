@@ -3668,6 +3668,7 @@ fn mrt_draw_request_texture_view_mip_level_view_of_linear_as_color_rt() {
 
 #[test]
 fn view_swizzle_remaps_rgba8_pixels() {
+    let capture = crate::observe::FailCapture::start();
     // Every CPU remap must report itself: this is the path the Vulkan
     // pathway replaced with a component mapping, and an unreported
     // invocation is a texture that silently lost its zero-copy crossing.
@@ -3692,9 +3693,12 @@ fn view_swizzle_remaps_rgba8_pixels() {
     // One non-identity remap ran and said so; the identity and None calls did
     // not, and neither did the length-rejected one. Read off the always-on sink
     // rather than a counter: the line is what a boot actually has to show.
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
     assert_eq!(
-        log.match_indices("view_swizzle_cpu_remap").count(),
+        capture
+            .lines()
+            .iter()
+            .filter(|line| line.contains("view_swizzle_cpu_remap"))
+            .count(),
         1,
         "exactly one CPU remap must be reported"
     );
@@ -4200,7 +4204,7 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
 /// that never stamps answers `NoStamp` to every ask and this door would serve
 /// whatever the cache holds, forever.
 #[test]
-fn a_mapper_ref_texture_load_seed_serves_a_published_frame_only_on_a_watched_clean_witness() {
+fn mapper_ref_texture_load_seed_does_not_treat_a_quiet_harvest_as_current_publication() {
     use crate::protocol::endian::{st16, st32};
     use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -4317,13 +4321,13 @@ fn a_mapper_ref_texture_load_seed_serves_a_published_frame_only_on_a_watched_cle
         .expect("mapped above")
         .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
     let served = seed_color_load(&mut state, &mut host, task_id, texture_ref, 0, w, h)
-        .expect("a published frame under a clean witness is the attachment's prior content");
+        .expect("the current guest pixels remain a valid LOAD seed");
     assert_eq!(
         &served[..4],
-        &PUBLISHED_RGBA,
-        "with the witness clean the device's own publication is the surface, and \
-         re-reading the guest's pages is the cost this door exists to remove"
+        &GUEST_RGBA,
+        "an unscoped historical publication must not override the LOAD seed"
     );
+    assert_ne!(&served[..4], &PUBLISHED_RGBA);
 
     // Leg 3 — repainted. The guest CPU stores into the surface with no device
     // operation at all, so this witness is the only thing that sees it.

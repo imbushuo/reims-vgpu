@@ -398,7 +398,8 @@ func sharedTargetGlyphCase(_ w: Int, _ h: Int) {
 // these widths: 60 and 1000 texels are 240 and 4000 bytes and IOSurface will
 // pad both, so the texture's stride is one the test never chose and any rail
 // that assumes a tight row has somewhere to go wrong.
-func makeIOSurfaceTarget(_ w: Int, _ h: Int, _ label: String) -> MTLTexture? {
+func makeIOSurfaceTargetWithBacking(_ w: Int, _ h: Int,
+                                   _ label: String) -> (MTLTexture, IOSurface)? {
     // 'BGRA' as an OSType, which is what IOSurface's pixel-format key takes.
     let bgra: UInt32 = 0x4247_5241
     let props: [IOSurfacePropertyKey: Any] = [
@@ -419,5 +420,9 @@ func makeIOSurfaceTarget(_ w: Int, _ h: Int, _ label: String) -> MTLTexture? {
         report(label, false, "makeTexture(iosurface:) nil for \(w)x\(h)")
         return nil
     }
-    return tex
+    return (tex, surface)
+}
+
+func makeIOSurfaceTarget(_ w: Int, _ h: Int, _ label: String) -> MTLTexture? {
+    makeIOSurfaceTargetWithBacking(w, h, label)?.0
 }

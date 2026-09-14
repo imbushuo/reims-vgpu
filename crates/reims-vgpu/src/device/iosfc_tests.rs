@@ -180,6 +180,7 @@ fn capture_device() -> (u64, Box<CaptureHost>, u64) {
     let id = device_create(Some(ops), PAGE_SHIFT_ARM64E).unwrap();
     host.device.store(id, Ordering::Release);
     device_slot(id).unwrap().iosfc_regs.set_ring_base(ring);
+    device_slot(id).unwrap().iosfc_regs.set_capacity(1);
     (id, host, internal)
 }
 

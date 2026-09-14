@@ -1,7 +1,7 @@
 //! The census lines only the Metal rail can answer.
 //!
-//! Two lines: this rail's compiled-object cache levels, and its retained colour
-//! render targets. The Vulkan rail asks the first of those of entirely
+//! This rail's compiled-object cache, retained colour targets, and completed
+//! input-buffer inventory. The Vulkan rail asks the first of those of entirely
 //! different tables and has no counterpart for the second, which is why both
 //! are reached through [`crate::backend::Backend::emit_census`] rather than
 //! through one `cfg`-selected function — a build carrying both rails has to
@@ -46,4 +46,5 @@ pub(crate) fn emit_resident_color_levels() {
         "resident_color_levels (levels, not per-interval) targets={targets} \
          bytes={bytes} loadable={loadable}"
     ));
+    super::input::emit_census();
 }

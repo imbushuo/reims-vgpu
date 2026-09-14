@@ -348,6 +348,100 @@ fn the_snapshot_rule_reads_the_same_for_both_rings() {
 }
 
 #[test]
+fn iosfc_ring_wrap_does_not_read_the_adjacent_allocation() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let base = 0x7000_0000;
+    let capacity = 4;
+    state.iosfc.set_ring_base(base);
+    state.iosfc.set_capacity(capacity);
+    host.map_range(base, 5 * MAPPER_REQUEST_ENTRY_LEN, 0);
+    state.map_surface(99);
+    let mut entry = [0u8; MAPPER_REQUEST_ENTRY_LEN];
+    st32(&mut entry, MAPPER_REQUEST_UNMAP);
+    st32(&mut entry[4..], 99);
+    host.write_gpa(base + 4 * MAPPER_REQUEST_ENTRY_LEN as u64, &entry).unwrap();
+    for sequence in 0..12u32 {
+        st32(&mut entry, MAPPER_REQUEST_MAP);
+        st32(&mut entry[4..], sequence + 1);
+        host.write_gpa(
+            base + u64::from(sequence % capacity) * MAPPER_REQUEST_ENTRY_LEN as u64,
+            &entry,
+        ).unwrap();
+        state.iosfc.set_producer(sequence + 1);
+        drain_iosfc(&mut state, &mut host);
+        assert_eq!(state.iosfc.consumer(), sequence + 1);
+        assert!(state.mappings[&(sequence + 1)].mapped);
+        assert!(state.mappings[&99].mapped, "bytes after the ring are not requests");
+        assert!(!state.pending.iosfc);
+    }
+}
+
+#[test]
+fn iosfc_ring_drains_across_u32_counter_rollover() {
+    use crate::model::MapperCapture;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let base = 0x7100_0000;
+    state.iosfc.set_ring_base(base);
+    state.iosfc.set_capacity(4);
+    state.iosfc.set_consumer(u32::MAX);
+    state.iosfc.set_producer(1);
+    host.map_range(base, 4 * MAPPER_REQUEST_ENTRY_LEN, 0);
+    for (slot, id) in [(3, 7), (0, 8)] {
+        state.map_surface(id);
+        let mut entry = [0u8; MAPPER_REQUEST_ENTRY_LEN];
+        st32(&mut entry, MAPPER_REQUEST_UNMAP);
+        st32(&mut entry[4..], id);
+        host.write_gpa(base + slot * MAPPER_REQUEST_ENTRY_LEN as u64, &entry).unwrap();
+    }
+    state.mapper_capture = Some(MapperCapture {
+        producer: 0,
+        request_type: MAPPER_REQUEST_UNMAP,
+        mapper_device_kva: 0,
+        mapping_internal: 0,
+    });
+    drain_iosfc(&mut state, &mut host);
+    assert_eq!(state.iosfc.consumer(), 1);
+    assert!(!state.mappings[&7].mapped);
+    assert!(!state.mappings[&8].mapped);
+    assert!(state.mapper_capture.is_none());
+    assert!(!state.pending.iosfc);
+}
+
+#[test]
+fn iosfc_invalid_ring_and_unreadable_entry_do_not_acknowledge_unprocessed_work() {
+    let base = 0x7200_0000;
+    for (capacity, producer) in [(0, 1), (2, 3)] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        state.iosfc.set_ring_base(base);
+        state.iosfc.set_capacity(capacity);
+        state.iosfc.set_producer(producer);
+        drain_iosfc(&mut state, &mut host);
+        assert_eq!(state.iosfc.consumer(), 0);
+        assert!(state.pending.iosfc);
+        assert!(host.actions.is_empty());
+    }
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.iosfc.set_ring_base(base);
+    state.iosfc.set_capacity(2);
+    state.iosfc.set_producer(2);
+    host.map_range(base, 2 * MAPPER_REQUEST_ENTRY_LEN, 0);
+    let mut entry = [0u8; MAPPER_REQUEST_ENTRY_LEN];
+    st32(&mut entry, MAPPER_REQUEST_MAP);
+    st32(&mut entry[4..], 7);
+    host.write_gpa(base, &entry).unwrap();
+    host.mark_non_ram(base + MAPPER_REQUEST_ENTRY_LEN as u64, MAPPER_REQUEST_ENTRY_LEN as u64);
+    drain_iosfc(&mut state, &mut host);
+    assert_eq!(state.iosfc.consumer(), 1);
+    assert!(state.mappings[&7].mapped);
+    assert!(state.pending.iosfc);
+    assert!(host.actions.is_empty());
+}
+
+#[test]
 fn display_descriptor_advertises_four_modes_incl_4k() {
     let mut host = FakeHost::new();
     let gpa = 0x7a000000u64;
@@ -2227,6 +2321,131 @@ fn poll_rescue_only_publishes_work_for_async_drain() {
     );
 }
 
+#[test]
+fn a_doorbell_for_an_already_served_channel_survives_until_the_next_wakeup() {
+    use crate::runtime::host::MemError;
+    use std::cell::{Cell, RefCell};
+    use std::sync::{atomic::AtomicU32, Arc};
+
+    struct ReringHost {
+        inner: RefCell<FakeHost>,
+        rung: Arc<AtomicU32>,
+        trigger: u64,
+        late_ring: u64,
+        late_tail: u64,
+        late_packet: Vec<u8>,
+        fired: Cell<bool>,
+    }
+    impl HostMemory for ReringHost {
+        fn read_gpa(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), MemError> {
+            if gpa == self.trigger && !self.fired.replace(true) {
+                let mut inner = self.inner.borrow_mut();
+                inner.write_gpa(self.late_ring, &self.late_packet)?;
+                inner.write_gpa(self.late_tail, &(2 * PACKET_HEADER_LEN).to_le_bytes())?;
+                self.rung
+                    .fetch_or(1 << 1, std::sync::atomic::Ordering::Release);
+                inner.schedule_bh();
+            }
+            self.inner.borrow().read_gpa(gpa, bytes)
+        }
+        fn write_gpa(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), MemError> {
+            self.inner.get_mut().write_gpa(gpa, bytes)
+        }
+    }
+    impl HostOps for ReringHost {
+        fn mono_ns(&self) -> u64 {
+            self.inner.borrow().mono_ns()
+        }
+        fn enqueue(&mut self, action: HostAction) {
+            self.inner.get_mut().enqueue(action);
+        }
+        fn schedule_bh(&mut self) {
+            self.inner.get_mut().schedule_bh();
+        }
+        fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
+            self.inner.get_mut().map_pages(gpas, page_size)
+        }
+        fn unmap_pages(&mut self, ptr: usize, len: usize) {
+            self.inner.get_mut().unmap_pages(ptr, len);
+        }
+    }
+
+    for page_shift in [PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+        let mut state = DeviceState::new(DeviceId(1), page_shift);
+        let page_size = state.page_size();
+        state.gfx.fifo_base_page = 0x40;
+        state.gfx.root_page = 0x50;
+        state.open_child_domains_for_test((1 << 1) | (1 << 2));
+        let mut inner = FakeHost::new();
+        for pfn in [0x40, 0x50, 0x60, 0x61, 0x70, 0x71] {
+            inner.map_range(state.pfn_gpa(pfn), page_size as usize, 0);
+        }
+        let regs =
+            |channel| state.pfn_gpa(state.gfx.root_page) + child_reg_block_offset(channel).unwrap();
+        for (channel, ring_pfn, list_pfn, stamp) in
+            [(1, 0x60u32, 0x70u32, 101), (2, 0x61, 0x71, 201)]
+        {
+            inner
+                .write_gpa(state.pfn_gpa(list_pfn), &ring_pfn.to_le_bytes())
+                .unwrap();
+            inner
+                .write_gpa(regs(channel) + CHILD_REG_BASE_PFN, &list_pfn.to_le_bytes())
+                .unwrap();
+            inner
+                .write_gpa(
+                    regs(channel) + CHILD_REG_STAMP_INDEX,
+                    &channel.to_le_bytes(),
+                )
+                .unwrap();
+            inner
+                .write_gpa(
+                    regs(channel) + CHILD_REG_TAIL,
+                    &PACKET_HEADER_LEN.to_le_bytes(),
+                )
+                .unwrap();
+            inner
+                .write_gpa(
+                    state.pfn_gpa(ring_pfn),
+                    &packet_bytes(CHILD_OP_NOP, stamp, &[]),
+                )
+                .unwrap();
+        }
+        let first_head = regs(1) + CHILD_REG_HEAD;
+        let stamp_gpa =
+            state.pfn_gpa(state.gfx.fifo_base_page) + stamp_slot_offset(1, page_size).unwrap();
+        let mut host = ReringHost {
+            inner: RefCell::new(inner),
+            rung: Arc::clone(&state.gfx.child_doorbell_rung),
+            trigger: regs(2) + CHILD_REG_HEAD,
+            late_ring: state.pfn_gpa(0x60) + u64::from(PACKET_HEADER_LEN),
+            late_tail: regs(1) + CHILD_REG_TAIL,
+            late_packet: packet_bytes(CHILD_OP_NOP, 102, &[]),
+            fired: Cell::new(false),
+        };
+        state.pending.child_mask = (1 << 1) | (1 << 2);
+
+        drain_pending(&mut state, &mut host);
+        assert!(host.fired.get());
+        assert!(host.inner.borrow().bh_scheduled);
+        assert_eq!(host.inner.borrow().get_u32(first_head), PACKET_HEADER_LEN);
+        assert_eq!(host.inner.borrow().get_u32(stamp_gpa), 101);
+        assert_eq!(
+            state.pending.child_mask,
+            1 << 1,
+            "the scheduled wakeup must retain the channel rung after its drain ended"
+        );
+
+        drain_pending(&mut state, &mut host);
+        assert_eq!(
+            host.inner.borrow().get_u32(first_head),
+            2 * PACKET_HEADER_LEN
+        );
+        assert_eq!(host.inner.borrow().get_u32(stamp_gpa), 102);
+        assert_eq!(state.pending.child_mask, 0);
+        assert!(state.parked.is_empty());
+    }
+}
+
 /// Archive render_wait_surface: no inflight async job for mapping ⇒ no-op,
 /// returns current content_generation. Does not drain other FIFOs.
 #[test]
@@ -3108,8 +3327,8 @@ fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
     }
     c.note_phase(DrainPhase::Flush(FlushRail::Render), 30_000);
     // Two tranches over a frame budget and one comfortably under it.
-    c.note(30_000, 0, 5_500);
-    c.note(9_000, 0, 5_600);
+    c.note(2 * DISPLAY_VBL_MIN_INTERVAL_US, 0, 5_500);
+    c.note(DISPLAY_VBL_MIN_INTERVAL_US + 1, 0, 5_600);
     c.note(1_000, 0, 5_700);
     let line = c
         .note(0, 0, 6_100)
@@ -3118,8 +3337,7 @@ fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
 
     assert!(line.contains("max_flush_us=30000"), "{line}");
     assert!(line.contains("flush_us=39000 flushes=10"), "{line}");
-    // Mean is 3.9 ms and would look healthy against an 8 ms budget; the tail is
-    // nearly four times the whole budget.
+    // The 3.9 ms mean hides the single 30 ms blocking flush.
     // Five tranches, not four: the call that closes the window is itself a
     // tranche and is counted in the window it reports.
     assert!(
@@ -3128,7 +3346,7 @@ fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
     );
     // The threshold is derived from the delivered VBL cadence, not written
     // down, so it tracks the refresh rate rather than aging beside it.
-    assert!(line.contains("slow_us=8333"), "{line}");
+    assert!(line.contains(&format!("slow_us={DISPLAY_VBL_MIN_INTERVAL_US}")), "{line}");
 
     // The same window, split by rail. Nine cheap flushes on one rail and one
     // expensive flush on another is exactly the shape the aggregate cannot

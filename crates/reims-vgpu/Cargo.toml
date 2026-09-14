@@ -93,6 +93,7 @@ metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "
 winit = { version = "0.30", optional = true }
 ash-window = { version = "0.13", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Keyboard shortcut capture for the host window (`host_window::capture`). The
 # desktop consumes chords before any client sees them; taking them back is a

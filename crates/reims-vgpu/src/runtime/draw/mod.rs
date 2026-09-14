@@ -90,8 +90,8 @@ pub(crate) use texture_view::*;
 // ladder's two report helpers are its own working parts and only these two
 // items have callers outside it.
 mod render_target;
-use render_target::{lookup_render_target, ResolvedRenderTarget};
 pub use reims_vgpu_protocol::memoryless::ColorStorage;
+use render_target::{lookup_render_target, ResolvedRenderTarget};
 
 /// Bind **index** cap for the buffer argument table.
 ///
@@ -554,6 +554,19 @@ pub struct VisibilityArming {
 /// through backend preparation.
 pub type BindTable<T> = std::sync::Arc<Vec<T>>;
 
+mod input_scope;
+pub(crate) use input_scope::BufferSnapshotScope;
+pub use input_scope::SnapshotScopeRef;
+
+/// Whether the caller needs a CPU copy of colour0 after the Store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Color0Readback {
+    #[default]
+    Required,
+    /// A resident-backed backend may omit pixels; returning them is also legal.
+    Optional,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DrawEncodeRequest {
     pub task_id: u32,
@@ -571,6 +584,10 @@ pub struct DrawEncodeRequest {
     /// seed all live here and nowhere else, so no two fields of one request can
     /// disagree about the attachment.
     pub colors: Vec<ColorRtRequest>,
+    pub color0_readback: Color0Readback,
+    /// Set only by the executing decoded render pass; ordinary callers capture
+    /// fresh bytes. A request cannot extend the issuing command's scope.
+    pub input_snapshot_scope: Option<SnapshotScopeRef>,
     pub vertex_buffers: BindTable<BufferBind>,
     pub fragment_buffers: BindTable<BufferBind>,
     pub vertex_textures: BindTable<TextureBind>,
@@ -1098,6 +1115,7 @@ pub(crate) fn refuse_pipeline<M: HostMemory + HostOps>(
 /// ~4.7 CPU snapshots/draw under Safari scroll, each of which previously paid
 /// the object-list entry read + descriptor read + decode in the failed ZC
 /// attempt *and* again in the CPU fallback).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct BufferBacking {
     pub(super) gva: u64,
     pub(super) size: u64,
@@ -1234,6 +1252,106 @@ fn read_buffer_bytes_resolved<M: HostMemory + HostOps>(
     offset: u64,
     extent_cap: Option<u64>,
 ) -> Option<Vec<u8>> {
+    let window = prepare_buffer_read(
+        state, host, task_id, buffer_ref, backing, offset, extent_cap,
+    )?;
+    window.read_vec()
+}
+
+/// A checked, settled read window, used synchronously under the caller's device
+/// ownership. It owns neither guest pages nor permission to defer a guest read.
+struct BufferReadWindow<'a, M: HostMemory> {
+    state: &'a DeviceState,
+    host: &'a M,
+    span: BufferReadSpan,
+}
+
+/// Checked read geometry, not a page lease or permission to defer a read.
+/// Kept separately so a synchronous CPU reader can observe freshness before
+/// and after filling without retaining a shared borrow of device state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BufferReadSpan {
+    task: u32,
+    backing: BufferBacking,
+    offset: u64,
+    gva: u64,
+    len: usize,
+    page_shift: u32,
+}
+
+impl BufferReadSpan {
+    fn settle<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        buffer_ref: u32,
+    ) {
+        crate::runtime::writeback_debt::settle_for_texture(
+            state,
+            host,
+            self.task,
+            buffer_ref,
+            self.gva,
+            self.len as u64,
+            crate::runtime::render_writeback::SettleSite::BufferGuestRead,
+        );
+    }
+
+    fn read_into<M: HostMemory>(
+        &self,
+        state: &DeviceState,
+        host: &M,
+        destination: &mut [u8],
+    ) -> Result<(), crate::runtime::host::MemError> {
+        if destination.len() != self.len {
+            return Err(crate::runtime::host::MemError::BadArgs);
+        }
+        gva_mem::read_task_gva_by_id(
+            host,
+            &state.tasks,
+            self.task,
+            self.gva,
+            destination,
+            self.page_shift,
+        )
+        .inspect_err(|_| {
+            crate::observe::fail(format!(
+                "load_buffer gva read fail task={} gva={:#x}+{} want={} shift={}",
+                self.task, self.backing.gva, self.offset, self.len, self.page_shift,
+            ));
+        })
+    }
+}
+
+impl<M: HostMemory> std::ops::Deref for BufferReadWindow<'_, M> {
+    type Target = BufferReadSpan;
+
+    fn deref(&self) -> &Self::Target {
+        &self.span
+    }
+}
+
+impl<M: HostMemory> BufferReadWindow<'_, M> {
+    fn read_into(&self, destination: &mut [u8]) -> Result<(), crate::runtime::host::MemError> {
+        self.span.read_into(self.state, self.host, destination)
+    }
+
+    fn read_vec(&self) -> Option<Vec<u8>> {
+        let mut bytes = vec![0; self.len];
+        self.read_into(&mut bytes).ok()?;
+        Some(bytes)
+    }
+}
+
+fn prepare_buffer_read<'a, M: HostMemory + HostOps>(
+    state: &'a mut DeviceState,
+    host: &'a mut M,
+    task_id: u32,
+    buffer_ref: u32,
+    backing: &BufferBacking,
+    offset: u64,
+    extent_cap: Option<u64>,
+) -> Option<BufferReadWindow<'a, M>> {
     let (gva, size) = (backing.gva, backing.size);
     if offset >= size {
         crate::observe::fail(format!(
@@ -1254,39 +1372,73 @@ fn read_buffer_bytes_resolved<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route_n("cpu_buffer_extent_saved_bytes", full - avail);
     }
     let want = host_alloc_len(avail).filter(|&n| n > 0)?;
-    let (read_gva, read_span) = (gva + offset, want as u64);
+    let read_gva = match gva
+        .checked_add(offset)
+        .filter(|start| start.checked_add(want as u64).is_some())
+    {
+        Some(gva) => gva,
+        None => {
+            crate::observe::Emit::decline("load_buffer", &crate::runtime::host::MemError::Overflow)
+                .field("task", task_id)
+                .field("ref", buffer_ref)
+                .fail();
+            return None;
+        }
+    };
     // Census, pay, settle — the whole obligation of a CPU read of one named
     // resource's guest bytes. This site used to carry the settle alone, because
     // it held `DeviceState` shared and so *could* not pay; see
     // `writeback_debt::settle_for_texture`, whose doc is about that gap.
-    crate::runtime::writeback_debt::settle_for_texture(
+    let span = BufferReadSpan {
+        task: task_id,
+        backing: BufferBacking { gva, size },
+        offset,
+        gva: read_gva,
+        len: want,
+        page_shift: state.page_shift,
+    };
+    span.settle(state, host, buffer_ref);
+    Some(BufferReadWindow {
+        state,
+        host,
+        span,
+    })
+}
+
+#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+fn prepare_bound_buffer_read<'a, M: HostMemory + HostOps>(
+    state: &'a mut DeviceState,
+    host: &'a mut M,
+    task_id: u32,
+    bind: &BufferBind,
+) -> Option<BufferReadWindow<'a, M>> {
+    prepare_bound_buffer_read_with_extent(state, host, task_id, bind, None)
+}
+
+#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+fn prepare_bound_buffer_read_with_extent<'a, M: HostMemory + HostOps>(
+    state: &'a mut DeviceState,
+    host: &'a mut M,
+    task_id: u32,
+    bind: &BufferBind,
+    extent_cap: Option<u64>,
+) -> Option<BufferReadWindow<'a, M>> {
+    let backing = resolve_buffer_backing(
         state,
         host,
         task_id,
-        buffer_ref,
-        read_gva,
-        read_span,
-        crate::runtime::render_writeback::SettleSite::BufferGuestRead,
-    );
-    let mut buf = vec![0u8; want];
-    // Use device page_shift (x86=12); unshifted helper defaults to arm14 and fails.
-    if gva_mem::read_task_gva_by_id(
+        bind.buffer_ref,
+        bind.resource.as_deref(),
+    )?;
+    prepare_buffer_read(
+        state,
         host,
-        &state.tasks,
         task_id,
-        gva + offset,
-        &mut buf,
-        state.page_shift,
+        bind.buffer_ref,
+        &backing,
+        bind.offset,
+        extent_cap,
     )
-    .is_err()
-    {
-        crate::observe::fail(format!(
-            "load_buffer gva read fail task={task_id} gva={gva:#x}+{offset} want={want} shift={}",
-            state.page_shift
-        ));
-        return None;
-    }
-    Some(buf)
 }
 
 /// Standalone CPU buffer read (non-draw-setup callers): resolve + read.
@@ -1967,6 +2119,15 @@ fn load_mapper_ref_texture_mapping_rgba<M: HostMemory + HostOps>(
     let sample_fmt = effective_view_sample_format(base_fmt, format_override)?;
     let stride = w.saturating_mul(RGBA8_BPP);
     let mut raw = vec![0u8; (stride as usize).saturating_mul(h as usize)];
+    if matches!(
+        pixel_format::RowToRgba8::for_format(sample_fmt),
+        Some(pixel_format::RowToRgba8::Bgra8)
+    ) {
+        return crate::runtime::scanout::read_mapping_rgba8(
+            state, host, mapping_id, &mut raw, stride, w, h,
+        )
+        .then_some((w, h, raw));
+    }
     if !crate::runtime::scanout::read_mapping_bgra8(state, host, mapping_id, &mut raw, stride, w, h)
     {
         return None;
@@ -2353,13 +2514,21 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         height: rt.height,
         format: rt.format,
         sample_count: attachment_sample_count,
-        load_action: if rt.storage == ColorStorage::Memoryless { color.load_action } else { 0 },
+        load_action: if rt.storage == ColorStorage::Memoryless {
+            color.load_action
+        } else {
+            0
+        },
         store_action: if rt.storage == ColorStorage::Memoryless {
             color.store_action
         } else {
             MTL_STORE_ACTION_STORE
         },
-        clear_color: if rt.storage == ColorStorage::Memoryless { color.clear_color } else { [0.0; 4] },
+        clear_color: if rt.storage == ColorStorage::Memoryless {
+            color.clear_color
+        } else {
+            [0.0; 4]
+        },
         target_seed_rgba: None,
         multisample_source_ref: 0,
     };
@@ -2518,12 +2687,17 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             base_h = mh;
         } else if mw != base_w || mh != base_h {
             if storage == ColorStorage::Memoryless
-                || colors.iter().any(|c: &ColorRtRequest| c.storage == ColorStorage::Memoryless)
+                || colors
+                    .iter()
+                    .any(|c: &ColorRtRequest| c.storage == ColorStorage::Memoryless)
             {
                 if let Some(event) = crate::observe::Emit::refusal(
-                    "mrt_request", &EncodeStatus::BadArgs("mrt_memoryless_geometry"),
+                    "mrt_request",
+                    &EncodeStatus::BadArgs("mrt_memoryless_geometry"),
                 ) {
-                    event.field("task", task_id).field("slot", slot)
+                    event
+                        .field("task", task_id)
+                        .field("slot", slot)
                         .field("dims", format!("{mw}x{mh}"))
                         .field("pass_dims", format!("{base_w}x{base_h}"))
                         .fail_once((u64::from(task_id) << 32) | u64::from(att.texture_ref));
@@ -2868,6 +3042,7 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
 /// closed on its own terms, and refusing on an empty capture would drop live
 /// Stores whenever the capture failed for an unrelated reason. If that counter
 /// stays at zero it can be tightened with evidence.
+#[cfg(any(test, feature = "backend-vulkan"))]
 pub(crate) fn sync_store_target_pages<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -2882,24 +3057,13 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
         return None;
     }
     let span = (c.row_stride as u64).checked_mul(c.height as u64)?;
-    let ordered = crate::runtime::gva_mem::task_gva_page_gpas(
-        host,
-        &state.tasks,
-        task_id,
-        c.target_gva,
-        span,
-        state.page_shift,
-    );
-    if ordered.is_empty() {
+    let pages = StoreTargetPages::capture(state, host, task_id, c.target_gva, span);
+    if pages.ordered.is_empty() {
         crate::runtime::drain::note_store_route("sync_store_unbounded");
         return None;
     }
     crate::runtime::drain::note_store_route("sync_store_bound");
-    Some(StoreTargetPages {
-        set: ordered.iter().copied().collect(),
-        ordered,
-        span,
-    })
+    Some(pages)
 }
 
 /// The guest pages a synchronous GVA render Store may write, from one walk
@@ -2924,6 +3088,23 @@ pub(crate) struct StoreTargetPages {
 }
 
 impl StoreTargetPages {
+    pub(crate) fn capture<M: HostMemory>(
+        state: &DeviceState,
+        host: &M,
+        task: u32,
+        gva: u64,
+        span: u64,
+    ) -> Self {
+        let ordered = crate::runtime::gva_mem::task_gva_page_gpas(
+            host, &state.tasks, task, gva, span, state.page_shift,
+        );
+        Self {
+            set: ordered.iter().copied().collect(),
+            ordered,
+            span,
+        }
+    }
+
     /// Reconstitute a transfer destination from a live resource's retained
     /// backing. The entries are physical page identities; bounded guest slices
     /// are created only when the backend submits the transfer.
@@ -3640,26 +3821,20 @@ fn seed_color_load<M: HostMemory + HostOps>(
     Some(rgba)
 }
 
-/// This device's own last publication of a mapper-ref-texture surface, when the
-/// hypervisor's witness says the guest has not repainted it since.
+/// Ask whether this device's stored publication can represent current guest
+/// pixels. A historical frame plus a quiet harvested generation cannot make
+/// that claim after a completed command; see `published_mapping_frame`.
 ///
-/// # Why this door takes the strict standard
+/// A LOAD seed is current attachment content, not merely the device's last
+/// stored frame. Trial 27 demonstrated the distinction: after a completed GPU
+/// render and locked CPU IOSurface update, RAM held the CPU color while sampling
+/// returned the prior GPU color. The dirty observation was insufficient.
 ///
-/// A LOAD seed is the attachment's *prior content*: the pass composites onto it
-/// and the matching Store publishes the composite back over the surface's guest
-/// pages. So a stale serve is not a frame that the next rung corrects — it is a
-/// frame that becomes the surface, and the frame after loads what this one
-/// stored. There is no rung under this one that reads the entry again.
-///
-/// [`CurrencyStandard::WatchedAndUnwritten`] is what makes that safe on a
-/// pathway whose dirty-tracking witness may never arm. Under the permissive
-/// standard a rail that never stamps answers `NoStamp` to every ask, and this
-/// door would then serve whatever the cache holds, unconditionally — a
-/// compositing layer frozen on the last frame this device drew into it. Under
-/// the strict standard the same rail simply never serves and pays the guest read
-/// it pays today.
-///
-/// The miss is cheap and the wrong serve is not, which is the whole asymmetry.
+/// These historical entries carry no live execution owner, so this door now
+/// refuses them as `Unscoped`. Its callers fall through to their checked guest
+/// readers, including paired writeback settlement. In-pass native targets keep
+/// their actual render-pass ownership; presentation can still name/read the
+/// historical publication through the identity APIs.
 ///
 /// # What it does not cover
 ///
@@ -3724,15 +3899,22 @@ pub(crate) fn published_mapping_frame<M: HostOps>(
     if !currency.serves(crate::runtime::surface_currency::CurrencyStandard::WatchedAndUnwritten) {
         return Err(NoPublishedFrame::Uncurrent(mapping_id, currency));
     }
-    let Some(generation) =
+    let Some(_generation) =
         crate::runtime::surface_cache::frame_generation(state, mapping_id, width, height)
     else {
         return Err(NoPublishedFrame::Unpublished(mapping_id));
     };
-    Ok(PublishedFrame {
-        mapping_id,
-        generation,
-    })
+    // host_surfaces records a historical publication, not an execution-scope
+    // capability. A completed GPU frame can remain retained while the guest
+    // CPU legally replaces its IOSurface pixels; neither host_gen nor a quiet
+    // harvested dirty generation observes that mutation immediately.
+    //
+    // Fail closed at this shared currency door, not independently at resident
+    // sampling, host-frame sampling and attachment LOAD. Their ordinary reader
+    // pays/settles writeback and reads guest pixels. Actual in-pass targets are
+    // retained by the render-pass owner and do not need this historical claim.
+    // frame_generation itself remains an identity API for presentation/capture.
+    Err(NoPublishedFrame::Unscoped(mapping_id))
 }
 
 /// A mapper-ref-texture surface whose host-side frame is current, and which
@@ -3751,7 +3933,7 @@ pub(crate) struct PublishedFrame {
 
 /// Why [`published_surface_frame`] has nothing to offer.
 ///
-/// The three are kept apart because they have different fixes and only the
+/// The outcomes are kept apart because they have different fixes and only the
 /// second is about the guest: "this attachment is not one of these surfaces",
 /// "the witness will not vouch for the copy", and "the witness is fine and this
 /// device has published nothing at this geometry yet".
@@ -3760,6 +3942,9 @@ pub(crate) enum NoPublishedFrame {
     NotMapped,
     Uncurrent(u32, crate::runtime::surface_currency::SurfaceCurrency),
     Unpublished(u32),
+    /// A stored frame has no live execution owner excluding subsequent legal
+    /// CPU mutation. It remains a historical publication, not current pixels.
+    Unscoped(u32),
 }
 
 /// A colour LOAD seed served from [`published_surface_frame`].
@@ -3817,6 +4002,7 @@ fn seed_from_published_surface<M: HostMemory + HostOps>(
                 // here — `frame_generation` names it, and the two sources below
                 // are what decide whether its bytes can be produced.
                 NoPublishedFrame::Unpublished(_) => "load_seed_color_surface_empty",
+                NoPublishedFrame::Unscoped(_) => "load_seed_color_surface_unscoped",
                 NoPublishedFrame::NotMapped => "load_seed_color_surface_impossible",
             });
             return None;
@@ -3931,5 +4117,7 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     )
 }
 
+#[cfg(test)]
+pub(crate) mod buffer_read_tests;
 #[cfg(test)]
 mod tests;

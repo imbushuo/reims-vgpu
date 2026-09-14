@@ -92,13 +92,15 @@ pub fn sweep(state: &mut crate::model::DeviceState) {
         }
         crate::observe::fail(format!(
             "released_pages reason=released_write_after_release gpa={:#x} \
-             released_at={} wrote_at={} armed={} (this device wrote to a guest page after the \
+             released_at={} wrote_at={} armed={} writer={} task_span={:?} (this device wrote to a guest page after the \
              guest released it; the guest is entitled to have given that page to something \
              else, including its own page table)",
             hit.gpa,
             hit.released_at,
             hit.wrote_at,
             writes.armed_pages(),
+            hit.writer,
+            hit.task_span,
         ));
     }
 }

@@ -17,6 +17,9 @@ use crate::runtime::changed_runs::ChangedRuns;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+pub(crate) mod metal;
+
 /// The rail that can copy a resident straight into a mapping's guest pages.
 ///
 /// Gated on the build — whether this binary carries a Vulkan rail at all is a
@@ -68,7 +71,7 @@ pub enum SurfaceWriteRefusal {
         height: u32,
         format: u16,
     },
-    /// The page walk refused to vouch for the mapping's page list.
+    /// The page witness or current page-plan authority refused the write.
     PagesNotOurs,
     /// The format has no packed row length, so there is no rect to write.
     FormatRowLength { format: u16 },
@@ -392,15 +395,19 @@ fn contig_for_write<H: HostMemory + HostOps>(
     mapping_id: u32,
     span_end: u64,
     vouched: &mapper::PagesVouched,
-) -> Option<(usize, usize)> {
+) -> Result<Option<(usize, usize)>, SurfaceWriteRefusal> {
+    let view = contig_for_span(state, host, mapping_id, span_end);
+    // Resolving the view can adopt a replacement page plan.
     if !vouched.covers(state, mapping_id) {
         crate::observe::fail(format!(
             "mapping_write contig mid={mapping_id} reason=vouch_stale need={span_end} \
              (the page list was cleared or replaced between the walk and this write)"
         ));
-        return None;
+        return Err(SurfaceWriteRefusal::PagesNotOurs);
     }
-    let view = contig_for_span(state, host, mapping_id, span_end)?;
+    let Some(view) = view else {
+        return Ok(None);
+    };
     // Every raw-pointer write in this file goes through here, and none of them
     // goes through `mapper::write_mapping_bytes` — they poke rows straight into
     // the view. So this is where those writes enter `observe::footprint`, and
@@ -420,7 +427,7 @@ fn contig_for_write<H: HostMemory + HostOps>(
     // the footprint mark rather than in each caller, so the two cannot drift and
     // a new caller inherits both.
     state.note_host_wrote_mapping(mapping_id);
-    Some(view)
+    Ok(Some(view))
 }
 
 /// One past the last mapping byte a rect transfer touches: the last texel of its
@@ -856,7 +863,11 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     let frame_bytes = (mh as u64).saturating_mul(tight as u64);
 
     // Fast path: one packed view, poke rows in place.
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+    let contig = match contig_for_write(state, host, mapping_id, span_end, &vouched) {
+        Ok(view) => view,
+        Err(reason) => return refuse(mapping_id, reason),
+    };
+    if let Some((ptr, _)) = contig {
         note_surface_write_path(true, frame_bytes);
         let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
@@ -1288,7 +1299,10 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rgba8_changed") else {
         return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
-    let contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
+    let contig = match contig_for_write(state, host, mapping_id, span_end, &vouched) {
+        Ok(view) => view,
+        Err(reason) => return refuse(mapping_id, reason),
+    };
     // SAFETY: when Some, contig covers span_end.
     let base = contig.map(|(ptr, _)| unsafe { (ptr as *mut u8).add(base_off as usize) });
 
@@ -1576,17 +1590,48 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     } else {
         "surface_row_no_seed"
     });
-    state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+    publish_rgba8_written(
+        state,
+        host,
+        mapping_id,
+        mw,
+        mh,
+        base_off..span_end,
+        match publication {
+            FramePublication::HostCache => CompletedRgba8::Host(cache),
+            FramePublication::RailResident => CompletedRgba8::Resident,
+        },
+    );
+    true
+}
+
+pub(crate) enum CompletedRgba8 {
+    Host(Vec<u8>),
+    Resident,
+}
+
+/// Publish only after the caller's completed write and host-write witness.
+/// Both CPU conversion and direct GPU Store consume this same metadata tail.
+pub(crate) fn publish_rgba8_written<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    mw: u32,
+    mh: u32,
+    window: std::ops::Range<u64>,
+    publication: CompletedRgba8,
+) {
+    state.invalidate_storage_residency_window(mapping_id, window.start, window.end);
     let _ = state.mark_mapping_written(mapping_id);
     // Host render-cache (Linux §8.5): the frame, published now that the guest's
     // pages hold it too. Both arms publish a *generation* for this frame — see
     // `FramePublication` — and differ only in whether the bytes are here or in
     // the caller's rail resident.
     match publication {
-        FramePublication::HostCache => {
+        CompletedRgba8::Host(cache) => {
             crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache)
         }
-        FramePublication::RailResident => {
+        CompletedRgba8::Resident => {
             crate::runtime::drain::note_store_route(
                 if crate::runtime::surface_cache::cede_surface_to_resident(
                     state, mapping_id, mw, mh,
@@ -1609,7 +1654,6 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // surface the guest has rewritten from one it has not, and must assume the
     // worst on every bind.
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
-    true
 }
 
 /// Write rows already encoded as a mapper-ref-texture mapping's native pixel format.
@@ -1741,7 +1785,11 @@ pub fn write_native_image_skipping<M: HostMemory + HostOps>(
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "native_image") else {
         return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+    let contig = match contig_for_write(state, host, mapping_id, span_end, &vouched) {
+        Ok(view) => view,
+        Err(reason) => return refuse(mapping_id, reason),
+    };
+    if let Some((ptr, _)) = contig {
         // SAFETY: the revalidated contiguous view covers `span_end`.
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         for y in 0..height as usize {
@@ -1858,7 +1906,11 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "raw_rows") else {
         return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+    let contig = match contig_for_write(state, host, mapping_id, span_end, &vouched) {
+        Ok(view) => view,
+        Err(reason) => return refuse(mapping_id, reason),
+    };
+    if let Some((ptr, _)) = contig {
         // SAFETY: contig covers span_end from offset 0.
         let base = ptr as *mut u8;
         for y in 0..height as usize {
@@ -2479,6 +2531,10 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
         "rectwr_contig_us",
         contig_started.elapsed().as_micros() as u64,
     );
+    let contig = match contig {
+        Ok(view) => view,
+        Err(reason) => return refuse(mapping_id, reason),
+    };
     if let Some((ptr, _)) = contig {
         crate::runtime::drain::note_store_route("rectwr_contig_n");
         // SAFETY: contig covers span_end, and write_end ≤ span_end (checked).
