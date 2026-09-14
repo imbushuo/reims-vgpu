@@ -2,6 +2,8 @@ use super::*;
 
 use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, PAGE_SIZE_ARM64E};
 
+mod task_admission;
+
 /// `process_child_packet` as a caller holding the packet at its ring position
 /// calls it: with no submission read ahead of time, so the exec arm reads its
 /// own.

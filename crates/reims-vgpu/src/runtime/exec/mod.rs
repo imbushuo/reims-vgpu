@@ -826,10 +826,8 @@ fn read_submission<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     measured_ns: &mut u64,
 ) -> Option<ExecSubmission> {
-    if payload.len() < CHILD_EXEC_INDIRECT_HEADER_LEN as usize {
-        return None;
-    }
-    let raw_task = ld32(&payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..]);
+    let header = crate::protocol::fifo::decode_exec_header(payload).ok()?;
+    let raw_task = header.task_id;
     // The resolver guarantees a live slot or nothing, so there is no second
     // liveness check here. The refusal is always-on: an exec packet the crate
     // drops is a whole command stream of guest work lost, and it used to leave
@@ -846,8 +844,8 @@ fn read_submission<M: HostMemory + HostOps>(
     };
     out.task_id = task_id;
 
-    let resource_count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]);
-    let cmdbuf_count = ld32(&payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..]);
+    let resource_count = header.resource_count;
+    let cmdbuf_count = header.cmdbuf_count;
     let resources_len = resource_count as u64 * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as u64;
     let cbufs_off = CHILD_EXEC_INDIRECT_HEADER_LEN as u64 + resources_len;
     let need = cbufs_off + cmdbuf_count as u64 * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as u64;
