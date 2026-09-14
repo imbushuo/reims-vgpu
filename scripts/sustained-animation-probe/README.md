@@ -234,3 +234,9 @@ were no zero-progress intervals or recovery inputs in these scored windows.
 An earlier independent clean run measured 50.58 host draws/s on the warmed
 desktop and 57.51 in full-screen mode. Cold-start shader work is not included
 in the warmed-rate claim.
+
+Cold submission checks also cover task-definition ordering: a first EXEC
+whose task is not yet active services pending sibling FIFO work before
+capturing its command stream. Capture finishes before releasing the EXEC ring
+head. This cold-path ordering step neither guesses task IDs nor adds per-draw
+memory validation.

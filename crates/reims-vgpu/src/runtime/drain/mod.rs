@@ -2066,6 +2066,30 @@ fn arrival_work<H: HostMemory + HostOps>(
     arrived
 }
 
+fn child_arrival_work<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    fifo: crate::runtime::ingress::Fifo,
+    channel: u32,
+    packet: &Packet,
+) -> Option<Arrived> {
+    if packet.opcode == CHILD_OP_EXEC_INDIRECT2
+        && crate::protocol::fifo::decode_exec_header(&packet.payload)
+            .is_ok_and(|header| !state.tasks.is_active(header.task_id))
+    {
+        // A new task's definition can be published on a sibling FIFO before
+        // its first EXEC, without that FIFO having been drained yet.
+        // Keep this ring position owned while resolving the prerequisite.
+        drain_other_child_fifos(state, host, channel);
+        if state.pending.host_action_yield || state.translation_deferred_mask != 0 {
+            state.pending.child_mask |= 1u32 << channel;
+            note_store_route("exec_task_context_wait");
+            return None;
+        }
+    }
+    Some(arrival_work(state, host, fifo, packet))
+}
+
 /// Move a re-pointed reference's storage incarnation, and say what it names now.
 ///
 /// **The whole of the re-point's device work, performed at arrival.** The
@@ -2119,6 +2143,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
     fifo: crate::runtime::ingress::Fifo,
     completion_slot: u32,
     packet: Packet,
+    arrived: Arrived,
 ) {
     use reims_vgpu_core::identity::StampSlot;
 
@@ -2128,7 +2153,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
         FifoStage::Arrived,
         crate::observe::elapsed_us(),
     );
-    let arrived = arrival_work(state, host, fifo, &packet);
     let session = state.session_generation();
     let built = crate::runtime::ingress::device_packet(
         state,
@@ -4120,8 +4144,9 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 // than on this ring's consumer pointer.
                 note_packet_stamp_waits(state, host, None, &packet);
 
-                // The head advances first and unconditionally; see the child
-                // drain's copy for why that is the whole of the switch.
+                let fifo = crate::runtime::ingress::Fifo::ROOT;
+                let captured = arrival_work(state, host, fifo, &packet);
+                // Release the ring after capturing arrival-owned inputs.
                 state
                     .gfx
                     .fifo_read
@@ -4130,9 +4155,10 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 admit_and_park(
                     state,
                     host,
-                    crate::runtime::ingress::Fifo::ROOT,
+                    fifo,
                     ROOT_STAMP_SLOT,
                     packet,
+                    captured,
                 );
                 settle_model_work(state, host);
             }
@@ -6822,7 +6848,13 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // refuses to move.
                 note_packet_stamp_waits(state, host, Some(channel_id), &packet);
 
-                // **The head advances first, and unconditionally.** Everything
+                let Some(captured) =
+                    child_arrival_work(state, host, fifo, channel_id, &packet)
+                else {
+                    break;
+                };
+
+                // **Capture before releasing the head.** Everything
                 // this packet needs has been taken out of the ring — the
                 // snapshot is decoded and the exec class's command buffers are
                 // read at arrival — so the ring position is free whatever the
@@ -6853,7 +6885,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     });
                 }
 
-                admit_and_park(state, host, fifo, stamp_index, packet);
+                admit_and_park(state, host, fifo, stamp_index, packet, captured);
                 settle_model_work(state, host);
 
                 if state.pending.host_action_yield {
