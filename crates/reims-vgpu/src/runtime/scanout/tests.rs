@@ -457,13 +457,17 @@ fn paint_mapping_fragmented_pages_multi_import() {
                 bytes: &mut dst,
                 stride: 8,
                 width: 2,
-                height: 2
+                height: 2,
+                order: super::RowOrder::Bgra,
             },
             crate::runtime::render_writeback::SettleSite::ScanoutPaint
         ),
         "fragmented paint must multi-import, not not_contig"
     );
     assert_eq!(&dst[..], &frame[..]);
+    let mut rgba = vec![0; 16];
+    assert!(read_mapping_rgba8(&mut state, &mut host, mid, &mut rgba, 8, 2, 2));
+    assert_eq!(rgba, [0, 0, 0xcc, 0xff].repeat(4));
     // The fixture must still be fragmented, or this stops testing the
     // multi-import path and silently passes through the packed-view branch.
     // Asserted on the thing `paint_mapping` actually branches on, rather than
@@ -472,6 +476,40 @@ fn paint_mapping_fragmented_pages_multi_import() {
         crate::runtime::mapper::ensure_contig_view(&mut state, &mut host, mid).is_none(),
         "fixture stopped being fragmented"
     );
+}
+
+#[test]
+fn rgba_mapping_read_matches_bgra_conversion_for_packed_and_float_rows() {
+    use crate::protocol::pixel_format::RowToRgba8;
+    for format in [
+        MTL_FORMAT_BGRA8_UNORM,
+        pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
+        MTL_FORMAT_RGBA8_UNORM,
+        MTL_FORMAT_RGBA16_FLOAT,
+    ] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let gpa = 0x100000;
+        host.map_range(gpa, 0x4000, 0);
+        state.map_surface(7);
+        state.set_mapping_geom(7, 7, 3, format);
+        let mapping = state.mappings.get_mut(&7).unwrap();
+        mapping.page_entries = vec![
+            (((gpa >> PAGE_SHIFT_ARM64E) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+        ];
+        let bytes = (0..0x4000).map(|i| (i * 37) as u8).collect::<Vec<_>>();
+        host.write_gpa(gpa, &bytes).unwrap();
+        let mut bgra = vec![0xa5; 32 * 3];
+        let mut rgba = bgra.clone();
+        assert!(read_mapping_bgra8(&mut state, &mut host, 7, &mut bgra, 32, 7, 3));
+        assert!(read_mapping_rgba8(&mut state, &mut host, 7, &mut rgba, 32, 7, 3));
+        for row in 0..3 {
+            let mut expected = [0; 28];
+            assert!(RowToRgba8::Bgra8.convert(&bgra[row * 32..row * 32 + 28], 7, &mut expected));
+            assert_eq!(&rgba[row * 32..row * 32 + 28], &expected, "format={format}");
+            assert_eq!(&rgba[row * 32 + 28..row * 32 + 32], &[0xa5; 4]);
+        }
+    }
 }
 
 /// The capture buffer is a recycled warm double-buffer, not a fresh 8 MiB

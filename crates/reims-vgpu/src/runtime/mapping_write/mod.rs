@@ -17,6 +17,9 @@ use crate::runtime::changed_runs::ChangedRuns;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+pub(crate) mod metal;
+
 /// The rail that can copy a resident straight into a mapping's guest pages.
 ///
 /// Gated on the build — whether this binary carries a Vulkan rail at all is a
@@ -1587,17 +1590,48 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     } else {
         "surface_row_no_seed"
     });
-    state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+    publish_rgba8_written(
+        state,
+        host,
+        mapping_id,
+        mw,
+        mh,
+        base_off..span_end,
+        match publication {
+            FramePublication::HostCache => CompletedRgba8::Host(cache),
+            FramePublication::RailResident => CompletedRgba8::Resident,
+        },
+    );
+    true
+}
+
+pub(crate) enum CompletedRgba8 {
+    Host(Vec<u8>),
+    Resident,
+}
+
+/// Publish only after the caller's completed write and host-write witness.
+/// Both CPU conversion and direct GPU Store consume this same metadata tail.
+pub(crate) fn publish_rgba8_written<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    mw: u32,
+    mh: u32,
+    window: std::ops::Range<u64>,
+    publication: CompletedRgba8,
+) {
+    state.invalidate_storage_residency_window(mapping_id, window.start, window.end);
     let _ = state.mark_mapping_written(mapping_id);
     // Host render-cache (Linux §8.5): the frame, published now that the guest's
     // pages hold it too. Both arms publish a *generation* for this frame — see
     // `FramePublication` — and differ only in whether the bytes are here or in
     // the caller's rail resident.
     match publication {
-        FramePublication::HostCache => {
+        CompletedRgba8::Host(cache) => {
             crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache)
         }
-        FramePublication::RailResident => {
+        CompletedRgba8::Resident => {
             crate::runtime::drain::note_store_route(
                 if crate::runtime::surface_cache::cede_surface_to_resident(
                     state, mapping_id, mw, mh,
@@ -1620,7 +1654,6 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // surface the guest has rewritten from one it has not, and must assume the
     // worst on every bind.
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
-    true
 }
 
 /// Write rows already encoded as a mapper-ref-texture mapping's native pixel format.

@@ -91,8 +91,9 @@ pub struct ReimsVgpuHostOps {
     /// thread. Distinct from `schedule_bh` (drain-worker wake): prompt actions
     /// (IRQ pulses, cursor moves) must be deliverable mid-drain.
     pub notify_actions: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
-    /// 1 when a `map_pages` result remains valid until its matching
-    /// `unmap_pages` call, so a caller may retain it in a GPU import.
+    /// Legacy stability admission for borrowed-run and generic import users.
+    /// Explicitly owned remaps use `map_pages_owned` instead; this flag is not
+    /// broadened merely because a remap survives until its matching unmap.
     ///
     /// x86 answers **1**: direct RAMBlock pointers remain borrowed, while a
     /// fragmented list's packed alias remains valid until explicit retirement.
@@ -104,9 +105,9 @@ pub struct ReimsVgpuHostOps {
     /// 1 only because it never released a view at all, so every fragmented map
     /// leaked a VA reservation until teardown. The GPU rail does not read this
     /// flag for the base RAMBlock import: those spans come from
-    /// `guest_ram_regions` and neither shim built them. Resource-shaped packed
-    /// imports do read it, because retaining such an import requires the
-    /// `map_pages` alias itself to outlive submitted GPU work.
+    /// `guest_ram_regions` and neither shim built them. Existing generic import
+    /// users still read this flag. Mapping-owned imports can instead use
+    /// `map_pages_owned` with an explicit backend-retirement/unmap handshake.
     pub map_pages_stable: c_int,
     /// Register `count` page-aligned GPAs as one guest-write-tracked set and
     /// return a non-zero opaque token, or 0 when the host has no dirty bitmap.
@@ -141,6 +142,10 @@ pub struct ReimsVgpuHostOps {
     >,
     pub page_alias_census:
         Option<unsafe extern "C" fn(ctx: *mut c_void, out: *mut PageAliasCensus) -> i32>,
+    /// A successful `map_pages` result is owned until its matching unmap.
+    /// Retained GPU users must defer that unmap until backend retirement.
+    pub map_pages_owned: c_int,
+    pub guest_write_gen_current: Option<unsafe extern "C" fn(ctx: *mut c_void, token: u64) -> u64>,
 }
 
 // SAFETY: QEMU keeps the context valid until worker/window threads have joined.
@@ -173,6 +178,8 @@ impl ReimsVgpuHostOps {
             map_pages: None,
             unmap_pages: None,
             map_pages_stable: 0,
+            map_pages_owned: 0,
+            guest_write_gen_current: None,
             track_guest_writes: None,
             untrack_guest_writes: None,
             guest_write_gen: None,
@@ -217,6 +224,7 @@ enum QemuHostDecline {
         ptr: usize,
         len: usize,
     },
+    OwnedPageAliasCallbacksMissing,
 }
 
 impl crate::observe::Decline for QemuHostDecline {
@@ -233,12 +241,15 @@ impl crate::observe::Decline for QemuHostDecline {
             },
             Self::MapPagesNullPointer { .. } => "qemu_map_pages_null_pointer",
             Self::UnmapPagesCallbackMissing { .. } => "qemu_unmap_pages_callback_missing",
+            Self::OwnedPageAliasCallbacksMissing => "qemu_owned_page_alias_callbacks_missing",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::MonoNsCallbackMissing | Self::ScheduleBhCallbackMissing => Vec::new(),
+            Self::MonoNsCallbackMissing
+            | Self::ScheduleBhCallbackMissing
+            | Self::OwnedPageAliasCallbacksMissing => Vec::new(),
             Self::MapPagesCallbackMissing {
                 first_gpa,
                 page_count,
@@ -413,6 +424,21 @@ impl HostMemory for QemuHost<'_> {
 }
 
 impl HostOps for QemuHost<'_> {
+    fn guest_write_gen_current(&self, token: u64) -> crate::runtime::host::CurrentGuestWrite {
+        use crate::runtime::host::CurrentGuestWrite;
+        let Some(read) = self.ops.guest_write_gen_current else {
+            return CurrentGuestWrite::Unsupported;
+        };
+        if token == 0 {
+            return CurrentGuestWrite::Unavailable;
+        }
+        // SAFETY: the versioned host table keeps ctx and this callback alive.
+        match unsafe { read(self.ops.ctx, token) } {
+            0 => CurrentGuestWrite::Unavailable,
+            generation => CurrentGuestWrite::Current(generation),
+        }
+    }
+
     fn mono_ns(&self) -> u64 {
         match self.ops.mono_ns {
             // SAFETY: QEMU owns ctx.
@@ -632,6 +658,20 @@ impl HostOps for QemuHost<'_> {
 
     fn map_pages_stable(&self) -> bool {
         self.ops.map_pages_stable != 0
+    }
+
+    fn map_pages_owned(&self) -> bool {
+        if self.map_pages_stable() {
+            return true;
+        }
+        if self.ops.map_pages_owned == 0 {
+            return false;
+        }
+        if self.ops.map_pages.is_none() || self.ops.unmap_pages.is_none() {
+            QemuHostDecline::OwnedPageAliasCallbacksMissing.emit(0);
+            return false;
+        }
+        true
     }
 
     fn page_alias_census(&self) -> Option<PageAliasCensus> {
@@ -859,6 +899,27 @@ mod tests {
             *out = std::ptr::null_mut();
         }
         0
+    }
+
+    unsafe extern "C" fn release_owned_pages(_ctx: *mut c_void, _ptr: *mut c_void, _len: usize) {}
+
+    #[test]
+    fn owned_page_alias_capability_does_not_widen_legacy_stability() {
+        let mut ops = ReimsVgpuHostOps::null();
+        let mut actions = VecDeque::new();
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        assert!(!QemuHost::new(&ops, &mut actions, &prompt).map_pages_owned());
+        ops.map_pages_owned = 1;
+        assert!(!QemuHost::new(&ops, &mut actions, &prompt).map_pages_owned());
+        ops.map_pages = Some(null_map_pages);
+        assert!(!QemuHost::new(&ops, &mut actions, &prompt).map_pages_owned());
+        ops.unmap_pages = Some(release_owned_pages);
+        let host = QemuHost::new(&ops, &mut actions, &prompt);
+        assert!(host.map_pages_owned());
+        assert!(
+            !host.map_pages_stable(),
+            "borrowed-run clients keep the Darwin refusal"
+        );
     }
 
     /// How many spans [`counting_ram_regions`] claims, and how many times it has
@@ -1135,6 +1196,7 @@ mod tests {
                 ptr: 0x10000,
                 len: 0x8000,
             },
+            QemuHostDecline::OwnedPageAliasCallbacksMissing,
         ];
         let expected = [
             "qemu_mono_ns_callback_missing",
@@ -1143,6 +1205,7 @@ mod tests {
             "qemu_map_pages_alias_failed",
             "qemu_map_pages_null_pointer",
             "qemu_unmap_pages_callback_missing",
+            "qemu_owned_page_alias_callbacks_missing",
         ];
         assert_eq!(declines.len(), expected.len());
         for (decline, expected_slug) in declines.iter().zip(expected) {

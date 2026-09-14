@@ -298,10 +298,16 @@ fn materialize_targets<M: HostMemory + HostOps>(
     affected: BTreeSet<usize>,
     boundary: &'static str,
 ) -> Result<(), EncodeStatus> {
-    pass.flush(boundary).map_err(EncodeStatus::RailRefused)?;
+    pass.flush_checked(state, host, boundary)
+        .map_err(EncodeStatus::RailRefused)?;
     for index in affected {
         let color = &req.colors[index];
         let target = pass.target(color).map_err(EncodeStatus::BadArgs)?;
+        if let Some(store) = &target.gpu_store {
+            store
+                .check(state, host)
+                .map_err(|status| EncodeStatus::RailRefused(*status))?;
+        }
         let len = reims_vgpu_protocol::extent::tight_image_bytes(color.width, color.height, 4)
             .ok_or(EncodeStatus::BadArgs("draw_mtl_dependency_geometry"))?;
         let mut bytes = vec![0; len];

@@ -21,7 +21,10 @@
 extern "C" {
 #endif
 
-/* v21: IOSFC begin/try/wait/finish admission; only wait runs without BQL.
+/* v23: Optional non-consuming, current guest-write generation observation.
+ * v22: ReimsVgpuHostOps.map_pages_owned explicitly licenses caller-owned views
+ *      until matching unmap, without widening legacy map_pages_stable users.
+ * v21: IOSFC begin/try/wait/finish admission; only wait runs without BQL.
  * v20: map_pages fills ReimsVgpuMapPagesFailure when it refuses a view.
  * v19: ReimsVgpuHostOps.page_alias_census reports the packed page views the
  *      shim currently owns and their cumulative lifetime totals.
@@ -95,7 +98,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 21u
+#define REIMS_VGPU_QEMU_ABI_VERSION 23u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -325,15 +328,14 @@ typedef struct ReimsVgpuHostOps {
      */
     void (*notify_actions)(void *ctx);
     /*
-     * 1 if map_pages returns an alias the caller may retain until its matching
-     * unmap_pages call. 0 if the view may be used only synchronously and cannot
-     * back a retained GPU import.
+     * Legacy stability admission for borrowed-run and generic import users.
+     * Caller-owned remaps use map_pages_owned instead. A remap remaining valid
+     * until explicit unmap does not by itself widen this legacy flag.
      *
      * Base guest RAM reaches the GPU through the spans guest_ram_regions names,
-     * independently of this flag. A resource-shaped packed import may retain a
-     * map_pages view, however, and may do so only when this flag promises that
-     * submitted GPU work cannot outlive the alias. Default (absent field /
-     * older shim) must be treated as 0.
+     * independently of this flag. Existing generic consumers retain this gate;
+     * mapping-owned imports can use map_pages_owned with explicit backend
+     * retirement before unmap. Default (absent field / older shim) is 0.
      */
     int map_pages_stable;
     /*
@@ -382,6 +384,21 @@ typedef struct ReimsVgpuHostOps {
                                    uint64_t *out, size_t max);
     /* Current packed map_pages aliases and cumulative lifetime totals. */
     int (*page_alias_census)(void *ctx, ReimsVgpuPageAliasCensus *out);
+    /*
+     * 1 if each successful map_pages result remains valid until its matching
+     * unmap_pages. A retaining owner must keep the view and defer unmap until
+     * its backend has released every imported GPU reference.
+     * Requires both callbacks. Does not license borrowed-run retention and
+     * does not change map_pages_stable. Default is 0.
+     */
+    int map_pages_owned;
+    /*
+     * Optional current observation of the same tracked token/generation.
+     * 0 means unavailable, including dirty pages awaiting harvest/reprotection.
+     * Nonzero excludes unharvested CPU writes; unlike guest_write_gen, this
+     * may certify a snapshot across commands. NULL means unsupported.
+     */
+    uint64_t (*guest_write_gen_current)(void *ctx, uint64_t token);
 } ReimsVgpuHostOps;
 
 /*

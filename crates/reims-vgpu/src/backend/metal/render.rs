@@ -37,21 +37,107 @@ pub(crate) struct RenderBatch {
     inputs: input::Submission,
     textures: Vec<Texture>,
     published_samples: Vec<super::resident::PublishedSample>,
+    imported_samples: Vec<Arc<super::mapped_sample::Image>>,
+    seed_sources: Vec<super::guest_writeback::ReadSource>,
     vertex_buffer_slots: Vec<u64>,
     fragment_buffer_slots: Vec<u64>,
     vertex_texture_slots: Vec<u64>,
     fragment_texture_slots: Vec<u64>,
     attachments: Vec<(u64, usize)>,
     failure: Option<Status>,
+    submitted: bool,
     #[cfg(test)]
     pub(crate) submissions: usize,
     #[cfg(test)]
     pub(crate) readbacks: usize,
 }
 
+pub(crate) struct SubmittedRender(RenderBatch);
+
+impl SubmittedRender {
+    pub(crate) fn finish(mut self) -> Result<(), Status> {
+        self.0.finish((ptr::null_mut(), 0))
+    }
+}
+
+/// Read an already-completed private RGBA8 target, including the late CPU
+/// fallback when a preflighted mapped GPU Store loses its allocation proof.
+pub(crate) fn read_completed_rgba8(
+    target: &TextureRef,
+    width: u32,
+    height: u32,
+    out: &mut [u8],
+) -> Result<(), Status> {
+    let need = tight_image_bytes(width, height, 4)
+        .ok_or_else(|| Status::args("metal_rgba8_readback_extent"))?;
+    if target.pixel_format() != MTLPixelFormat::RGBA8Unorm
+        || target.width() != u64::from(width)
+        || target.height() != u64::from(height)
+        || out.len() != need
+    {
+        return Err(Status::args("metal_rgba8_readback_layout"));
+    }
+    let pitch = u64::from(width) * 4;
+    let started = std::time::Instant::now();
+    let linear = unsafe { super::raw_metal::linear_pixels(target, pitch, u64::from(height)) };
+    let (route, time, bytes) = if let Some(source) = linear {
+        out.copy_from_slice(source);
+        (
+            "metal_readback_linear",
+            "metal_readback_linear_ns",
+            "metal_readback_linear_bytes",
+        )
+    } else {
+        target.get_bytes(
+            out.as_mut_ptr().cast(),
+            pitch,
+            MTLRegion::new_2d(0, 0, u64::from(width), u64::from(height)),
+            0,
+        );
+        (
+            "metal_readback_tiled",
+            "metal_readback_tiled_ns",
+            "metal_readback_tiled_bytes",
+        )
+    };
+    crate::runtime::drain::note_store_route(route);
+    crate::runtime::drain::note_store_route_n(time, started.elapsed().as_nanos() as u64);
+    crate::runtime::drain::note_store_route_n(bytes, need as u64);
+    Ok(())
+}
+
 impl RenderBatch {
     pub(crate) fn pending(&self) -> bool {
         self.command.is_some()
+    }
+
+    pub(crate) fn pending_guest_reads(&self) -> bool {
+        !self.seed_sources.is_empty() || !self.imported_samples.is_empty()
+    }
+
+    /// Setup work and rendering share one submission. Setup-only work is
+    /// discarded if a draw refuses before creating its render encoder.
+    pub(crate) fn begin_commands(&mut self, device: &Device) -> Result<CommandBuffer, Status> {
+        if let Some(status) = self.failure {
+            return Err(status);
+        }
+        if self.submitted {
+            return Err(Status::args("metal_render_batch_already_submitted"));
+        }
+        if self.encoder.is_some() {
+            return Err(Status::args("metal_render_setup_after_encoder"));
+        }
+        if let Some(command) = &self.command {
+            return Ok(command.clone());
+        }
+        let command = super::raw_metal::new_command_buffer(&thread_queue(device))
+            .ok_or_else(|| Status::execute("metal_render_command_buffer_unavailable"))?
+            .to_owned();
+        self.inputs
+            .begin(&command, super::runtime::thread_input_pool(device))?;
+        self.attachments.clear();
+        self.command = Some(command.clone());
+        Ok(command)
     }
 
     pub(crate) fn encoder(
@@ -77,7 +163,7 @@ impl RenderBatch {
                 .load_action() as u64
                 != MTLLoadAction::Load as u64
         });
-        if self.pending() && (self.attachments != attachments || reload) {
+        if self.encoder.is_some() && (self.attachments != attachments || reload) {
             crate::runtime::drain::note_store_route("metal_batch_attachment_boundary");
             self.finish((ptr::null_mut(), 0))?;
         }
@@ -85,20 +171,15 @@ impl RenderBatch {
             crate::runtime::drain::note_store_route("metal_batch_encoder_reuse");
             return Ok(encoder.clone());
         }
-        let command = super::raw_metal::new_command_buffer(&thread_queue(device))
-            .ok_or_else(|| Status::execute("metal_render_command_buffer_unavailable"))?
-            .to_owned();
-        let encoder = super::raw_metal::new_render_command_encoder(&command, pass)
-            .ok_or_else(|| Status::execute("metal_render_encoder_unavailable"))?
-            .to_owned();
-        if let Err(status) = self
-            .inputs
-            .begin(&command, super::runtime::thread_input_pool(device))
-        {
-            encoder.end_encoding();
+        let command = self.begin_commands(device)?;
+        let Some(encoder) = super::raw_metal::new_render_command_encoder(&command, pass) else {
+            self.command = None;
+            self.inputs.discard();
+            let status = Status::execute("metal_render_encoder_unavailable");
+            self.failure = Some(status);
             return Err(status);
-        }
-        self.command = Some(command);
+        };
+        let encoder = encoder.to_owned();
         self.encoder = Some(encoder.clone());
         self.attachments = attachments;
         crate::runtime::drain::note_store_route("metal_batch_encoder_begin");
@@ -111,14 +192,70 @@ impl RenderBatch {
         }
     }
 
-    pub(crate) fn finish(&mut self, err: ErrOut<'_>) -> Result<(), Status> {
+    pub(crate) fn abort_pending(&mut self, status: Status) {
+        if self.submitted {
+            if let Err(completion) = self.finish((ptr::null_mut(), 0)) {
+                crate::observe::Emit::refusal("metal_render_abort_completion", &completion)
+                    .unwrap()
+                    .fail();
+            }
+        }
+        self.end_encoding();
+        self.command = None;
+        self.inputs.discard();
+        self.textures.clear();
+        self.published_samples.clear();
+        self.imported_samples.clear();
+        self.seed_sources.clear();
+        self.attachments.clear();
+        self.failure = Some(status);
+    }
+
+    pub(crate) fn submit(&mut self) -> Result<SubmittedRender, Status> {
+        self.submit_pending()?;
+        let submitted = std::mem::take(self);
+        #[cfg(test)]
+        {
+            self.submissions = submitted.submissions;
+            self.readbacks = submitted.readbacks;
+        }
+        Ok(SubmittedRender(submitted))
+    }
+
+    fn submit_pending(&mut self) -> Result<(), Status> {
         if let Some(status) = self.failure {
             return Err(status);
         }
+        if self.submitted {
+            return Ok(());
+        }
         self.end_encoding();
-        let Some(command) = self.command.take() else {
+        let Some(command) = self.command.as_ref() else {
             return Ok(());
         };
+        if self.attachments.is_empty() {
+            self.command = None;
+            self.inputs.discard();
+            self.textures.clear();
+            self.published_samples.clear();
+            self.imported_samples.clear();
+            self.seed_sources.clear();
+            return Ok(());
+        }
+        self.attachments.clear();
+        let read_error = self.seed_sources.iter().find_map(|source| source.check_live().err())
+            .or_else(|| self.imported_samples.iter().any(|source| !source.live())
+                .then(|| Status::args("metal_mapped_sample_retired")));
+        if let Some(status) = read_error {
+            self.command = None;
+            self.inputs.discard();
+            self.textures.clear();
+            self.published_samples.clear();
+            self.imported_samples.clear();
+            self.seed_sources.clear();
+            self.failure = Some(status);
+            return Err(status);
+        }
         let _span = crate::runtime::chain_phase::CostSpan::new("metal_commit_us");
         crate::runtime::drain::note_store_route("metal_submissions");
         #[cfg(test)]
@@ -126,9 +263,22 @@ impl RenderBatch {
             self.submissions += 1;
         }
         command.commit();
+        self.submitted = true;
+        Ok(())
+    }
+
+    pub(crate) fn finish(&mut self, err: ErrOut<'_>) -> Result<(), Status> {
+        self.submit_pending()?;
+        let Some(command) = self.command.take() else {
+            return Ok(());
+        };
+        let _span = crate::runtime::chain_phase::CostSpan::new("metal_commit_us");
         command.wait_until_completed();
+        self.submitted = false;
         self.textures.clear();
         self.published_samples.clear();
+        self.imported_samples.clear();
+        self.seed_sources.clear();
         if command.status() != MTLCommandBufferStatus::Completed {
             self.inputs.discard();
             let status = Status::execute("metal_render_command_buffer_failed");
@@ -195,6 +345,14 @@ fn reset_draw_state(encoder: &RenderCommandEncoderRef, batch: &mut RenderBatch) 
 #[cfg(test)]
 #[path = "render_texture_tests.rs"]
 mod render_texture_tests;
+
+#[cfg(test)]
+#[path = "render_batch_tests.rs"]
+mod render_batch_tests;
+
+#[cfg(test)]
+#[path = "render_packed_tests.rs"]
+mod render_packed_tests;
 
 struct AttrBufferSlot {
     data: *const u8,
@@ -1363,6 +1521,23 @@ fn bind_sampled_images(
     for source in images {
         let image = match source {
             ReimsVgpuSampledImage::Packed(image) => image,
+            ReimsVgpuSampledImage::ImportedRead { binding, image } => {
+                let Some(index) = texture_index(*binding) else {
+                    return Status::args("metal_render_sampled_binding_invalid")
+                        .field("binding", *binding);
+                };
+                let texture = match image.texture(device) {
+                    Ok(texture) => texture,
+                    Err(status) => return status,
+                };
+                if fragment_stage {
+                    encoder.set_fragment_texture(index as u64, Some(texture));
+                } else {
+                    encoder.set_vertex_texture(index as u64, Some(texture));
+                }
+                retained.push(texture.to_owned());
+                continue;
+            }
             ReimsVgpuSampledImage::Resident { binding, image } => {
                 let Some(index) = texture_index(*binding) else {
                     return Status::args("metal_render_sampled_binding_invalid")
@@ -1410,237 +1585,257 @@ fn bind_sampled_images(
                 continue;
             }
         };
-        let Some(texture_index) = texture_index(image.binding) else {
-            set_err(
-                err,
-                format!(
-                    "invalid {} sampled image binding {}",
-                    if fragment_stage { "fragment" } else { "vertex" },
-                    image.binding
-                ),
-            );
-            return Status::args("metal_render_sampled_binding_invalid")
-                .field("fragment", fragment_stage)
-                .field("binding", image.binding);
+        let texture = match upload_packed_sampled_image(device, image, fragment_stage, err) {
+            Ok(texture) => texture,
+            Err(status) => return status,
         };
-        if image.width == 0 {
-            set_err(
-                err,
-                format!(
-                    "invalid {} sampled image binding {}",
-                    if fragment_stage { "fragment" } else { "vertex" },
-                    image.binding
-                ),
-            );
-            return Status::args("metal_render_sampled_width_zero")
-                .field("fragment", fragment_stage)
-                .field("binding", image.binding);
-        }
-        if image.height == 0 {
-            set_err(
-                err,
-                format!(
-                    "invalid {} sampled image binding {}",
-                    if fragment_stage { "fragment" } else { "vertex" },
-                    image.binding
-                ),
-            );
-            return Status::args("metal_render_sampled_height_zero")
-                .field("fragment", fragment_stage)
-                .field("binding", image.binding);
-        }
-
-        let (pixel_format, bytes, bytes_per_row) = if image.pixel_format != 0 {
-            let Some(bpp) = mtl_pixel_format_bpp(image.pixel_format) else {
-                set_err(
-                    err,
-                    format!(
-                        "invalid native {} sampled image binding {}",
-                        if fragment_stage { "fragment" } else { "vertex" },
-                        image.binding
-                    ),
-                );
-                return Status::args("metal_render_sampled_native_format_unsupported")
-                    .field("fragment", fragment_stage)
-                    .field("binding", image.binding)
-                    .field("format", image.pixel_format);
-            };
-            if image.data.is_null() {
-                set_err(
-                    err,
-                    format!(
-                        "invalid native {} sampled image binding {}",
-                        if fragment_stage { "fragment" } else { "vertex" },
-                        image.binding
-                    ),
-                );
-                return Status::args("metal_render_sampled_native_data_missing")
-                    .field("fragment", fragment_stage)
-                    .field("binding", image.binding);
-            }
-            if image.data_len == 0 {
-                set_err(
-                    err,
-                    format!(
-                        "invalid native {} sampled image binding {}",
-                        if fragment_stage { "fragment" } else { "vertex" },
-                        image.binding
-                    ),
-                );
-                return Status::args("metal_render_sampled_native_data_empty")
-                    .field("fragment", fragment_stage)
-                    .field("binding", image.binding);
-            }
-            let bpr = if image.bytes_per_row != 0 {
-                image.bytes_per_row as u64
-            } else {
-                image.width as u64 * bpp as u64
-            };
-            let need = bpr.checked_mul(image.height as u64);
-            let Some(need) = need else {
-                set_err(
-                    err,
-                    format!(
-                        "native {} sampled image too short binding {}",
-                        if fragment_stage { "fragment" } else { "vertex" },
-                        image.binding
-                    ),
-                );
-                return Status::args("metal_render_sampled_native_span_overflow")
-                    .field("fragment", fragment_stage)
-                    .field("binding", image.binding)
-                    .field("bytes_per_row", bpr)
-                    .field("height", image.height);
-            };
-            if image.data_len < need as usize {
-                set_err(
-                    err,
-                    format!(
-                        "native {} sampled image too short binding {}",
-                        if fragment_stage { "fragment" } else { "vertex" },
-                        image.binding
-                    ),
-                );
-                return Status::args("metal_render_sampled_native_data_too_short")
-                    .field("fragment", fragment_stage)
-                    .field("binding", image.binding)
-                    .field("len", image.data_len)
-                    .field("required", need);
-            }
-            let Some(format) = mtl_enum::pixel_format(image.pixel_format) else {
-                set_err(
-                    err,
-                    format!(
-                        "native {} sampled image names no pixel format, binding {}",
-                        if fragment_stage { "fragment" } else { "vertex" },
-                        image.binding
-                    ),
-                );
-                return Status::args("metal_render_sampled_native_format_undeclared")
-                    .field("fragment", fragment_stage)
-                    .field("binding", image.binding)
-                    .field("format", image.pixel_format);
-            };
-            (format, image.data, bpr)
-        } else {
-            let Some(expected_len) = tight_image_bytes(
-                image.width,
-                image.height,
-                crate::protocol::pixel_format::RGBA8_BPP as usize,
-            ) else {
-                set_err(
-                    err,
-                    format!(
-                        "invalid {} sampled image binding {}",
-                        if fragment_stage { "fragment" } else { "vertex" },
-                        image.binding
-                    ),
-                );
-                return Status::args("metal_render_sampled_rgba_geometry_invalid")
-                    .field("fragment", fragment_stage)
-                    .field("binding", image.binding)
-                    .field("width", image.width)
-                    .field("height", image.height);
-            };
-            if image.rgba8.is_null() {
-                set_err(
-                    err,
-                    format!(
-                        "invalid {} sampled image binding {}",
-                        if fragment_stage { "fragment" } else { "vertex" },
-                        image.binding
-                    ),
-                );
-                return Status::args("metal_render_sampled_rgba_data_missing")
-                    .field("fragment", fragment_stage)
-                    .field("binding", image.binding);
-            }
-            if image.len < expected_len {
-                set_err(
-                    err,
-                    format!(
-                        "invalid {} sampled image binding {}",
-                        if fragment_stage { "fragment" } else { "vertex" },
-                        image.binding
-                    ),
-                );
-                return Status::args("metal_render_sampled_rgba_data_too_short")
-                    .field("fragment", fragment_stage)
-                    .field("binding", image.binding)
-                    .field("len", image.len)
-                    .field("required", expected_len);
-            }
-            (
-                MTLPixelFormat::RGBA8Unorm,
-                image.rgba8,
-                image.width as u64 * 4,
-            )
-        };
-
-        // Every sampled bind is a fresh `MTLTexture` and a full upload, per
-        // draw — the same shape the colour target had before
-        // [`crate::backend::metal::resident`], and charged apart from the rest
-        // of `metal_encode_us` for the same reason: the fix for byte movement
-        // is not the fix for encoder overhead.
-        let span_alloc = crate::runtime::chain_phase::CostSpan::new("metal_sampled_tex_alloc_us");
-        let descriptor = TextureDescriptor::new();
-        descriptor.set_texture_type(MTLTextureType::D2);
-        descriptor.set_pixel_format(pixel_format);
-        descriptor.set_width(image.width as u64);
-        descriptor.set_height(image.height as u64);
-        descriptor.set_storage_mode(MTLStorageMode::Shared);
-        descriptor.set_usage(MTLTextureUsage::ShaderRead);
-        let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor)
-        else {
-            set_err(err, "failed to allocate sampled image texture");
-            return Status::execute("metal_render_sampled_texture_alloc_failed")
-                .field("fragment", fragment_stage)
-                .field("binding", image.binding)
-                .field("width", image.width)
-                .field("height", image.height);
-        };
-        let region = MTLRegion {
-            origin: MTLOrigin { x: 0, y: 0, z: 0 },
-            size: MTLSize {
-                width: image.width as u64,
-                height: image.height as u64,
-                depth: 1,
-            },
-        };
-        drop(span_alloc);
-        {
-            let _span_upload =
-                crate::runtime::chain_phase::CostSpan::new("metal_sampled_tex_upload_us");
-            texture.replace_region(region, 0, bytes as *const _, bytes_per_row);
-        }
+        let index = texture_index(image.binding).expect("the uploader checked the binding");
         if fragment_stage {
-            encoder.set_fragment_texture(texture_index as u64, Some(&texture));
+            encoder.set_fragment_texture(index as u64, Some(&texture));
         } else {
-            encoder.set_vertex_texture(texture_index as u64, Some(&texture));
+            encoder.set_vertex_texture(index as u64, Some(&texture));
         }
         retained.push(texture);
     }
     Status::OK
+}
+
+/// The single packed sampled upload contract, shared with immutable snapshots.
+/// Format zero remains tight RGBA8; native formats retain their supplied pitch.
+pub(super) fn upload_packed_sampled_image(
+    device: &Device,
+    image: &ReimsVgpuPackedSampledImage,
+    fragment_stage: bool,
+    err: ErrOut<'_>,
+) -> Result<Texture, Status> {
+    if texture_index(image.binding).is_none() {
+        set_err(
+            err,
+            format!(
+                "invalid {} sampled image binding {}",
+                if fragment_stage { "fragment" } else { "vertex" },
+                image.binding
+            ),
+        );
+        return Err(Status::args("metal_render_sampled_binding_invalid")
+            .field("fragment", fragment_stage)
+            .field("binding", image.binding));
+    }
+    if image.width == 0 {
+        set_err(
+            err,
+            format!(
+                "invalid {} sampled image binding {}",
+                if fragment_stage { "fragment" } else { "vertex" },
+                image.binding
+            ),
+        );
+        return Err(Status::args("metal_render_sampled_width_zero")
+            .field("fragment", fragment_stage)
+            .field("binding", image.binding));
+    }
+    if image.height == 0 {
+        set_err(
+            err,
+            format!(
+                "invalid {} sampled image binding {}",
+                if fragment_stage { "fragment" } else { "vertex" },
+                image.binding
+            ),
+        );
+        return Err(Status::args("metal_render_sampled_height_zero")
+            .field("fragment", fragment_stage)
+            .field("binding", image.binding));
+    }
+
+    let (pixel_format, bytes, bytes_per_row) = if image.pixel_format != 0 {
+        let Some(bpp) = mtl_pixel_format_bpp(image.pixel_format) else {
+            set_err(
+                err,
+                format!(
+                    "invalid native {} sampled image binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    image.binding
+                ),
+            );
+            return Err(
+                Status::args("metal_render_sampled_native_format_unsupported")
+                    .field("fragment", fragment_stage)
+                    .field("binding", image.binding)
+                    .field("format", image.pixel_format),
+            );
+        };
+        if image.data.is_null() {
+            set_err(
+                err,
+                format!(
+                    "invalid native {} sampled image binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    image.binding
+                ),
+            );
+            return Err(Status::args("metal_render_sampled_native_data_missing")
+                .field("fragment", fragment_stage)
+                .field("binding", image.binding));
+        }
+        if image.data_len == 0 {
+            set_err(
+                err,
+                format!(
+                    "invalid native {} sampled image binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    image.binding
+                ),
+            );
+            return Err(Status::args("metal_render_sampled_native_data_empty")
+                .field("fragment", fragment_stage)
+                .field("binding", image.binding));
+        }
+        let bpr = if image.bytes_per_row != 0 {
+            image.bytes_per_row as u64
+        } else {
+            image.width as u64 * bpp as u64
+        };
+        let need = bpr.checked_mul(image.height as u64);
+        let Some(need) = need else {
+            set_err(
+                err,
+                format!(
+                    "native {} sampled image too short binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    image.binding
+                ),
+            );
+            return Err(Status::args("metal_render_sampled_native_span_overflow")
+                .field("fragment", fragment_stage)
+                .field("binding", image.binding)
+                .field("bytes_per_row", bpr)
+                .field("height", image.height));
+        };
+        if image.data_len < need as usize {
+            set_err(
+                err,
+                format!(
+                    "native {} sampled image too short binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    image.binding
+                ),
+            );
+            return Err(Status::args("metal_render_sampled_native_data_too_short")
+                .field("fragment", fragment_stage)
+                .field("binding", image.binding)
+                .field("len", image.data_len)
+                .field("required", need));
+        }
+        let Some(format) = mtl_enum::pixel_format(image.pixel_format) else {
+            set_err(
+                err,
+                format!(
+                    "native {} sampled image names no pixel format, binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    image.binding
+                ),
+            );
+            return Err(
+                Status::args("metal_render_sampled_native_format_undeclared")
+                    .field("fragment", fragment_stage)
+                    .field("binding", image.binding)
+                    .field("format", image.pixel_format),
+            );
+        };
+        (format, image.data, bpr)
+    } else {
+        let Some(expected_len) = tight_image_bytes(
+            image.width,
+            image.height,
+            crate::protocol::pixel_format::RGBA8_BPP as usize,
+        ) else {
+            set_err(
+                err,
+                format!(
+                    "invalid {} sampled image binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    image.binding
+                ),
+            );
+            return Err(Status::args("metal_render_sampled_rgba_geometry_invalid")
+                .field("fragment", fragment_stage)
+                .field("binding", image.binding)
+                .field("width", image.width)
+                .field("height", image.height));
+        };
+        if image.rgba8.is_null() {
+            set_err(
+                err,
+                format!(
+                    "invalid {} sampled image binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    image.binding
+                ),
+            );
+            return Err(Status::args("metal_render_sampled_rgba_data_missing")
+                .field("fragment", fragment_stage)
+                .field("binding", image.binding));
+        }
+        if image.len < expected_len {
+            set_err(
+                err,
+                format!(
+                    "invalid {} sampled image binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    image.binding
+                ),
+            );
+            return Err(Status::args("metal_render_sampled_rgba_data_too_short")
+                .field("fragment", fragment_stage)
+                .field("binding", image.binding)
+                .field("len", image.len)
+                .field("required", expected_len));
+        }
+        (
+            MTLPixelFormat::RGBA8Unorm,
+            image.rgba8,
+            image.width as u64 * 4,
+        )
+    };
+
+    // The uncached rail and a new immutable snapshot both allocate here.
+    let span_alloc = crate::runtime::chain_phase::CostSpan::new("metal_sampled_tex_alloc_us");
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(pixel_format);
+    descriptor.set_width(image.width as u64);
+    descriptor.set_height(image.height as u64);
+    descriptor.set_storage_mode(MTLStorageMode::Shared);
+    descriptor.set_usage(MTLTextureUsage::ShaderRead);
+    let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor) else {
+        set_err(err, "failed to allocate sampled image texture");
+        return Err(Status::execute("metal_render_sampled_texture_alloc_failed")
+            .field("fragment", fragment_stage)
+            .field("binding", image.binding)
+            .field("width", image.width)
+            .field("height", image.height));
+    };
+    let region = MTLRegion {
+        origin: MTLOrigin { x: 0, y: 0, z: 0 },
+        size: MTLSize {
+            width: image.width as u64,
+            height: image.height as u64,
+            depth: 1,
+        },
+    };
+    drop(span_alloc);
+    {
+        let _span_upload =
+            crate::runtime::chain_phase::CostSpan::new("metal_sampled_tex_upload_us");
+        texture.replace_region(region, 0, bytes as *const _, bytes_per_row);
+    }
+    crate::runtime::drain::note_store_route("metal_packed_sampled_uploads");
+    crate::runtime::drain::note_store_route_n(
+        "metal_packed_sampled_upload_bytes",
+        bytes_per_row * u64::from(image.height),
+    );
+    Ok(texture)
 }
 
 fn bind_samplers(
@@ -2116,6 +2311,7 @@ impl ColorRt<'_> {
             ColorTarget::Memoryless(target) | ColorTarget::PassLocal(target) => {
                 target.initialized()
                     || self.seed_rgba8.is_some()
+                    || target.gpu_load.is_some()
                     || target
                         .resident
                         .as_ref()
@@ -2702,6 +2898,25 @@ pub(crate) fn render_core_mrt_inputs(
     let defer = defer && !immediate && !colors.iter().any(|color| color.out_rgba8.is_some());
     drop(span_pso);
 
+    for image in vertex_images.iter().chain(images) {
+        if let ReimsVgpuSampledImage::ImportedRead { image, .. } = image {
+            if image.needs_conversion() {
+                // Conversion and its consuming draw stay in one submission.
+                // End only the encoder, not the batch or its guest read leases.
+                batch.end_encoding();
+                let command = match batch.begin_commands(device) {
+                    Ok(command) => command,
+                    Err(status) => return status,
+                };
+                batch.imported_samples.push(Arc::clone(image));
+                if let Err(status) = image.encode_conversion(device, &command) {
+                    batch.abort_pending(status);
+                    return status;
+                }
+            }
+        }
+    }
+
     let mut retained_tex: Vec<Texture> = Vec::new();
     // (slot, tex, bpp)
     let mut color_textures: Vec<(u32, Texture, usize)> = Vec::new();
@@ -2738,6 +2953,38 @@ pub(crate) fn render_core_mrt_inputs(
             return Status::args("metal_render_pass_target_geometry").field("slot", slot);
         }
         drop(span_alloc);
+        if let ColorTarget::PassLocal(owner) = &c.target {
+            if !owner.initialized() {
+                if let Some(source) = &owner.gpu_load {
+                    let command = match batch.begin_commands(device) {
+                        Ok(command) => command,
+                        Err(status) => return status,
+                    };
+                    let buffer = match source.buffer() {
+                        Ok(buffer) => buffer,
+                        Err(status) => return status,
+                    };
+                    let layout = source.layout();
+                    if let Err(status) = super::guest_seed::Prepared::encode(
+                        device,
+                        &command,
+                        buffer,
+                        &target,
+                        super::guest_seed::Layout {
+                            source_offset: source.offset(),
+                            source_length: source.span(),
+                            source_pitch: u64::from(layout.pitch),
+                            width: layout.width,
+                            height: layout.height,
+                            source_format: layout.format,
+                        },
+                    ) {
+                        return status;
+                    }
+                    batch.seed_sources.push(source.clone());
+                }
+            }
+        }
         // Archive reims_vgpu_backend_metal: upload target_rgba8 before Load
         // (fresh RT every job; NULL seed → Clear invent below).
         //
@@ -2868,12 +3115,28 @@ pub(crate) fn render_core_mrt_inputs(
     };
     // Hold the read lease, not just the Metal handle, until real completion.
     // A later registry writer must not reuse pixels this command still samples.
-    batch.published_samples.extend(
-        vertex_images.iter().chain(images).filter_map(|image| match image {
-            ReimsVgpuSampledImage::Resident { image, .. } => Some(image.clone()),
-            _ => None,
-        }),
-    );
+    batch
+        .published_samples
+        .extend(
+            vertex_images
+                .iter()
+                .chain(images)
+                .filter_map(|image| match image {
+                    ReimsVgpuSampledImage::Resident { image, .. } => Some(image.clone()),
+                    _ => None,
+                }),
+        );
+    batch
+        .imported_samples
+        .extend(
+            vertex_images
+                .iter()
+                .chain(images)
+                .filter_map(|image| match image {
+                    ReimsVgpuSampledImage::ImportedRead { image, .. } => Some(Arc::clone(image)),
+                    _ => None,
+                }),
+        );
     // Error arms below end this draw's encoder. Only successful deferred draws
     // return an open encoder to the batch; refusal then submits the closed one.
     batch.encoder.take();
@@ -3207,6 +3470,12 @@ pub(crate) fn render_core_mrt_inputs(
             }
             let (slot, target, bpp) = &color_textures[i];
             let _ = slot;
+            if target.pixel_format() == MTLPixelFormat::RGBA8Unorm {
+                if let Err(status) = read_completed_rgba8(target, width, height, out) {
+                    return status;
+                }
+                continue;
+            }
             let target_len = (width as usize)
                 .saturating_mul(height as usize)
                 .saturating_mul(*bpp);

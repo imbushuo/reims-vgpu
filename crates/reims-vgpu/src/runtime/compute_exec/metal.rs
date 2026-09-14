@@ -185,11 +185,24 @@ pub(crate) fn split_staged_textures(
 
 /// A fragment binding can reuse precisely the compute rail's checked whole-
 /// surface staging. `None` means this is not a direct composite type11 texture.
+#[cfg(test)]
 pub(crate) fn try_stage_planar_sampled<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
+) -> Result<Option<std::sync::Arc<crate::backend::metal::planar::SampledImage>>, ComputeStatus> {
+    try_stage_planar_sampled_in_scope(state, host, task_id, texture_ref, None)
+}
+
+/// Rendering can carry the issuing pass's revocable snapshot permission.
+/// Without it, the same checked plane reader runs but cannot reuse an old copy.
+pub(crate) fn try_stage_planar_sampled_in_scope<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    scope: Option<&crate::runtime::draw::SnapshotScopeRef>,
 ) -> Result<Option<std::sync::Arc<crate::backend::metal::planar::SampledImage>>, ComputeStatus> {
     let Ok(resource) = objects::resolve_resource(state, host, task_id, texture_ref) else {
         return Ok(None);
@@ -200,7 +213,9 @@ pub(crate) fn try_stage_planar_sampled<M: HostMemory + HostOps>(
     if crate::protocol::planar::type11_sample_format(&resource.descriptor).is_none() {
         return Ok(None);
     }
-    let staged = stage_texture_raw::<MetalStage, _>(state, host, task_id, texture_ref, 0, false)?;
+    let staged = stage_texture_raw_in_scope::<MetalStage, _>(
+        state, host, task_id, texture_ref, 0, false, scope,
+    )?;
     staged.rail.planar.map(Some)
         .ok_or(ComputeStatus::Unsupported("planar_staging_missing"))
 }

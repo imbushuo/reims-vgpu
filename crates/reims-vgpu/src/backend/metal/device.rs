@@ -48,6 +48,7 @@ impl MetalBackend {
                  (this host exposes no MTLDevice)",
             );
         }
+        super::guest_writeback::publish_import_limits();
         Self
     }
 
@@ -106,7 +107,35 @@ impl Backend for MetalBackend {
     }
 
     fn reset(&self) {
+        super::guest_writeback::reset();
         crate::runtime::icb::clear_icb_cache();
+    }
+
+    fn guest_writes_outstanding(&self) -> bool {
+        super::guest_writeback::outstanding()
+    }
+
+    fn quiesce_guest_writes(&self) {
+        super::guest_writeback::quiesce();
+    }
+
+    fn guest_writes_reaching(&self, _pages: &[u64]) -> crate::backend::GuestWriteReach {
+        if super::guest_writeback::outstanding() {
+            crate::backend::GuestWriteReach::Unnamed
+        } else {
+            crate::backend::GuestWriteReach::Disjoint
+        }
+    }
+
+    fn retire_guest_import(
+        &self,
+        import: crate::runtime::guest_ram::ImportId,
+    ) -> Option<(usize, usize)> {
+        super::guest_writeback::retire(import)
+    }
+
+    fn take_released_host_aliases(&self) -> Vec<(usize, usize)> {
+        super::guest_writeback::released()
     }
 
     fn forget_host_icbs(&self) {

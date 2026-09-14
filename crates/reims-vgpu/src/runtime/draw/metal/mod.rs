@@ -30,6 +30,7 @@ use depth_stencil::{seed_host_depth_stencil, DepthStencilAspect, HostAttachment}
 mod hazards;
 pub(crate) mod inputs;
 mod sampled;
+pub(crate) use sampled::ImportedReads;
 mod storage;
 pub(crate) use hazards::land_before_refusal;
 pub(crate) use hazards::PassDependencies;
@@ -71,9 +72,9 @@ pub(crate) struct ResidentPlan {
 /// *next* pass's Load free.
 ///
 /// An attachment [`crate::runtime::draw::published_surface_frame`] declines is
-/// still retained — the texture is reused as an allocation and the seed is
-/// uploaded into it as before. Only the content claim is refused, and the two
-/// are separate answers for exactly that reason.
+/// still retained as an allocation. Historical publications have no live
+/// execution scope, so a new pass must seed current guest bytes rather than
+/// turn a quiet harvest into a cross-command content claim.
 fn plan_resident_target<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -86,6 +87,11 @@ fn plan_resident_target<M: HostMemory + HostOps>(
     use crate::runtime::draw::NoPublishedFrame;
 
     let key = ResidentColorKey::for_surface(c.mapping_id, width, height);
+    // Publication-change detection is not permission to LOAD old pixels.
+    // Keep the historical generation even when current-guest currency refuses.
+    let asked_generation =
+        crate::runtime::surface_cache::frame_generation(state, c.mapping_id, width, height)
+            .unwrap_or(0);
     let generation = match crate::runtime::draw::published_surface_frame(
         state,
         host,
@@ -103,6 +109,7 @@ fn plan_resident_target<M: HostMemory + HostOps>(
                 NoPublishedFrame::NotMapped => "metal_resident_frame_unmapped",
                 NoPublishedFrame::Uncurrent(..) => "metal_resident_frame_uncurrent",
                 NoPublishedFrame::Unpublished(_) => "metal_resident_frame_unpublished",
+                NoPublishedFrame::Unscoped(_) => "metal_resident_frame_unscoped",
             });
             0
         }
@@ -118,7 +125,7 @@ fn plan_resident_target<M: HostMemory + HostOps>(
         key,
         texture: taken.map(|(texture, _)| texture),
         holds_prior,
-        asked_generation: generation,
+        asked_generation,
     }
 }
 
@@ -161,6 +168,21 @@ fn null_apv_buffer() -> crate::backend::metal::abi::ReimsVgpuBuffer {
         backing_data: std::ptr::null_mut(),
         backing_len: 0,
         backing_offset: 0,
+    }
+}
+
+fn partial_store_rect(
+    color: &ColorRtRequest,
+    force_full_store: bool,
+    has_seed: bool,
+    scissors: &[crate::runtime::render_pass::ScissorRect],
+) -> Option<crate::runtime::render_pass::ScissorRect> {
+    if force_full_store || color.load_action != MTL_LOAD_ACTION_LOAD || !has_seed {
+        return None;
+    }
+    match scissors {
+        [rect] if !rect.covers(color.width, color.height) => Some(*rect),
+        _ => None,
     }
 }
 
@@ -269,7 +291,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     };
     if let Some(reason) = boundary {
         crate::runtime::drain::note_store_route(reason);
-        if let Err(status) = pass.flush("metal_batch_dependency_flush") {
+        if let Err(status) = pass.flush_checked(state, host, "metal_batch_dependency_flush") {
             return (EncodeStatus::RailRefused(status), None);
         }
     }
@@ -435,6 +457,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
                         .as_ref()
                         .and_then(|extents| extents.bound(b.index)),
                 )
+                .in_scope(req.input_snapshot_scope.as_ref())
             } else {
                 Capture::Cpu
             },
@@ -470,6 +493,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
                         .as_ref()
                         .and_then(|extents| extents.bound(b.index)),
                 )
+                .in_scope(req.input_snapshot_scope.as_ref())
             } else {
                 Capture::Cpu
             },
@@ -885,8 +909,8 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         None
     };
 
-    // Owned RGBA out buffers per color RT (host encode always RGBA8).
-    // Seeds were moved into `color_seeds` above.
+    // Allocate CPU outputs only after direct-Store viability is established.
+    // Required colour0 readback still receives the same RGBA8 result.
     let need = (width as usize)
         .saturating_mul(height as usize)
         .saturating_mul(RGBA8_BPP as usize);
@@ -897,19 +921,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     // boots; see [`chain_phase::CostSpan`].
     let mut color_outs: Vec<Vec<u8>> = {
         let _outs = chain_phase::CostSpan::new("metal_seed_outs_us");
-        color_list
-            .iter()
-            .map(|c| {
-                if writeback_guest
-                    && c.storage == ColorStorage::GuestBacked
-                    && c.store_action != MTL_STORE_ACTION_DONT_CARE
-                {
-                    vec![0u8; need]
-                } else {
-                    Vec::new()
-                }
-            })
-            .collect()
+        color_list.iter().map(|_| Vec::new()).collect()
     };
 
     // For indexed draws, pass index_count as vertex_count for the early gate.
@@ -919,14 +931,9 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         req.vertex_count
     };
 
-    // Mapper-ref-texture color targets render into a host RT and are written back by the
-    // CPU. The guest-backed attachment that used to sit here aliased the
-    // mapping's `mach_vm_remap` view with `newBufferWithBytesNoCopy`, so Load
-    // read and Store wrote guest pages in place; that is exactly the access the
-    // host GPU must not have, and the alias is gone. What runs now is the same
-    // seed-and-write-back path the alias already fell through to on every
-    // contract refusal (unaligned offset or row stride, span out of range, no
-    // device), so this is a rung the rail has always had.
+    // Attachments remain private RGBA8 targets. A direct Store copies their
+    // completed bytes through a separately checked guest import; rendering never
+    // acquires an unowned pointer to guest pages as its colour attachment.
     //
     // The seed is skipped entirely for an attachment this rail already holds a
     // render target for whose pixels are the frame the cache would have handed
@@ -938,6 +945,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             if c.storage == ColorStorage::Memoryless {
                 continue;
             }
+            let gpu_allowed = pass.gpu_store_allowed.get();
             let target = match pass.target_mut(c) {
                 Ok(target) => target,
                 Err(reason) => return (EncodeStatus::BadArgs(reason), None),
@@ -981,6 +989,30 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
                         None,
                     );
                 }
+                if gpu_allowed
+                    && c.mapping_id != 0
+                    && c.target_gva == 0
+                    && c.store_action == MTL_STORE_ACTION_STORE
+                    && target.resident.is_some()
+                {
+                    crate::runtime::drain::note_store_route("metal_gpu_store_prepare");
+                    target.gpu_store = mapping_write::metal::Store::prepare(
+                        state,
+                        host,
+                        c.mapping_id,
+                        width,
+                        height,
+                        target.texture(),
+                    );
+                } else {
+                    crate::runtime::drain::note_store_route(if !gpu_allowed {
+                        "metal_gpu_store_policy_blocked"
+                    } else if c.mapping_id == 0 || c.target_gva != 0 {
+                        "metal_gpu_store_non_mapping"
+                    } else {
+                        "metal_gpu_store_no_store"
+                    });
+                }
             }
             if c.load_action != MTL_LOAD_ACTION_LOAD || color_seeds[i].is_some() {
                 continue;
@@ -995,6 +1027,16 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             }
             if c.mapping_id == 0 {
                 continue;
+            }
+            if let Some(store) = &target.gpu_store {
+                match store.load_source(state, host) {
+                    Ok(source) => {
+                        target.gpu_load = Some(source);
+                        crate::runtime::drain::note_store_route("metal_seed_from_guest_gpu");
+                        continue;
+                    }
+                    Err(status) => return (EncodeStatus::RailRefused(*status), None),
+                }
             }
             crate::runtime::drain::note_store_route("metal_seed_load_asked");
             color_seeds[i] =
@@ -1020,9 +1062,6 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     let mut color_rts: Vec<ColorRt<'_>> = Vec::with_capacity(color_list.len());
     for (i, c) in color_list.iter().enumerate() {
         // Every target encodes host RGBA8 for writeback conversion.
-        let out_ptr = color_outs[i].as_mut_ptr();
-        let out_len = color_outs[i].len();
-        let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, out_len) };
         // This slot's own entry and no other. `slot` is the index the guest
         // declared on the entry, so the vector is keyed by the same numbering
         // `c.slot` uses and `find` is an exact lookup rather than a search over
@@ -1082,7 +1121,7 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
                 ColorStorage::Memoryless => u32::from(c.format),
             },
             seed_rgba8: color_seeds[i].as_deref(),
-            out_rgba8: if out.is_empty() { None } else { Some(out) },
+            out_rgba8: None,
             clear_r: c.clear_color[0],
             clear_g: c.clear_color[1],
             clear_b: c.clear_color[2],
@@ -1143,8 +1182,9 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         .chain(&texture_usages.fragment)
         .any(|usage| usage.access.writes())
     {
+        pass.gpu_store_allowed.set(false);
         crate::runtime::drain::note_store_route("metal_batch_storage_boundary");
-        if let Err(status) = pass.flush("metal_batch_dependency_flush") {
+        if let Err(status) = pass.flush_checked(state, host, "metal_batch_dependency_flush") {
             return (EncodeStatus::RailRefused(status), None);
         }
     }
@@ -1208,7 +1248,13 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
                 images.push(image);
                 continue;
             }
-            let Some(upload) = sampled::load(state, host, req.task_id, bind.texture_ref) else {
+            let Some(upload) = sampled::load_in_scope(
+                state,
+                host,
+                req.task_id,
+                bind.texture_ref,
+                req.input_snapshot_scope.as_ref(),
+            ) else {
                 crate::observe::fail(format!(
                     "metal_draw gate: reason={miss_reason} ref={} {}",
                     bind.texture_ref,
@@ -1224,6 +1270,46 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     }
     drop(span_sampled);
 
+    let mut direct_stores = vec![false; color_list.len()];
+    for (i, color) in color_list.iter().enumerate() {
+        if !writeback_guest
+            || color.storage != ColorStorage::GuestBacked
+            || color.store_action == MTL_STORE_ACTION_DONT_CARE
+        {
+            continue;
+        }
+        if let Some(store) = pass
+            .target(color)
+            .ok()
+            .and_then(|target| target.gpu_store.as_ref())
+        {
+            if let Err(status) = store.check(state, host) {
+                return (EncodeStatus::RailRefused(*status), None);
+            }
+            // Clipped draws can still end in a whole-image Store (Clear, or
+            // the final Store of a multi-draw pass). Only actual partial
+            // writeback must retain the CPU path's untouched guest bytes.
+            direct_stores[i] = pass.gpu_store_allowed.get()
+                && partial_store_rect(
+                    color,
+                    force_full_store,
+                    color_seeds.get(i).is_some_and(Option::is_some)
+                        || pass
+                            .target(color)
+                            .is_ok_and(|target| target.gpu_load.is_some()),
+                    &req.scissors,
+                )
+                .is_none();
+        }
+        if !direct_stores[i] || (i == 0 && req.color0_readback == Color0Readback::Required) {
+            let _outs = chain_phase::CostSpan::new("metal_seed_outs_us");
+            color_outs[i] = vec![0; need];
+            // Distinct owned vectors, retained unchanged until encode completes.
+            color_rts[i].out_rgba8 =
+                Some(unsafe { std::slice::from_raw_parts_mut(color_outs[i].as_mut_ptr(), need) });
+        }
+    }
+
     let mut err_buf = [0i8; 256];
     let err: ErrOut<'_> = (err_buf.as_mut_ptr(), err_buf.len());
     // The guest's offset stays here: the backend answers one draw at a time and
@@ -1233,9 +1319,21 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         mode: arming.mode,
         samples: None,
     });
+    if !pass.batch.borrow().pending() {
+        pass.imported_reads.borrow_mut().clear();
+    }
+    pass.imported_reads
+        .borrow_mut()
+        .retain([&vtx_tex_items, &frag_tex_items]);
     chain_phase::enter(chain_phase::Phase::Engine);
-    let defer = req.render_pass_continues
-        && !writeback_guest
+    let pipelined_store = writeback_guest
+        && !req.render_pass_continues
+        && color_list.iter().zip(&direct_stores).all(|(color, direct)| {
+            color.store_action == MTL_STORE_ACTION_DONT_CARE || *direct
+        })
+        && direct_stores.iter().any(|direct| *direct)
+        && color_rts.iter().all(|color| color.out_rgba8.is_none());
+    let defer = ((req.render_pass_continues && !writeback_guest) || pipelined_store)
         && visibility.is_none()
         && depth_attach_api.is_none()
         && stencil_attach_api.is_none()
@@ -1244,6 +1342,17 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             .iter()
             .chain(&texture_usages.fragment)
             .any(|usage| usage.access.writes());
+    if !defer
+        || vtx_imgs
+            .iter()
+            .chain(&frag_imgs)
+            .any(ReimsVgpuSampledImage::needs_completion)
+        || color_rts.iter().any(|color| color.out_rgba8.is_some())
+    {
+        if let Err(status) = pass.validate_gpu_reads(state, host) {
+            return (EncodeStatus::RailRefused(status), None);
+        }
+    }
     let st = render_core_mrt_inputs(
         &prepared_pipeline,
         width,
@@ -1285,6 +1394,9 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         &mut pass.batch.borrow_mut(),
         defer,
     );
+    if !pass.batch.borrow().pending() {
+        pass.imported_reads.borrow_mut().clear();
+    }
     chain_phase::enter(chain_phase::Phase::Store);
     // Read before the status is matched, the way `runtime::exec` reads the
     // field it lands in: the backend only fills `samples` on a pass that ran to
@@ -1308,6 +1420,18 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     if !st.is_ok() {
         return (EncodeStatus::RailRefused(st), None);
     }
+    drop(color_rts);
+    let mut submitted_render = None;
+    if pipelined_store && pass.batch.borrow().pending() {
+        if let Err(status) = pass.validate_gpu_reads(state, host) {
+            return (EncodeStatus::RailRefused(status), None);
+        }
+        match pass.batch.borrow_mut().submit() {
+            Ok(submitted) => submitted_render = Some(submitted),
+            Err(status) => return (EncodeStatus::RailRefused(status), None),
+        }
+        crate::runtime::drain::note_store_route("metal_render_store_pipelined");
+    }
     if let Err(reason) = writable.publish(state, host, req.task_id) {
         return (reason, None);
     }
@@ -1327,6 +1451,52 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
     for (i, c) in color_list.iter().enumerate() {
         if c.store_action == MTL_STORE_ACTION_DONT_CARE {
             continue;
+        }
+        if direct_stores[i] {
+            let store = pass
+                .target_mut(c)
+                .ok()
+                .and_then(|target| target.gpu_store.as_mut());
+            if let Some(store) = store {
+                match store.finish_after(state, host, || {
+                    submitted_render.take().map_or(Ok(()), |render| render.finish())
+                }) {
+                    Ok(()) => {
+                        any_write = true;
+                        crate::runtime::scanout::note_front_buffer_writeback(
+                            state,
+                            host,
+                            c.mapping_id,
+                            width,
+                            height,
+                            c.format,
+                        );
+                        continue;
+                    }
+                    Err(status) => return (EncodeStatus::RailRefused(*status), None),
+                }
+            }
+        }
+        if color_outs[i].is_empty() {
+            if let Some(render) = submitted_render.take() {
+                if let Err(status) = render.finish() {
+                    return (EncodeStatus::RailRefused(status), None);
+                }
+            }
+            color_outs[i] = vec![0; need];
+            let target = match pass.target(c) {
+                Ok(target) => target,
+                Err(reason) => return (EncodeStatus::BadArgs(reason), None),
+            };
+            let _read = chain_phase::CostSpan::new("metal_readback_us");
+            if let Err(status) = crate::backend::metal::render::read_completed_rgba8(
+                target.texture(),
+                width,
+                height,
+                &mut color_outs[i],
+            ) {
+                return (EncodeStatus::RailRefused(status), None);
+            }
         }
         let out_rgba = &color_outs[i];
         if let Ok(target) = pass.target(c) {
@@ -1348,11 +1518,10 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         // than was needed. So a multi-rect draw takes the full store, and the
         // narrowing stays available for the single-rect case that has always
         // used it.
-        let store_rect = match req.scissors.as_slice() {
-            [r] if !r.covers(width, height) => Some(*r),
-            _ => None,
-        };
-        let gva_partial = seed_for_store.is_some() && store_rect.is_some();
+        let has_seed =
+            load_seed.is_some() || pass.target(c).is_ok_and(|target| target.gpu_load.is_some());
+        let store_rect = partial_store_rect(c, force_full_store, has_seed, &req.scissors);
+        let gva_partial = store_rect.is_some();
         let wrote = if c.mapping_id != 0 {
             if gva_partial {
                 let r = store_rect.expect("gva_partial implies exactly one narrowing rect");
@@ -1403,7 +1572,10 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
             }
         } else if c.target_gva != 0 {
             let Ok(target) = pass.target(c) else {
-                return (EncodeStatus::BadArgs("draw_mtl_render_pass_target_missing"), None);
+                return (
+                    EncodeStatus::BadArgs("draw_mtl_render_pass_target_missing"),
+                    None,
+                );
             };
             let Some(pages) = target.store_pages.as_ref() else {
                 return (EncodeStatus::BadArgs("draw_mtl_store_pages_missing"), None);
@@ -1498,7 +1670,10 @@ pub(crate) fn encode_draw_in_pass<M: HostMemory + HostOps>(
         seeded.store_back(state, host, (width, height));
     }
     // Moved, not cloned; see the early return above.
-    let color0_rgba = std::mem::take(&mut color_outs).into_iter().next();
+    let color0_rgba = std::mem::take(&mut color_outs)
+        .into_iter()
+        .next()
+        .filter(|bytes| req.color0_readback == Color0Readback::Required || !bytes.is_empty());
     (EncodeStatus::Ok, color0_rgba)
 }
 
@@ -2085,8 +2260,11 @@ fn load_mapper_ref_texture_rgba<M: HostMemory + HostOps>(
     load_mapper_ref_texture_mapping_rgba(state, host, mapping_id, format_override)
 }
 
-/// A sampled read served from this device's own last publication of the surface,
-/// instead of from the surface's guest pages.
+/// Historical publication rung. Its shared currency door now refuses unscoped
+/// frames; do not bypass that door to recover the old cross-command shortcut.
+///
+/// The following measurements explain the original optimization, not a proof
+/// that its historical bytes remain current after a legal CPU update.
 ///
 /// # Why this is the whole of the bar
 ///
@@ -2186,6 +2364,7 @@ fn sampled_surface_frame<M: HostMemory + HostOps>(
                         "metal_sampled_surface_unknown"
                     }
                     NoPublishedFrame::Unpublished(_) => "metal_sampled_surface_empty",
+                    NoPublishedFrame::Unscoped(_) => "metal_sampled_surface_unscoped",
                     // `serves` admits `WroteElsewhere` and the mapping and geometry were
                     // both checked above, so either arm here is a contradiction between
                     // this match and the gate rather than a guest behaviour.
@@ -2427,7 +2606,7 @@ mod tests {
     /// under the permissive standard this door would then hand every shader
     /// whatever the cache held, forever.
     #[test]
-    fn a_sampled_mapper_ref_texture_serves_a_published_frame_only_on_a_watched_clean_witness() {
+    fn sampled_mapper_ref_texture_does_not_treat_a_quiet_harvest_as_current_publication() {
         use crate::model::PAGE_SHIFT_X86;
         use crate::protocol::endian::{st16, st32};
         use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
@@ -2535,8 +2714,7 @@ mod tests {
             "an unstamped surface has no witness to spend, and the cache must not be served"
         );
 
-        // Watched and clean, which is what `mapping_write` leaves behind when it
-        // publishes: the device's own frame is the surface.
+        // A readable, unchanged observation is not a fence against CPU updates.
         let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mid)
             .expect("FakeHost observes guest writes");
         state
@@ -2545,13 +2723,13 @@ mod tests {
             .expect("mapped above")
             .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
         let (_, _, served) = load_sampled_rgba(&mut state, &mut host, task_id, texture_ref)
-            .expect("a published frame under a clean witness is the surface");
+            .expect("the current guest pixels remain readable");
         assert_eq!(
             &served[..4],
-            &PUBLISHED_RGBA,
-            "with the witness clean the device's own publication is the surface, and the \
-             per-texel decode of the guest's pages is the cost this door exists to remove"
+            &GUEST_RGBA,
+            "an unscoped historical publication must not override guest pixels"
         );
+        assert_ne!(&served[..4], &PUBLISHED_RGBA);
 
         // Repainted by the guest CPU, with no device operation at all — this
         // witness is the only thing that sees it.

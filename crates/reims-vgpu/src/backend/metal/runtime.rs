@@ -20,11 +20,9 @@
 //! teardown, leaking a VA reservation each time. A RAMBlock-wide import has no
 //! remap view to retain.
 //!
-//! **No importer is wired here yet.** Nothing in this module turns a
-//! `GuestSlice` into an `MTLBuffer`, because no caller would use one — the
-//! staged `Vec` is filled from guest RAM further up, and the seam worth cutting
-//! is there rather than here. Landing an importer without that consumer would
-//! be untestable dead code on an arm no Linux host can run.
+//! Checked guest Store imports live in [`super::guest_writeback`], with mapping
+//! identity and Metal-deallocator retirement. This module's legacy no-copy
+//! helper still handles only caller-owned host staging, not guest imports.
 
 use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 use once_cell::sync::OnceCell;

@@ -1,14 +1,25 @@
 //! Packed, planar, or leased published-resident Metal sampled bindings.
+//!
+//! Packed reuse normally removes native allocation/upload only. Direct,
+//! unreinterpreted mapper-ref textures can also avoid staging under the shared
+//! gather witness and its guest-byte audit, within a live decoded render pass.
+//! No resource lifetime or IOSurface construction descriptor extends that scope.
+//! All other routes still stage before
+//! exact byte/layout comparison. Mapping read-elision counters are separate
+//! from the upload-only reuse-byte counters.
 
 use super::*;
 use crate::backend::metal::abi::{
     ReimsVgpuPackedSampledImage, ReimsVgpuSampledImage, REIMS_VGPU_BINDING_TEXTURE_BASE,
 };
 use crate::backend::metal::planar::SampledImage;
+use crate::backend::metal::{packed, resident::PublishedSample};
 use crate::runtime::compute_exec::{
-    metal::{try_stage_planar_sampled, MetalStage}, stage_texture_raw,
+    metal::{try_stage_planar_sampled_in_scope, MetalStage}, stage_texture_raw,
 };
 use std::sync::Arc;
+
+mod mapping;
 
 pub(super) enum SampledUpload {
     Packed {
@@ -18,14 +29,53 @@ pub(super) enum SampledUpload {
         pixel_format: u32,
         bytes_per_row: u32,
     },
+    ImmutablePacked(Arc<packed::SampledImage>),
+    Imported(Arc<mapping::ImportedSample>),
     Planar(Arc<SampledImage>),
     Resident(crate::backend::metal::resident::PublishedSample),
+}
+
+#[derive(Default)]
+pub(crate) struct ImportedReads {
+    sources: Vec<Arc<mapping::ImportedSample>>,
+}
+
+impl ImportedReads {
+    pub(super) fn retain(&mut self, groups: [&[SampledUpload]; 2]) {
+        for upload in groups.into_iter().flatten() {
+            if let SampledUpload::Imported(source) = upload {
+                if !self.sources.iter().any(|held| held.same_view(source)) {
+                    self.sources.push(Arc::clone(source));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn validate<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+    ) -> Result<(), crate::backend::metal::error::Status> {
+        for source in &self.sources {
+            source.revalidate(state, host)?;
+        }
+        for source in &self.sources {
+            source.check(state)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.sources.clear();
+    }
 }
 
 impl SampledUpload {
     pub fn byte_len(&self) -> u64 {
         match self {
             Self::Packed { bytes, .. } => bytes.len() as u64,
+            Self::ImmutablePacked(image) => image.byte_len(),
+            Self::Imported(image) => image.byte_len(),
             Self::Planar(image) => image.layout().planes.iter().map(|plane| plane.size).sum(),
             Self::Resident(image) => image.byte_len(),
         }
@@ -34,6 +84,14 @@ impl SampledUpload {
     pub fn image(&self, index: u32) -> ReimsVgpuSampledImage {
         let binding = REIMS_VGPU_BINDING_TEXTURE_BASE + index;
         match self {
+            Self::Imported(image) => ReimsVgpuSampledImage::ImportedRead {
+                binding,
+                image: image.image(),
+            },
+            Self::ImmutablePacked(image) => ReimsVgpuSampledImage::Resident {
+                binding,
+                image: PublishedSample::packed(Arc::clone(image)),
+            },
             Self::Resident(image) => ReimsVgpuSampledImage::Resident {
                 binding,
                 image: image.clone(),
@@ -59,13 +117,46 @@ impl SampledUpload {
     }
 }
 
+/// Seal the complete sampled-input set after all staging/debt resolution and
+/// before encoding. Revalidating one source may retire another alias, so the
+/// final current-identity pass is read-only and covers the whole set.
+#[cfg(test)]
+pub(super) fn validate_imported<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    groups: [&[SampledUpload]; 2],
+) -> Result<(), crate::backend::metal::error::Status> {
+    for image in groups.into_iter().flatten() {
+        if let SampledUpload::Imported(image) = image {
+            image.revalidate(state, host)?;
+        }
+    }
+    for image in groups.into_iter().flatten() {
+        if let SampledUpload::Imported(image) = image {
+            image.check(state)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) fn load<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
 ) -> Option<SampledUpload> {
-    match try_stage_planar_sampled(state, host, task_id, texture_ref) {
+    load_in_scope(state, host, task_id, texture_ref, None)
+}
+
+pub(super) fn load_in_scope<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    scope: Option<&crate::runtime::draw::SnapshotScopeRef>,
+) -> Option<SampledUpload> {
+    match try_stage_planar_sampled_in_scope(state, host, task_id, texture_ref, scope) {
         Ok(Some(image)) => return Some(SampledUpload::Planar(image)),
         Ok(None) => {}
         Err(reason) => {
@@ -82,6 +173,18 @@ pub(super) fn load<M: HostMemory + HostOps>(
     // images keep their existing conversion/staging owners.
     if let Some(image) = load_resident(state, host, task_id, texture_ref) {
         return Some(SampledUpload::Resident(image));
+    }
+    match mapping::load(state, host, task_id, texture_ref, scope) {
+        Ok(Some(image)) => return Some(image),
+        Ok(None) => {}
+        Err(reason) => {
+            crate::observe::Emit::refusal("draw_mtl_packed_mapping", &reason)
+                .expect("mapping read refusal")
+                .field("task", task_id)
+                .field("ref", texture_ref)
+                .fail();
+            return None;
+        }
     }
     let native_packed = objects::lookup_list_entry(state, host, task_id, texture_ref)
         .is_some_and(|entry| match entry.object_type {
@@ -128,8 +231,7 @@ pub(super) fn load<M: HostMemory + HostOps>(
             .fail();
             return None;
         };
-        return Some(SampledUpload::Packed {
-            bytes: staged.bytes,
+        return retain_packed(state, host, task_id, texture_ref, staged.bytes, packed::Layout {
             width: staged.width,
             height: staged.height,
             pixel_format: u32::from(staged.pixel_format),
@@ -137,6 +239,15 @@ pub(super) fn load<M: HostMemory + HostOps>(
         });
     }
 
+    load_rgba_packed(state, host, task_id, texture_ref)
+}
+
+fn load_rgba_packed<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+) -> Option<SampledUpload> {
     let (width, height, bytes) = load_sampled_rgba(state, host, task_id, texture_ref)?;
     let Some(bytes_per_row) = width.checked_mul(RGBA8_BPP) else {
         crate::observe::Emit::refusal(
@@ -148,13 +259,108 @@ pub(super) fn load<M: HostMemory + HostOps>(
         .fail();
         return None;
     };
-    Some(SampledUpload::Packed {
-        bytes,
+    retain_packed(state, host, task_id, texture_ref, bytes, packed::Layout {
         width,
         height,
         pixel_format: 0,
         bytes_per_row,
     })
+}
+
+/// Packed and planar routes are disjoint for an immutable construction
+/// descriptor. No other Metal owner currently uses this resource's rail slot.
+/// One latest candidate follows deletion/reset, not a process cache or an LRU.
+#[derive(Default)]
+struct RetainedPacked {
+    latest: Option<Arc<packed::SampledImage>>,
+    mapping: Option<mapping::Proof>,
+}
+
+impl crate::model::RailResourceState for RetainedPacked {}
+
+impl RetainedPacked {
+    fn stage(
+        &mut self,
+        layout: packed::Layout,
+        bytes: Vec<u8>,
+        create: impl FnOnce(packed::Layout, Vec<u8>)
+            -> Result<packed::SampledImage, crate::backend::metal::error::Status>,
+    ) -> Result<Arc<packed::SampledImage>, crate::backend::metal::error::Status> {
+        use crate::runtime::drain::{note_store_route, note_store_route_n};
+        // An ordinary staging call may have used a different source route.
+        // Only a completed pre/post mapping witness can restore this capability.
+        self.mapping = None;
+        let same = {
+            let _compare = crate::runtime::chain_phase::CostSpan::new(
+                "metal_packed_sampled_compare_us",
+            );
+            self.latest.as_ref().filter(|image| image.matches(layout, &bytes))
+        };
+        if let Some(image) = same {
+            note_store_route("metal_packed_sampled_reuses");
+            note_store_route_n("metal_packed_sampled_reuse_bytes", bytes.len() as u64);
+            return Ok(Arc::clone(image));
+        }
+        note_store_route("metal_packed_sampled_misses");
+        self.latest = None;
+        let image = Arc::new(create(layout, bytes)?);
+        self.latest = Some(Arc::clone(&image));
+        Ok(image)
+    }
+}
+
+/// This runs *after* the existing reader and paired debt settlement on every
+/// load. Exact staged-byte equality is the only freshness test; neither a hash
+/// nor the guest/host write witnesses license skipping a read here.
+fn retain_packed<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+    bytes: Vec<u8>,
+    layout: packed::Layout,
+) -> Option<SampledUpload> {
+    let fallback = |bytes| SampledUpload::Packed {
+        bytes,
+        width: layout.width,
+        height: layout.height,
+        pixel_format: layout.pixel_format,
+        bytes_per_row: layout.bytes_per_row,
+    };
+    let Ok(resource) = objects::resolve_resource(state, host, task_id, texture_ref) else {
+        // Legacy direct mapping refs can stage without naming a TaskResource.
+        // They retain their ordinary upload path, not an invented lifetime.
+        crate::runtime::drain::note_store_route("metal_packed_sampled_unowned");
+        return Some(fallback(bytes));
+    };
+    let mut bytes = Some(bytes);
+    let staged = resource.with_rail_state(|held: &mut RetainedPacked| {
+        held.stage(layout, bytes.take().expect("one staging call"), packed::SampledImage::new)
+    });
+    match staged {
+        Some(Ok(image)) => Some(SampledUpload::ImmutablePacked(image)),
+        Some(Err(reason)) => {
+            crate::observe::Emit::refusal("draw_mtl_packed_texture", &reason)
+                .expect("native upload error is a refusal")
+                .field("task", task_id)
+                .field("ref", texture_ref)
+                .fail();
+            None
+        }
+        None => {
+            crate::observe::Emit::refusal(
+                "draw_mtl_packed_texture",
+                &crate::backend::metal::error::Status::args(
+                    "metal_packed_sampled_resource_state_conflict",
+                ),
+            )
+            .expect("a conflicting owner is a refusal")
+            .field("task", task_id)
+            .field("ref", texture_ref)
+            .fail();
+            Some(fallback(bytes.expect("a conflicting slot did not stage")))
+        }
+    }
 }
 
 fn load_resident<M: HostMemory + HostOps>(
@@ -186,7 +392,7 @@ mod tests {
     use std::mem::offset_of;
 
     #[test]
-    fn resident_sample_uses_readback_witness_and_preserves_fallbacks_and_lifetime() {
+    fn historical_resident_lease_survives_but_current_sampling_reads_guest_pixels() {
         use crate::backend::metal::{resident, runtime::system_device};
         use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         use foreign_types::ForeignType;
@@ -253,6 +459,7 @@ mod tests {
             });
             let packed_bytes = |upload| match upload {
                 SampledUpload::Packed { bytes, .. } => bytes,
+                SampledUpload::ImmutablePacked(image) => image.bytes().to_vec(),
                 _ => panic!("unproven resident must use the existing packed fallback"),
             };
             assert_eq!(
@@ -268,16 +475,19 @@ mod tests {
                 .unwrap()
                 .guest_write_gen_at_store = host.guest_write_gen(token).unwrap();
             let upload = load(&mut state, &mut host, 1, reference).unwrap();
-            assert!(matches!(&upload, SampledUpload::Resident(_)));
+            assert!(!matches!(&upload, SampledUpload::Resident(_)));
             assert_eq!(upload.byte_len(), 64);
             assert_eq!(
                 load_sampled_rgba(&mut state, &mut host, 1, reference)
                     .unwrap()
                     .2,
-                pixels,
-                "the native sample and the original readback share one witness",
+                guest_rgba,
+                "ordinary fallback cannot use a historical frame as current guest pixels",
             );
-            let image = upload.image(3);
+            let image = ReimsVgpuSampledImage::Resident {
+                binding: REIMS_VGPU_BINDING_TEXTURE_BASE + 3,
+                image: resident::sample_published_rgba8(&key, generation).unwrap(),
+            };
             assert_eq!(image.binding(), REIMS_VGPU_BINDING_TEXTURE_BASE + 3);
             assert!(
                 !image.needs_completion(),
@@ -361,8 +571,8 @@ mod tests {
             );
             assert_eq!(
                 packed_bytes(load(&mut state, &mut host, 1, reference).unwrap()),
-                [55, 44, 33, 255].repeat(16),
-                "CPU-published bytes retain priority and BGRA-to-RGBA semantics",
+                guest_rgba,
+                "a historical host-frame cache cannot override guest bytes either",
             );
             resident::forget(mapping);
             assert!(
@@ -446,16 +656,17 @@ mod tests {
                 &mut host, &state.tasks[1], list_object_entry_offset(7, 32).unwrap(), &entry,
             );
             let upload = load(&mut state, &mut host, 1, 7).expect("native linear texture");
-            let SampledUpload::Packed { bytes, .. } = &upload else {
+            let SampledUpload::ImmutablePacked(image) = &upload else {
                 panic!("linear textures are packed");
             };
-            assert_eq!(*bytes, expected, "no channel expansion or float-to-UNORM conversion");
-            let ReimsVgpuSampledImage::Packed(image) = upload.image(0) else {
-                panic!("linear texture must keep its native format");
+            assert_eq!(image.bytes(), expected, "no channel expansion or float-to-UNORM conversion");
+            assert_eq!(image.layout().pixel_format, u32::from(format));
+            assert_eq!(image.layout().bytes_per_row, tight as u32);
+            assert_eq!(image.byte_len(), (tight * height) as u64);
+            let ReimsVgpuSampledImage::Resident { image, .. } = upload.image(0) else {
+                panic!("an immutable packed upload must bind read-only");
             };
-            assert_eq!(image.pixel_format, u32::from(format));
-            assert_eq!(image.bytes_per_row, tight as u32);
-            assert_eq!(image.data_len, tight * height);
+            assert_eq!(image.texture().pixel_format() as u32, u32::from(format));
         }
     }
 
@@ -513,20 +724,24 @@ mod tests {
                 );
             }
             let upload = load(&mut state, &mut host, 1, 21).expect("native buffer texture");
-            let SampledUpload::Packed { bytes, .. } = &upload else {
+            let SampledUpload::ImmutablePacked(image) = &upload else {
                 panic!("buffer textures must use packed uploads");
             };
-            assert_eq!(*bytes, expected, "no UNORM8 conversion or row padding");
+            assert_eq!(image.bytes(), expected, "no UNORM8 conversion or row padding");
             assert_eq!(upload.byte_len(), expected.len() as u64);
-            let ReimsVgpuSampledImage::Packed(image) = upload.image(3) else {
+            assert_eq!((image.layout().width, image.layout().height), (2, 2));
+            assert_eq!(image.layout().pixel_format, u32::from(format));
+            assert_eq!(image.layout().bytes_per_row, TIGHT as u32);
+            let binding = upload.image(3);
+            assert_eq!(binding.binding(), REIMS_VGPU_BINDING_TEXTURE_BASE + 3);
+            assert!(!binding.needs_completion());
+            let ReimsVgpuSampledImage::Resident { image, .. } = binding else {
                 panic!("buffer textures must retain their native packed format");
             };
-            assert_eq!(image.binding, REIMS_VGPU_BINDING_TEXTURE_BASE + 3);
-            assert_eq!((image.width, image.height), (2, 2));
-            assert_eq!(image.pixel_format, u32::from(format));
-            assert_eq!(image.bytes_per_row, TIGHT as u32);
-            assert_eq!(image.data_len, expected.len());
-            assert_eq!(image.data, bytes.as_ptr());
+            assert_eq!(image.texture().pixel_format() as u32, u32::from(format));
         }
     }
 }
+
+#[cfg(test)]
+mod packed_tests;

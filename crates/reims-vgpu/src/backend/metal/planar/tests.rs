@@ -4,6 +4,8 @@ use crate::protocol::planar::{self, BackingFormat, SampleFormat};
 use metal::{CompileOptions, MTLResourceOptions, MTLSize};
 use objc::rc::WeakPtr;
 
+pub(crate) mod cpu_surface;
+
 pub(crate) fn device_descriptor(backing: BackingFormat) -> [u8; 512] {
     let mut b = [0; 512];
     st32(&mut b[4..], backing.word());

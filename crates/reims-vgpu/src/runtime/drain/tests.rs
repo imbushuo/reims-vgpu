@@ -3327,8 +3327,8 @@ fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
     }
     c.note_phase(DrainPhase::Flush(FlushRail::Render), 30_000);
     // Two tranches over a frame budget and one comfortably under it.
-    c.note(30_000, 0, 5_500);
-    c.note(9_000, 0, 5_600);
+    c.note(2 * DISPLAY_VBL_MIN_INTERVAL_US, 0, 5_500);
+    c.note(DISPLAY_VBL_MIN_INTERVAL_US + 1, 0, 5_600);
     c.note(1_000, 0, 5_700);
     let line = c
         .note(0, 0, 6_100)
@@ -3337,8 +3337,7 @@ fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
 
     assert!(line.contains("max_flush_us=30000"), "{line}");
     assert!(line.contains("flush_us=39000 flushes=10"), "{line}");
-    // Mean is 3.9 ms and would look healthy against an 8 ms budget; the tail is
-    // nearly four times the whole budget.
+    // The 3.9 ms mean hides the single 30 ms blocking flush.
     // Five tranches, not four: the call that closes the window is itself a
     // tranche and is counted in the window it reports.
     assert!(
@@ -3347,7 +3346,7 @@ fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
     );
     // The threshold is derived from the delivered VBL cadence, not written
     // down, so it tracks the refresh rate rather than aging beside it.
-    assert!(line.contains("slow_us=8333"), "{line}");
+    assert!(line.contains(&format!("slow_us={DISPLAY_VBL_MIN_INTERVAL_US}")), "{line}");
 
     // The same window, split by rail. Nine cheap flushes on one rail and one
     // expensive flush on another is exactly the shape the aggregate cannot

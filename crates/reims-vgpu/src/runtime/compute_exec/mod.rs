@@ -1439,6 +1439,17 @@ pub(crate) struct PlanarSource {
     description: crate::protocol::planar::TextureDescription,
     layout: crate::protocol::planar::Layout,
     map_generation: u32,
+    /// Revocable permission from an executing decoded render pass. Standalone
+    /// compute staging has no such permission and always reads fresh planes.
+    scope: Option<crate::runtime::draw::SnapshotScopeRef>,
+}
+
+struct PlanarBinding {
+    task_id: u32,
+    texture_ref: u32,
+    descriptor_ref: u32,
+    mapping_id: u32,
+    binding: u32,
 }
 
 impl PlanarSource {
@@ -1704,6 +1715,18 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     texture_ref: u32,
     binding: u32,
     is_storage: bool,
+) -> Result<StagedTexture<R>, ComputeStatus> {
+    stage_texture_raw_in_scope(state, host, task_id, texture_ref, binding, is_storage, None)
+}
+
+pub(crate) fn stage_texture_raw_in_scope<R: RailStage, M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    binding: u32,
+    is_storage: bool,
+    scope: Option<&crate::runtime::draw::SnapshotScopeRef>,
 ) -> Result<StagedTexture<R>, ComputeStatus> {
     // Ref-texture RefTextureHandle → surface_id (live CI binds ot5).
     let mut stage_ref = texture_ref;
@@ -2066,7 +2089,9 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                         return Err(ComputeStatus::Unsupported("planar_texture_view"));
                     }
                     return stage_planar_texture::<R, _>(
-                        state, host, task_id, texture_ref, stage_ref, mapping_id, binding, resource,
+                        state, host,
+                        PlanarBinding { task_id, texture_ref, descriptor_ref: stage_ref, mapping_id, binding },
+                        resource, scope,
                     );
                 }
             }
@@ -2446,13 +2471,11 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     fn stage_planar_texture<R: RailStage, M: HostMemory + HostOps>(
         state: &mut DeviceState,
         host: &mut M,
-        task_id: u32,
-        texture_ref: u32,
-        descriptor_ref: u32,
-        mapping_id: u32,
-        binding: u32,
+        bind: PlanarBinding,
         resource: std::sync::Arc<crate::model::TaskResource>,
+        scope: Option<&crate::runtime::draw::SnapshotScopeRef>,
     ) -> Result<StagedTexture<R>, ComputeStatus> {
+        let PlanarBinding { task_id, texture_ref, descriptor_ref, mapping_id, binding } = bind;
         use crate::protocol::planar::{Layout, TextureDescription};
         if !R::supports_planar_samples() {
             return Err(ComputeStatus::Unsupported("planar_sampling_metal_only"));
@@ -2512,6 +2535,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             description,
             layout,
             map_generation: generation,
+            scope: scope.cloned(),
         })?;
         Ok(StagedTexture {
             binding,

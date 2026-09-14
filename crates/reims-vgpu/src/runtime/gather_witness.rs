@@ -292,11 +292,19 @@
 //! outside the host-write record — fired tens to hundreds of times per boot, so
 //! sampling costs the alarm latency and not its reach.
 
+// CPU texture snapshots use note_scoped_gather: equal harvested generations
+// cannot exclude a legal CPU update between completed commands. ScopeEnded
+// spends that claim's generation and follows the normal audit rebaseline path,
+// without resetting the stride or inventing a guest/host write.
+
 use std::collections::HashMap;
 
 use crate::protocol::fnv;
 
-/// Which zero-copy sampled producer built the window.
+#[cfg(test)]
+mod cpu_tests;
+
+/// Which input producer built the window.
 ///
 /// The 2x2 below says whether the witness is sound; this says whose gathers it
 /// would be sound *for*. The aggregate reading that opened this — 360 gathers and
@@ -304,6 +312,8 @@ use crate::protocol::fnv;
 /// so which of them to fix is not yet known.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GatherRail {
+    /// Private CPU-captured native buffer input.
+    Buffer,
     /// Linear guest texture addressed through task GVA.
     Linear,
     /// Mapper-ref-texture mapping-backed sampled bind.
@@ -316,6 +326,7 @@ impl GatherRail {
     /// Census names for the rail's gather count and its gathered kilobytes.
     fn names(self) -> (&'static str, &'static str) {
         match self {
+            Self::Buffer => ("gw_rail_buffer", "gw_rail_buffer_kb"),
             Self::Linear => ("gw_rail_linear", "gw_rail_linear_kb"),
             Self::MapperRefTexture => ("gw_rail_t11", "gw_rail_t11_kb"),
             Self::RefTexture => ("gw_rail_t5", "gw_rail_t5_kb"),
@@ -323,15 +334,19 @@ impl GatherRail {
     }
 }
 
-/// Which sampled window a witness entry describes.
+/// Which input window a witness entry describes.
 ///
 /// The two shapes are the two ways the producers name a window: a task-GVA span
 /// (the linear texture rail, which has no mapping) and a mapping-relative offset
 /// (the mapper-ref-texture and ref-texture rails). Those two rails can name the same
 /// `(mid, base_off)` for a single-plane surface, and that is harmless — same
 /// mapping, same offset and same span is the same bytes.
+/// CPU buffer snapshots use a separate GVA domain because their byte audit has
+/// no native gather-run boundaries; the two fold representations cannot mix.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum GatherKey {
+    /// A CPU snapshot window, separate from GPU gathers' run-based audit.
+    TaskBuffer { task_id: u32, gva: u64 },
     /// A texture window addressed through a task's GVA space.
     TaskGva { task_id: u32, gva: u64 },
     /// A window at a byte offset into a mapping's page list.
@@ -354,6 +369,11 @@ impl GatherKey {
         let mut h = fnv::FNV_OFFSET_BASIS;
         let mut eat = |v: u64| h = fnv::fold_u64(h, v);
         match self {
+            Self::TaskBuffer { task_id, gva } => {
+                eat(3);
+                eat(task_id as u64);
+                eat(gva);
+            }
             Self::TaskGva { task_id, gva } => {
                 eat(1);
                 eat(task_id as u64);
@@ -372,6 +392,7 @@ impl GatherKey {
     /// splitting on spaces.
     fn log_token(self) -> String {
         match self {
+            Self::TaskBuffer { task_id, gva } => format!("buffer:{task_id}:{gva:#x}"),
             Self::TaskGva { task_id, gva } => format!("gva:{task_id}:{gva:#x}"),
             Self::Mapping { mid, base_off } => format!("map:{mid}:{base_off:#x}"),
         }
@@ -381,6 +402,7 @@ impl GatherKey {
 /// What the last bind of one window observed.
 #[derive(Clone, Debug)]
 struct Entry {
+    read_scope: ReadScope,
     /// The exact page set the gather read, in window order. A change here means
     /// the window was re-pointed and there is nothing to compare against.
     gpas: Vec<u64>,
@@ -596,6 +618,7 @@ impl GatherWitness {
                 gva: 0x1000,
             },
             Entry {
+                read_scope: ReadScope::Existing,
                 gpas: vec![0x3000],
                 span: 0x1000,
                 token,
@@ -660,32 +683,47 @@ impl GatherWitness {
 /// same precondition the gather itself relies on, read at the same point in the
 /// draw.
 pub(crate) unsafe fn fold_runs(runs: &[crate::runtime::guest_ram::GuestRun], span: u64) -> u128 {
-    let mut a: u64 = 0x9e37_79b9_7f4a_7c15;
-    let mut b: u64 = 0xc2b2_ae3d_27d4_eb4f;
-    let mut remaining = span;
-    for run in runs {
-        if remaining == 0 {
-            break;
+    let parts = runs.iter().scan(span, |remaining, run| {
+        if *remaining == 0 {
+            return None;
         }
-        let n = run.len().min(remaining) as usize;
-        remaining -= n as u64;
-        // SAFETY: caller's precondition — `host_ptr` is a stable RAMBlock alias
-        // valid for at least `run.len` bytes, and `n <= run.len`.
-        let bytes = unsafe { std::slice::from_raw_parts(run.host_ptr() as *const u8, n) };
-        let (words, tail) = bytes.split_at(n & !7);
-        for chunk in words.chunks_exact(8) {
-            let w = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
-            a = (a ^ w).rotate_left(29).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-            b = b.rotate_left(7).wrapping_add(w ^ a);
-        }
-        for (i, &byte) in tail.iter().enumerate() {
-            a ^= (byte as u64) << (8 * i);
-        }
-        // Fold the run boundary in so two windows with the same bytes split into
-        // different runs are still distinguishable.
-        b = b.wrapping_mul(0xff51_afd7_ed55_8ccd) ^ (n as u64);
+        let n = run.len().min(*remaining) as usize;
+        *remaining -= n as u64;
+        // SAFETY: the caller holds the checked run live throughout this fold.
+        Some(unsafe { std::slice::from_raw_parts(run.host_ptr() as *const u8, n) })
+    });
+    fold_parts(parts)
+}
+
+fn fold_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> u128 {
+    let mut hash = xxhash_rust::xxh3::Xxh3::new();
+    for bytes in parts {
+        // Length framing preserves run boundaries, including empty runs.
+        // The audit still reads every byte; only the folding algorithm changes.
+        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
     }
-    ((a as u128) << 64) | b as u128
+    hash.digest128()
+}
+
+#[cfg(test)]
+mod content_fold_tests {
+    use super::fold_parts;
+
+    #[test]
+    fn fold_preserves_run_boundaries_lengths_and_every_byte_including_tails() {
+        let bytes: Vec<u8> = (0..259).map(|i| (i * 37) as u8).collect();
+        let original = fold_parts([bytes.as_slice()]);
+        assert_eq!(original, fold_parts([bytes.clone().as_slice()]));
+        assert_ne!(original, fold_parts([&bytes[..128], &bytes[128..]]));
+        assert_ne!(original, fold_parts([bytes.as_slice(), &[]]));
+        for index in 0..bytes.len() {
+            let mut changed = bytes.clone();
+            changed[index] ^= 0x80;
+            assert_ne!(original, fold_parts([changed.as_slice()]), "byte {index}");
+            assert_ne!(original, fold_parts([&bytes[..index]]), "length {index}");
+        }
+    }
 }
 
 /// Every account of one bind's writers that is read out of device state, taken
@@ -822,6 +860,71 @@ pub struct GatherWindow<'a> {
     pub page_size: usize,
 }
 
+/// Scope is an additional validity term, not a synthesized dirty observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadScope {
+    Existing,
+    Command(u64),
+    Current { command: u64, available: bool },
+    Unavailable,
+}
+
+impl ReadScope {
+    fn observation(self, host: &impl crate::runtime::host::HostOps, token: u64) -> (u64, Self) {
+        if token == 0 {
+            return (0, self);
+        }
+        if let Self::Current { command, .. } = self {
+            match host.guest_write_gen_current(token) {
+                crate::runtime::host::CurrentGuestWrite::Current(generation) => (
+                    generation, Self::Current { command, available: true },
+                ),
+                _ => (
+                    host.guest_write_gen(token).unwrap_or(0),
+                    Self::Current { command, available: false },
+                ),
+            }
+        } else {
+            (host.guest_write_gen(token).unwrap_or(0), self)
+        }
+    }
+
+    fn same_domain(self, previous: Self) -> bool {
+        match (self, previous) {
+            (
+                Self::Current { command, available },
+                Self::Current { command: before, available: was_available },
+            ) => {
+                // Losing a previously current observation invalidates even
+                // within the pass. Two delayed observations retain only the
+                // original command-local reuse contract.
+                (available && was_available)
+                    || (command == before && !available && !was_available)
+            }
+            _ => self != Self::Unavailable && self == previous,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WitnessWindow<'a> {
+    gpas: &'a [u64],
+    span: u64,
+    page_size: usize,
+    read_scope: ReadScope,
+}
+
+impl<'a> From<&GatherWindow<'a>> for WitnessWindow<'a> {
+    fn from(window: &GatherWindow<'a>) -> Self {
+        Self {
+            gpas: window.gpas,
+            span: window.span,
+            page_size: window.page_size,
+            read_scope: ReadScope::Existing,
+        }
+    }
+}
+
 /// What the two halves of the witness said about one bind of a window.
 ///
 /// Returned rather than only counted so a test can drive the witness against a
@@ -835,6 +938,9 @@ pub enum GatherVerdict {
     /// No readable generation on one side of the comparison, so the hypervisor
     /// half says nothing at all. Fail closed: nothing is vouched for.
     Unarmed,
+    /// The CPU snapshot's decoded command ended, changed, or was never named.
+    /// This expires a claim without fabricating either kind of write.
+    ScopeEnded,
     /// Both halves quiet — no guest store into the pages, and no write by this
     /// device either. The gather is skippable and the entry keeps its generation.
     Vouched,
@@ -1040,6 +1146,20 @@ pub struct GatherOutcome {
     pub identity: GatheredIdentity,
     /// Whether that identity can name an image the cache already holds.
     pub vouch: GatherVouch,
+    /// Actual guest bytes read by this bind's audit, for net read-elision
+    /// accounting. This reports the existing audit; it never schedules one.
+    pub audit_bytes: u64,
+    /// Submitted device writes were ruled out over this window at observation.
+    /// The GPU gather can rely on queue ordering; a CPU snapshot cannot.
+    pub cpu_read_settled: bool,
+}
+
+impl GatherOutcome {
+    /// The existing harvest-based guest vouch, also excluding outstanding
+    /// device writes. This does not add immediate guest-CPU write exclusion.
+    pub fn cpu_read_vouched(self) -> bool {
+        self.vouch.is_vouched() && self.cpu_read_settled
+    }
 }
 
 /// Record one zero-copy sampled gather against the guest-write witness, and
@@ -1067,6 +1187,97 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     key: GatherKey,
     window: GatherWindow<'_>,
 ) -> GatherOutcome {
+    note_gather_with_scope(state, host, rail, key, window, ReadScope::Existing)
+}
+
+/// Delayed observations confine a CPU copy's claim to its decoded render pass.
+/// A current-write observation can carry the claim between live passes.
+/// Transitions between current and delayed observation quality always spend the
+/// generation; a weak capture cannot become current without being recaptured.
+pub(crate) fn note_scoped_gather<M: crate::runtime::host::HostOps>(
+    state: &mut crate::model::DeviceState,
+    host: &mut M,
+    rail: GatherRail,
+    key: GatherKey,
+    window: GatherWindow<'_>,
+    scope: Option<&crate::runtime::draw::SnapshotScopeRef>,
+) -> GatherOutcome {
+    let read_scope = match scope.and_then(crate::runtime::draw::SnapshotScopeRef::current) {
+        None => ReadScope::Unavailable,
+        Some(id) => {
+            if host.guest_write_gen_current(0)
+                == crate::runtime::host::CurrentGuestWrite::Unsupported
+            {
+                ReadScope::Command(id)
+            } else {
+                ReadScope::Current { command: id, available: false }
+            }
+        }
+    };
+    note_gather_with_scope(state, host, rail, key, window, read_scope)
+}
+
+fn note_gather_with_scope<M: crate::runtime::host::HostOps>(
+    state: &mut crate::model::DeviceState,
+    host: &mut M,
+    rail: GatherRail,
+    key: GatherKey,
+    window: GatherWindow<'_>,
+    read_scope: ReadScope,
+) -> GatherOutcome {
+    let witness = WitnessWindow { read_scope, ..(&window).into() };
+    let seen = note_with(state, host, rail, key, witness, |_| {
+        // The producer holds these checked runs live for this synchronous call.
+        Ok::<_, std::convert::Infallible>(unsafe { fold_runs(window.runs, window.span) })
+    });
+    match seen {
+        Ok(seen) => seen,
+        Err(never) => match never {},
+    }
+}
+
+/// The same guest/host freshness and audit contract for an owned CPU snapshot,
+/// without constructing or retaining a guest alias. The checked reader is
+/// invoked only when the existing audit is due. A read failure invalidates the
+/// witness and propagates; it can never turn a failed audit into a cache hit.
+pub(crate) fn note_cpu_read<M: crate::runtime::host::HostOps>(
+    state: &mut crate::model::DeviceState,
+    host: &mut M,
+    key: GatherKey,
+    gpas: &[u64],
+    span: u64,
+    page_size: usize,
+    read: impl FnOnce(&M) -> Result<Vec<u8>, crate::runtime::host::MemError>,
+) -> Result<GatherOutcome, crate::runtime::host::MemError> {
+    note_with(
+        state,
+        host,
+        GatherRail::Buffer,
+        key,
+        WitnessWindow {
+            gpas,
+            span,
+            page_size,
+            read_scope: ReadScope::Existing,
+        },
+        |host| {
+            let bytes = read(host)?;
+            if bytes.len() as u64 != span {
+                return Err(crate::runtime::host::MemError::BadArgs);
+            }
+            Ok(fold_parts([bytes.as_slice()]))
+        },
+    )
+}
+
+fn note_with<M: crate::runtime::host::HostOps, E>(
+    state: &mut crate::model::DeviceState,
+    host: &mut M,
+    rail: GatherRail,
+    key: GatherKey,
+    window: WitnessWindow<'_>,
+    fold: impl FnOnce(&M) -> Result<u128, E>,
+) -> Result<GatherOutcome, E> {
     use crate::runtime::drain::{note_store_route, note_store_route_n};
 
     let span = window.span;
@@ -1092,7 +1303,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             GatherKey::Mapping { mid, .. } => {
                 state.mappings.get(&mid).map(|m| m.content_generation)
             }
-            GatherKey::TaskGva { .. } => None,
+            GatherKey::TaskGva { .. } | GatherKey::TaskBuffer { .. } => None,
         },
         pending: PendingWrites::over(window.gpas),
     };
@@ -1118,7 +1329,16 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     // The guest's own statement about this resource, read before the witness is
     // touched for the same reason the host-write epoch is: it has to describe the
     // moment the inferred half is asked about, not a moment after it.
-    let seen = observe(&mut state.gather_witness, host, key, window, counts, fresh);
+    let cpu_read_settled = counts.pending.settled();
+    let seen = observe_with(
+        &mut state.gather_witness,
+        host,
+        key,
+        window,
+        counts,
+        fresh,
+        fold,
+    )?;
 
     // Score the guest's stated account against the hypervisor's inferred one,
     // and both against the content audit. Nothing branches on the stated channel
@@ -1129,6 +1349,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     // stated channel would recover. `gwst_stated_stricter` is the opposite cell
     // and costs nothing but a gather that would have happened anyway.
     match (seen.stated, seen.verdict) {
+        (_, GatherVerdict::ScopeEnded) => note_store_route("gwst_scope_ended"),
         (StatedGuestWrite::Unaddressed, _) => note_store_route("gwst_unaddressed"),
         (StatedGuestWrite::Quiet, GatherVerdict::Vouched) => note_store_route("gwst_agree_quiet"),
         (StatedGuestWrite::Wrote, GatherVerdict::Refused { .. }) => {
@@ -1158,6 +1379,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     match seen.verdict {
         GatherVerdict::Rearmed => note_store_route("gw_rearm"),
         GatherVerdict::Unarmed => note_store_route("gw_unarmed"),
+        GatherVerdict::ScopeEnded => note_store_route("gw_scope_ended"),
         GatherVerdict::Vouched => {
             note_store_route("gw_vouched");
             note_store_route_n("gw_vouched_kb", span / 1024);
@@ -1211,13 +1433,21 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             .fail_once(key.content_key());
         }
     }
-    GatherOutcome {
+    Ok(GatherOutcome {
         identity: GatheredIdentity {
             key: key.content_key(),
             generation: seen.generation,
         },
         vouch: seen.vouch,
-    }
+        cpu_read_settled,
+        audit_bytes: match seen.audit {
+            ContentAudit::Seeded
+            | ContentAudit::Rebaselined
+            | ContentAudit::Agreed
+            | ContentAudit::Disagreed => span,
+            ContentAudit::Skipped | ContentAudit::Restarted | ContentAudit::Indebted => 0,
+        },
+    })
 }
 
 /// Whether this bind's identity names bytes some earlier gather already moved,
@@ -1276,6 +1506,7 @@ pub struct GatheredIdentity {
 
 /// The witness itself: ask both halves about the last bind of the same window,
 /// audit the answer on the stride, and leave the entry describing this bind.
+#[cfg(test)]
 fn observe<M: crate::runtime::host::HostOps>(
     witness: &mut GatherWitness,
     host: &mut M,
@@ -1284,11 +1515,35 @@ fn observe<M: crate::runtime::host::HostOps>(
     counts: WitnessReadings,
     fresh_generation: u64,
 ) -> GatherObservation {
-    let GatherWindow {
+    let seen = observe_with(
+        witness,
+        host,
+        key,
+        (&window).into(),
+        counts,
+        fresh_generation,
+        |_| Ok::<_, std::convert::Infallible>(unsafe { fold_runs(window.runs, window.span) }),
+    );
+    match seen {
+        Ok(seen) => seen,
+        Err(never) => match never {},
+    }
+}
+
+fn observe_with<M: crate::runtime::host::HostOps, E>(
+    witness: &mut GatherWitness,
+    host: &mut M,
+    key: GatherKey,
+    window: WitnessWindow<'_>,
+    counts: WitnessReadings,
+    fresh_generation: u64,
+    fold: impl FnOnce(&M) -> Result<u128, E>,
+) -> Result<GatherObservation, E> {
+    let WitnessWindow {
         gpas,
-        runs,
         span,
         page_size,
+        read_scope,
     } = window;
     let WitnessReadings {
         pages_epoch,
@@ -1328,14 +1583,11 @@ fn observe<M: crate::runtime::host::HostOps>(
             }
         }
         let token = host.track_guest_writes(gpas, page_size).unwrap_or(0);
-        let gen = if token == 0 {
-            0
-        } else {
-            host.guest_write_gen(token).unwrap_or(0)
-        };
+        let (gen, read_scope) = read_scope.observation(host, token);
         witness.entries.insert(
             key,
             Entry {
+                read_scope,
                 gpas: gpas.to_vec(),
                 span,
                 token,
@@ -1355,7 +1607,7 @@ fn observe<M: crate::runtime::host::HostOps>(
                 generation: fresh_generation,
             },
         );
-        return GatherObservation {
+        return Ok(GatherObservation {
             verdict: GatherVerdict::Rearmed,
             audit: ContentAudit::Skipped,
             generation: fresh_generation,
@@ -1368,7 +1620,7 @@ fn observe<M: crate::runtime::host::HostOps>(
             // window. Reporting it as quiet would credit the stated channel with
             // vouching for a window that gathers unconditionally.
             stated: StatedGuestWrite::Unaddressed,
-        };
+        });
     }
 
     // Copied out before the entry is borrowed mutably: the policy belongs to the
@@ -1378,11 +1630,7 @@ fn observe<M: crate::runtime::host::HostOps>(
         .entries
         .get_mut(&key)
         .expect("the stale branch above returns for every absent key");
-    let gen = if entry.token == 0 {
-        0
-    } else {
-        host.guest_write_gen(entry.token).unwrap_or(0)
-    };
+    let (gen, read_scope) = read_scope.observation(host, entry.token);
     // A generation of 0 on either side is "cannot tell": the token is unarmed,
     // was released with its pages, or has not survived the two harvests the
     // dirty adapter needs before it can answer at all.
@@ -1392,16 +1640,18 @@ fn observe<M: crate::runtime::host::HostOps>(
     // of this, and two spellings of it is one edit away from a witness that
     // vouches and reports a host write in the same breath.
     let host_quiet = pages_wrote.is_some_and(|seen| !seen.wrote());
+    let same_scope = read_scope.same_domain(entry.read_scope);
     let verdict = if gen == 0 || entry.gen == 0 {
         GatherVerdict::Unarmed
     } else if gen == entry.gen && host_quiet {
-        GatherVerdict::Vouched
+        if same_scope { GatherVerdict::Vouched } else { GatherVerdict::ScopeEnded }
     } else {
         GatherVerdict::Refused {
             guest_wrote: gen != entry.gen,
             host_wrote_pages: !host_quiet,
         }
     };
+    entry.read_scope = read_scope;
     let vouched = matches!(verdict, GatherVerdict::Vouched);
 
     // The guest's own account of the same writes the `gen` comparison above
@@ -1415,11 +1665,24 @@ fn observe<M: crate::runtime::host::HostOps>(
     };
     entry.stated_gen = stated_now;
 
-    // SAFETY (every `fold_runs` below): `runs` describe the window this draw is
-    // about to gather from, so their pointers are live here for the same reason
-    // they are live there. On a vouched bind the gather will be skipped, but the
-    // runs were resolved by the same producer in the same call and name the same
-    // pages, which the entry's page set is checked against above.
+    let needs_fold = pending.settled()
+        && if entry.audit_armed {
+            vouched || entry.rebaselines < AUDIT_REBASELINE_LIMIT
+        } else {
+            entry.binds_since_fold >= density.stride()
+        };
+    let folded = if needs_fold {
+        Some(fold(host).inspect_err(|_| {
+            entry.gen = 0;
+            entry.generation = fresh_generation;
+            entry.fold_valid = false;
+            entry.audit_armed = false;
+            entry.rebaselines = 0;
+            entry.binds_since_fold = 0;
+        })?)
+    } else {
+        None
+    };
     let audit = if !pending.settled() {
         // A copy this device submitted is in flight over these pages and the
         // fold is a CPU read of them, so whatever it reads now is neither the
@@ -1445,7 +1708,7 @@ fn observe<M: crate::runtime::host::HostOps>(
         // drops the baseline, and a run of sixty-four vouched binds is not
         // something this workload produces.
         if vouched {
-            let fold = unsafe { fold_runs(runs, span) };
+            let fold = folded.expect("armed settled audit");
             let audit = match fold == entry.fold {
                 true => ContentAudit::Agreed,
                 false => ContentAudit::Disagreed,
@@ -1461,7 +1724,7 @@ fn observe<M: crate::runtime::host::HostOps>(
             // nothing. The gather is about to read this window anyway, so a
             // fresh baseline costs the fold and keeps the arm alive for the
             // vouched bind it is waiting for.
-            entry.fold = unsafe { fold_runs(runs, span) };
+            entry.fold = folded.expect("settled rebaseline");
             entry.fold_seeded = true;
             entry.fold_valid = true;
             entry.rebaselines += 1;
@@ -1480,7 +1743,7 @@ fn observe<M: crate::runtime::host::HostOps>(
         // Arm: take the baseline whatever this bind's verdict is. The fold reads
         // the guest pages directly, so it describes the window on a vouched bind
         // (where the gather is skipped) exactly as it does on a refused one.
-        entry.fold = unsafe { fold_runs(runs, span) };
+        entry.fold = folded.expect("settled stride audit");
         entry.fold_seeded = true;
         entry.fold_valid = true;
         entry.audit_armed = true;
@@ -1513,7 +1776,7 @@ fn observe<M: crate::runtime::host::HostOps>(
     entry.gen = gen;
     entry.pages_epoch = pages_epoch;
     entry.last_seen = witness.binds;
-    GatherObservation {
+    Ok(GatherObservation {
         verdict,
         audit,
         generation: entry.generation,
@@ -1523,13 +1786,79 @@ fn observe<M: crate::runtime::host::HostOps>(
             GatherVouch::Fresh
         },
         stated,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::guest_ram::GuestRun;
+
+    #[test]
+    fn scoped_gather_expires_claims_without_fake_writes_or_disabling_the_audit() {
+        use crate::model::{DeviceId, DeviceState, PAGE_SHIFT_X86};
+        use crate::runtime::draw::BufferSnapshotScope;
+        use crate::runtime::host::HostOps;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.gather_witness = witness_auditing(AuditDensity::EveryBind);
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut bytes = vec![0x51; PAGE];
+        let mut owner = BufferSnapshotScope::new();
+        let observe = |state: &mut DeviceState, host: &mut _, bytes: &[u8], scope: Option<&crate::runtime::draw::SnapshotScopeRef>| {
+            note_scoped_gather(state, host, GatherRail::MapperRefTexture, KEY,
+                one_page(&GPAS, &[run_over(bytes)]), scope)
+        };
+        let first = observe(&mut state, &mut host, &bytes, Some(&owner.reference()));
+        let warm = observe(&mut state, &mut host, &bytes, Some(&owner.reference()));
+        assert!(warm.cpu_read_vouched());
+        assert_eq!(first.identity, warm.identity);
+        let baseline = observe(&mut state, &mut host, &bytes, Some(&owner.reference()));
+        assert_eq!(baseline.audit_bytes, PAGE as u64);
+        let token = state.gather_witness.entries[&KEY].token;
+        let generation = host.guest_write_gen(token);
+        let host_epoch = state.host_writes.epoch();
+        let old_scope = owner.reference();
+        owner = BufferSnapshotScope::new();
+        bytes[0] ^= 0xff; // legal between commands, before a later harvest
+        let fresh = observe(&mut state, &mut host, &bytes, Some(&owner.reference()));
+        assert!(!fresh.cpu_read_vouched());
+        assert_ne!(fresh.identity, warm.identity);
+        assert_eq!(fresh.audit_bytes, PAGE as u64, "the armed audit rebaselines, not disappears");
+        let checked = observe(&mut state, &mut host, &bytes, Some(&owner.reference()));
+        assert!(checked.cpu_read_vouched());
+        assert_eq!(checked.identity, fresh.identity);
+        assert_eq!(checked.audit_bytes, PAGE as u64, "the new scope's next vouch is still audited");
+        assert_eq!(host.guest_write_gen(token), generation);
+        assert_eq!(state.host_writes.epoch(), host_epoch);
+        assert!(old_scope.current().is_none());
+        for scope in [None, Some(&old_scope)] {
+            let a = observe(&mut state, &mut host, &bytes, scope);
+            let b = observe(&mut state, &mut host, &bytes, scope);
+            assert!(!a.cpu_read_vouched() && !b.cpu_read_vouched());
+            assert_ne!(a.identity, b.identity);
+        }
+    }
+
+    #[test]
+    fn cpu_reuse_needs_a_vouch_and_disjoint_pending_writes() {
+        for vouch in [GatherVouch::Fresh, GatherVouch::Vouched] {
+            for cpu_read_settled in [false, true] {
+                let outcome = GatherOutcome {
+                    identity: GatheredIdentity {
+                        key: 1,
+                        generation: 1,
+                    },
+                    vouch,
+                    audit_bytes: 0,
+                    cpu_read_settled,
+                };
+                assert_eq!(
+                    outcome.cpu_read_vouched(),
+                    vouch == GatherVouch::Vouched && cpu_read_settled,
+                );
+            }
+        }
+    }
 
     const KEY: GatherKey = GatherKey::Mapping {
         mid: 11,

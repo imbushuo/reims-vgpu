@@ -31,6 +31,21 @@ if CommandLine.arguments.contains("--mapper-ring-wrap-only") {
     finish()
 }
 
+if CommandLine.arguments.contains("--mapped-store-cpu-only") {
+    mappedStoreCpuVisibilityCase()
+    finish()
+}
+
+if CommandLine.arguments.contains("--cpu-surface-sampling-only") {
+    cpuSurfaceSamplingCases()
+    finish()
+}
+
+if CommandLine.arguments.contains("--gpu-published-cpu-surface-sampling-only") {
+    cpuSurfaceSamplingCases(gpuSeeded: true)
+    finish()
+}
+
 if CommandLine.arguments.contains("--topology-only") {
     _ = library
     report("shader_compile", true, "runtime library built")
@@ -102,6 +117,10 @@ report("shader_compile", true, "runtime library built")
 topologyCases()
 
 floatSamplingCases()
+
+cpuSurfaceSamplingCases()
+
+cpuSurfaceSamplingCases(gpuSeeded: true)
 
 alphaSurfaceRenderCases(64, 32)
 alphaSurfaceRenderCases(702, 576)
@@ -319,6 +338,7 @@ blitIOSurfaceSourceCase(1920, 1080, frames: 4)
 blitBufferBackedCase(512, 512)
 
 mapperRingWrapCase()
+mappedStoreCpuVisibilityCase()
 
 // A device-wide waiter-first scheduling defect can stop all later work, so
 // this bounded probe deliberately closes the battery.

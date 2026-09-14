@@ -14,7 +14,7 @@ use reims_vgpu_protocol::pass_action::{
     MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD,
     MTL_STORE_ACTION_DONT_CARE,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Attachment {
@@ -59,6 +59,8 @@ pub(crate) struct PassLocalColorTarget {
     initialized: bool,
     pub(crate) resident: Option<crate::runtime::draw::metal::ResidentPlan>,
     pub(crate) store_pages: Option<crate::runtime::draw::StoreTargetPages>,
+    pub(crate) gpu_store: Option<crate::runtime::mapping_write::metal::Store>,
+    pub(crate) gpu_load: Option<super::guest_writeback::ReadSource>,
 }
 
 impl PassLocalColorTarget {
@@ -92,6 +94,8 @@ pub struct MetalRenderPass {
     pub(crate) depth: Option<crate::runtime::draw::metal::HostDepthStencil>,
     pub(crate) stencil: Option<crate::runtime::draw::metal::HostDepthStencil>,
     pub(crate) dependencies: RefCell<crate::runtime::draw::metal::PassDependencies>,
+    pub(crate) imported_reads: RefCell<crate::runtime::draw::metal::ImportedReads>,
+    pub(crate) gpu_store_allowed: Cell<bool>,
     depth_identity: Option<(u32, crate::runtime::render_pass::AttachSubresource, u16)>,
     stencil_identity: Option<(u32, crate::runtime::render_pass::AttachSubresource, u16)>,
 }
@@ -105,6 +109,9 @@ impl MetalRenderPass {
             _ => return Err("draw_mtl_render_pass_sequence"),
         }
         let initial = self.phase == Phase::New;
+        if initial {
+            self.gpu_store_allowed.set(true);
+        }
         let depth = request
             .depth_attach
             .map(|a| (a.texture_ref, a.into(), a.store_action));
@@ -206,6 +213,8 @@ impl MetalRenderPass {
                     initialized: false,
                     resident: None,
                     store_pages: None,
+                    gpu_store: None,
+                    gpu_load: None,
                 });
             }
         } else if request.colors.len() != self.targets.len()
@@ -268,17 +277,72 @@ impl MetalRenderPass {
             if !target.initialized && color.target_gva != 0 {
                 // Capture before the first draw, not the last draw's Store:
                 // deferred draws can span a guest rewire of this same GVA.
-                target.store_pages = Some(
-                    crate::runtime::draw::StoreTargetPages::capture(
-                        state,
-                        host,
-                        request.task_id,
-                        color.target_gva,
-                        u64::from(color.row_stride) * u64::from(color.height),
-                    ),
-                );
+                target.store_pages = Some(crate::runtime::draw::StoreTargetPages::capture(
+                    state,
+                    host,
+                    request.task_id,
+                    color.target_gva,
+                    u64::from(color.row_stride) * u64::from(color.height),
+                ));
             }
         }
+    }
+
+    pub(crate) fn validate_gpu_reads<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+    ) -> Result<(), super::util::Status> {
+        let imported = self.imported_reads.borrow().validate(state, host);
+        if let Err(status) = imported {
+            self.batch.borrow_mut().abort_pending(status);
+            return Err(status);
+        }
+        let pending = self.batch.borrow().pending_guest_reads();
+        for target in &self.targets {
+            if target.gpu_load.is_some() && (pending || !target.initialized) {
+                let result = target
+                    .gpu_store
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Box::new(super::util::Status::args("metal_gpu_load_owner_missing"))
+                    })
+                    .and_then(|store| store.check(state, host));
+                if let Err(status) = result {
+                    self.batch.borrow_mut().abort_pending(*status);
+                    return Err(*status);
+                }
+            }
+        }
+        for target in &self.targets {
+            if let Some(source) = target
+                .gpu_load
+                .as_ref()
+                .filter(|_| pending || !target.initialized)
+            {
+                if let Err(status) = source.check_live() {
+                    self.batch.borrow_mut().abort_pending(status);
+                    return Err(status);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush_checked<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        reason: &'static str,
+    ) -> Result<(), super::util::Status> {
+        if self.batch.borrow().pending_guest_reads() {
+            self.validate_gpu_reads(state, host)?;
+        }
+        let result = self.flush(reason);
+        if !self.batch.borrow().pending() {
+            self.imported_reads.borrow_mut().clear();
+        }
+        result
     }
 
     pub(crate) fn flush(&self, reason: &'static str) -> Result<(), super::util::Status> {
@@ -314,14 +378,21 @@ impl MetalRenderPass {
     }
 
     fn refused(&mut self) {
+        if self.batch.borrow().pending_guest_reads() {
+            let status = super::util::Status::args("metal_gpu_load_abandoned");
+            self.batch.borrow_mut().abort_pending(status);
+        }
         // Submitted work must complete before caller-owned guest state can be
         // released, even when a later record refuses before encoding.
-        if let Err(status) = self.flush("metal_batch_refusal") {
-            crate::observe::Emit::refusal("metal_render_pass", &status)
-                .unwrap()
-                .fail();
+        if self.batch.borrow().pending() {
+            if let Err(status) = self.flush("metal_batch_refusal") {
+                crate::observe::Emit::refusal("metal_render_pass", &status)
+                    .unwrap()
+                    .fail();
+            }
         }
         self.targets.clear();
+        self.imported_reads.borrow_mut().clear();
         self.depth = None;
         self.stencil = None;
         self.phase = Phase::Failed;
@@ -336,6 +407,35 @@ impl MetalRenderPass {
         force_full_store: bool,
     ) -> (EncodeStatus, Option<Vec<u8>>) {
         self.with_draw(request, |pass, request| {
+            pass.gpu_store_allowed.set(
+                pass.gpu_store_allowed.get()
+                    && !(writeback_guest && request.render_pass_continues)
+                    && request.visibility.is_none()
+                    && request.depth_attach.is_none()
+                    && request.stencil_attach.is_none()
+                    && request
+                        .colors
+                        .iter()
+                        .all(|color| color.sample_count == 1 && color.multisample_source_ref == 0),
+            );
+            if !request.continues_render_pass {
+                let reason = if writeback_guest && request.render_pass_continues {
+                    "metal_gpu_store_midpass_writeback"
+                } else if request.visibility.is_some() {
+                    "metal_gpu_store_visibility"
+                } else if request.depth_attach.is_some() || request.stencil_attach.is_some() {
+                    "metal_gpu_store_depth_stencil"
+                } else if request
+                    .colors
+                    .iter()
+                    .any(|c| c.sample_count != 1 || c.multisample_source_ref != 0)
+                {
+                    "metal_gpu_store_multisample"
+                } else {
+                    "metal_gpu_store_policy_eligible"
+                };
+                crate::runtime::drain::note_store_route(reason);
+            }
             pass.capture_store_pages(state, host, request);
             let result = crate::runtime::draw::metal::encode_draw_in_pass(
                 state,
@@ -389,6 +489,17 @@ impl MetalRenderPass {
 
 impl Drop for MetalRenderPass {
     fn drop(&mut self) {
+        if !self.batch.borrow().pending() {
+            return;
+        }
+        if self.batch.borrow().pending_guest_reads() {
+            let status = super::util::Status::args("metal_gpu_load_abandoned");
+            self.batch.borrow_mut().abort_pending(status);
+            crate::observe::Emit::refusal("metal_render_pass_drop", &status)
+                .unwrap()
+                .fail();
+            return;
+        }
         if let Err(status) = self.flush("metal_batch_drop") {
             crate::observe::Emit::refusal("metal_render_pass_drop", &status)
                 .unwrap()

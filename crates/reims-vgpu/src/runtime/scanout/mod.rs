@@ -78,11 +78,38 @@ pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
+    read_mapping_rows(state, host, mapping_id, PaintDst {
+        bytes: dst, stride: dst_stride, width, height, order: RowOrder::Bgra,
+    })
+}
+
+/// Sample directly in RGBA order without a full-image BGRA intermediate.
+pub(crate) fn read_mapping_rgba8<M: HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    dst: &mut [u8],
+    dst_stride: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    read_mapping_rows(state, host, mapping_id, PaintDst {
+        bytes: dst, stride: dst_stride, width, height, order: RowOrder::Rgba,
+    })
+}
+
+fn read_mapping_rows<M: HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    dst: PaintDst<'_>,
+) -> bool {
+    let (width, height, dst_stride) = (dst.width, dst.height, dst.stride);
     if !scanout_extent_ok(width, height) || dst_stride < width.saturating_mul(RGBA8_BPP) {
         return false;
     }
     let need = (height as u64).saturating_mul(dst_stride as u64) as usize;
-    if dst.len() < need {
+    if dst.bytes.len() < need {
         return false;
     }
     let _ = crate::runtime::mapper::ensure_resolved_for_scanout(state, host, mapping_id);
@@ -90,12 +117,7 @@ pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
         state,
         host,
         mapping_id,
-        PaintDst {
-            bytes: dst,
-            stride: dst_stride,
-            width,
-            height,
-        },
+        dst,
         crate::runtime::render_writeback::SettleSite::SampledMappingRead,
     )
 }
@@ -556,6 +578,7 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             stride: dst_stride,
             width,
             height,
+            order: RowOrder::Bgra,
         },
         crate::runtime::render_writeback::SettleSite::ScanoutPaint,
     ) {
@@ -897,11 +920,18 @@ impl crate::observe::Decline for CaptureDecline {
 /// fill. One parameter because the four travel together through every caller and
 /// a stride that belongs to a different buffer is the mistake worth making
 /// unspellable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowOrder {
+    Bgra,
+    Rgba,
+}
+
 struct PaintDst<'a> {
     bytes: &'a mut [u8],
     stride: u32,
     width: u32,
     height: u32,
+    order: RowOrder,
 }
 
 /// `site` is the caller's own, not this leaf's. Both callers read the same guest
@@ -921,6 +951,7 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
         stride: dst_stride,
         width,
         height,
+        order,
     } = dst;
     use crate::runtime::mapping_write::mapper_ref_texture_sample_window;
 
@@ -1046,7 +1077,8 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     };
 
     let mut src_row = vec![0u8; tight as usize];
-    let mut rgba_row = if format == MTL_FORMAT_BGRA8_UNORM
+    let mut rgba_row = if order == RowOrder::Rgba
+        || format == MTL_FORMAT_BGRA8_UNORM
         || format == pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
     {
         None
@@ -1064,6 +1096,29 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
             return fail(CaptureDecline::DstOverflow { row: y });
         }
         let src_off = (y as usize).saturating_mul(bpr);
+
+        if order == RowOrder::Rgba {
+            if let Some(base) = base {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        base.add(src_off), src_row.as_mut_ptr(), tight as usize,
+                    );
+                }
+            } else if let Some(bytes) = multi.as_ref() {
+                let Some(row) = bytes.get(src_off..src_off + tight as usize) else {
+                    return fail(CaptureDecline::ConvertRowOob { row: y });
+                };
+                src_row.copy_from_slice(row);
+            } else {
+                return fail(CaptureDecline::ConvertRowMissing { row: y });
+            }
+            if !row_rail.is_some_and(|rail| {
+                rail.convert(&src_row, mw, &mut dst[dst_off..dst_off + dst_row_len])
+            }) {
+                return fail(CaptureDecline::ConvertToRgba { format });
+            }
+            continue;
+        }
 
         if let Some(ref mut rgba) = rgba_row {
             // Non-BGRA source: stage the tight guest row, then convert via RGBA8.

@@ -20,7 +20,29 @@ define {float} @declared_reach(ptr addrspace(2) %object, ptr addrspace(1) %array
 !6 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1}
 "#;
 
-pub(crate) fn object(stage: Stage, index: u32, bytes: u32) -> BoundedRead {
+pub(crate) fn unbounded_readonly() -> BufferRead {
+    BufferExtents {
+        stage: Stage::Fragment,
+        reflection: reflect_text(FRAGMENT, Stage::Fragment),
+    }
+    .bound(1)
+    .unwrap()
+}
+
+pub(crate) fn writable_object() -> BufferRead {
+    let source = FRAGMENT.replace(
+        "!\"air.read\", !\"air.address_space\", i32 2",
+        "!\"air.read_write\", !\"air.address_space\", i32 2",
+    );
+    BufferExtents {
+        stage: Stage::Fragment,
+        reflection: reflect_text(&source, Stage::Fragment),
+    }
+    .bound(0)
+    .unwrap()
+}
+
+pub(crate) fn object(stage: Stage, index: u32, bytes: u32) -> BufferRead {
     let source = match stage {
         Stage::Fragment => format!(
             r#"
@@ -75,10 +97,74 @@ fn only_air_object_extent_bounds_capture_not_dynamic_pointer_or_type_size() {
     assert_eq!(proof.bytes_for(Class::Fragment, 0), Some(4));
     assert!(proof.bytes_for(Class::Vertex, 0).is_none());
     assert!(proof.bytes_for(Class::Fragment, 1).is_none());
-    for index in [1, 2, 3] {
-        assert!(extents.bound(index).is_none());
+    for index in [1, 2] {
+        let (extent, readonly) = extents
+            .bound(index)
+            .unwrap()
+            .capture_for(Class::Fragment, index)
+            .unwrap();
+        assert!(extent.is_none(), "pointee size must not narrow capture");
+        assert!(
+            readonly.unwrap().bytes().is_none(),
+            "unbounded full capture"
+        );
     }
+    assert!(extents.bound(3).is_none(), "absent slot has no certificate");
     assert!(reflect_text(FRAGMENT, Stage::Vertex).is_err());
+}
+
+#[test]
+fn immutable_reuse_requires_no_write_access_independently_of_reach() {
+    let readonly = BufferExtents {
+        stage: Stage::Fragment,
+        reflection: reflect_text(FRAGMENT, Stage::Fragment),
+    };
+    let (bytes, proof) = readonly
+        .bound(0)
+        .unwrap()
+        .capture_for(Class::Fragment, 0)
+        .unwrap();
+    assert_eq!(bytes, Some(4));
+    assert_eq!(proof.unwrap().bytes(), Some(4));
+    assert!(readonly
+        .bound(0)
+        .unwrap()
+        .capture_for(Class::Vertex, 0)
+        .is_none());
+    assert!(
+        readonly
+            .bound(1)
+            .unwrap()
+            .capture_for(Class::Fragment, 1)
+            .unwrap()
+            .1
+            .unwrap()
+            .bytes()
+            .is_none(),
+        "an unbounded readonly pointer captures the full suffix"
+    );
+    let writable = FRAGMENT.replace(
+        "!\"air.read\", !\"air.address_space\", i32 2",
+        "!\"air.read_write\", !\"air.address_space\", i32 2",
+    );
+    let writable = BufferExtents {
+        stage: Stage::Fragment,
+        reflection: reflect_text(&writable, Stage::Fragment),
+    };
+    let (bytes, proof) = writable
+        .bound(0)
+        .unwrap()
+        .capture_for(Class::Fragment, 0)
+        .unwrap();
+    assert_eq!(
+        bytes,
+        Some(4),
+        "writability does not remove the existing capture bound"
+    );
+    assert!(
+        proof.is_none(),
+        "no readonly claim may be inferred from a bounded size"
+    );
 }
 
 fn wrapped_air(source: &str) -> Vec<u8> {

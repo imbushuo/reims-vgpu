@@ -10,6 +10,7 @@ pub(crate) struct Fixture {
     pub state: DeviceState,
     pub host: FakeHost,
     pub page: u64,
+    pub input_scope: BufferSnapshotScope,
 }
 
 impl Fixture {
@@ -33,7 +34,12 @@ impl Fixture {
                 .unwrap();
         }
         state.define_task(1, 0x1000, 2);
-        Self { state, host, page }
+        Self {
+            state,
+            host,
+            page,
+            input_scope: BufferSnapshotScope::new(),
+        }
     }
 
     pub fn resource(&self, handle: u32, size: u64) -> Arc<TaskResource> {

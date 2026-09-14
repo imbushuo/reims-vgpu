@@ -2449,6 +2449,22 @@ const fn f16_to_unorm8_lut() -> &'static [u8; 65536] {
     &F16_TO_UNORM8
 }
 
+#[inline]
+fn f16_to_unorm8_row(half_bits: u16) -> u8 {
+    const ONE: u16 = (F16_EXP_BIAS as u16) << F16_EXP_SHIFT;
+    const BIAS: u32 = ((F32_EXP_BIAS - F16_EXP_BIAS) as u32) << F32_EXP_SHIFT;
+    // Positive normal halves widen exactly. The biased subnormal values still
+    // round to zero in unorm8; negative values and all NaNs select zero below.
+    // This arithmetic can vectorize, unlike the scalar texel table gathers.
+    let bits = (u32::from(half_bits.min(ONE)) << F16_F32_MANT_SHIFT) + BIAS;
+    let value = (f32::from_bits(bits) * UNORM8_MAX as f32 + 0.5) as u8;
+    if half_bits > F16_INF_BITS {
+        UNORM8_MIN
+    } else {
+        value
+    }
+}
+
 const fn unorm8_to_f16_slow(value: u8) -> u16 {
     let f = value as f32 / UNORM8_MAX as f32;
     let x = f.to_bits();
@@ -3067,7 +3083,7 @@ pub enum RowToRgba8 {
     Rgba8,
     /// Four bytes in B,G,R,A order — the row is a four-byte shuffle.
     Bgra8,
-    /// Four `float16` channels, narrowed through `f16_to_unorm8_lut`. Lossy;
+    /// Four `float16` channels, narrowed identically to the texel lookup. Lossy;
     /// see [`narrows_to_unorm8`], which lists exactly this arm and its sibling.
     Rgba16Float,
     /// Two `float16` channels → R,G; blue zero, alpha opaque. Lossy for
@@ -3172,20 +3188,20 @@ impl RowToRgba8 {
                 }
             }
             Self::Rgba16Float => {
-                let lut = f16_to_unorm8_lut();
-                for (s, d) in src.chunks_exact(8).zip(dst.chunks_exact_mut(4)) {
-                    d[COMPONENT_R] = lut[ld16(&s[0..2]) as usize];
-                    d[COMPONENT_G] = lut[ld16(&s[2..4]) as usize];
-                    d[COMPONENT_B] = lut[ld16(&s[4..6]) as usize];
-                    d[COMPONENT_A] = lut[ld16(&s[6..8]) as usize];
+                for (s, d) in src.as_chunks::<2>().0.iter().zip(dst.iter_mut()) {
+                    *d = f16_to_unorm8_row(ld16(s));
                 }
             }
             Self::Rg16Float => {
-                let lut = f16_to_unorm8_lut();
-                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                for (s, d) in src
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                {
                     let mut px = [0u8; 4];
-                    px[COMPONENT_R] = lut[ld16(&s[0..2]) as usize];
-                    px[COMPONENT_G] = lut[ld16(&s[2..4]) as usize];
+                    px[COMPONENT_R] = f16_to_unorm8_row(ld16(&s[0..2]));
+                    px[COMPONENT_G] = f16_to_unorm8_row(ld16(&s[2..4]));
                     px[COMPONENT_A] = UNORM8_MAX;
                     d.copy_from_slice(&px);
                 }
@@ -3377,8 +3393,7 @@ impl Rgba8ToRow {
                         0
                     } else {
                         let normalized = channel as f32 * (1.0 / UNORM8_MAX as f32);
-                        (((normalized.to_bits() + F32_TO_F16_ROUND_BIT)
-                            >> F16_F32_MANT_SHIFT)
+                        (((normalized.to_bits() + F32_TO_F16_ROUND_BIT) >> F16_F32_MANT_SHIFT)
                             - (((F32_EXP_BIAS - F16_EXP_BIAS) as u32) << F16_EXP_SHIFT))
                             as u16
                     };
@@ -4294,6 +4309,40 @@ mod tests {
         }
         let _ = f64_to_unorm8(0.5);
         let _ = f16_to_f32(0x3c00); // 1.0
+    }
+
+    #[test]
+    fn half_rows_match_texel_lookup_for_every_bit_pattern_and_vector_tail() {
+        for format in [MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RG16_FLOAT] {
+            let rail = RowToRgba8::for_format(format).unwrap();
+            let bpp = rail.source_bytes_per_pixel() as usize;
+            let mut source = vec![0x5a];
+            for value in 0..=u16::MAX {
+                let channels = [
+                    value,
+                    value ^ 0x5555,
+                    value.wrapping_mul(257),
+                    u16::MAX - value,
+                ];
+                for channel in &channels[..bpp / 2] {
+                    source.extend_from_slice(&channel.to_le_bytes());
+                }
+            }
+            let input = &source[1..];
+            for count in (0..=33).chain(core::iter::once(65536)) {
+                let len = count * 4;
+                let mut output = vec![0xcd; 3 + len + 17];
+                assert!(rail.convert(input, count as u32, &mut output[3..]));
+                for (src, dst) in input[..count * bpp]
+                    .chunks_exact(bpp)
+                    .zip(output[3..3 + len].as_chunks::<4>().0.iter())
+                {
+                    assert_eq!(*dst, texel_to_rgba8(format, src).unwrap());
+                }
+                assert!(output[..3].iter().all(|&byte| byte == 0xcd));
+                assert!(output[3 + len..].iter().all(|&byte| byte == 0xcd));
+            }
+        }
     }
 
     /// Every storage-capable format has a texel width, and it is the width the

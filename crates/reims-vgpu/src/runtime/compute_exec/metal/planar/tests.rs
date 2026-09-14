@@ -4,7 +4,7 @@ use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::protocol::endian::{st32, st64};
 use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::protocol::planar::{BackingFormat, SampleFormat};
-use crate::runtime::compute_exec::{metal::try_stage_planar_sampled, stage_texture_raw};
+use crate::runtime::compute_exec::{metal::try_stage_planar_sampled_in_scope, stage_texture_raw};
 use crate::runtime::decode::resource::{
     list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_MAPPER_REF_TEXTURE,
 };
@@ -18,6 +18,7 @@ const GPA: u64 = 0x20 << PAGE_SHIFT_ARM64E;
 struct Fixture {
     state: DeviceState,
     host: FakeHost,
+    scope: crate::runtime::draw::BufferSnapshotScope,
 }
 
 impl Fixture {
@@ -32,7 +33,11 @@ impl Fixture {
             vec![(0x20 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
         assert!(state.set_mapping_device_desc(5, &device_descriptor(BackingFormat::VideoRange)));
         assert!(state.set_mapping_geom(5, 8, 4, SampleFormat::Rgb10_420TwoPlane.word()));
-        let mut fixture = Self { state, host };
+        let mut fixture = Self {
+            state,
+            host,
+            scope: crate::runtime::draw::BufferSnapshotScope::new(),
+        };
         fixture.descriptor(SampleFormat::Rgb10_420TwoPlane);
         fixture
     }
@@ -66,13 +71,20 @@ impl Fixture {
             texture_ref: 11,
             layout: Layout::decode(&self.state.mappings[&5].device_desc, 8, 4).unwrap(),
             map_generation: self.state.mappings[&5].map_generation,
+            scope: Some(self.scope.reference()),
         }
     }
 
     fn fragment(&mut self) -> Arc<SampledImage> {
-        try_stage_planar_sampled(&mut self.state, &mut self.host, 1, 11)
-            .unwrap()
-            .unwrap()
+        try_stage_planar_sampled_in_scope(
+            &mut self.state,
+            &mut self.host,
+            1,
+            11,
+            Some(&self.scope.reference()),
+        )
+        .unwrap()
+        .unwrap()
     }
 
     fn write(&mut self, byte: u8) {
@@ -81,7 +93,7 @@ impl Fixture {
 }
 
 #[test]
-fn both_quiet_reuses_one_image_across_fragment_and_compute() {
+fn both_quiet_reuses_within_render_scope_but_not_for_unscoped_compute() {
     let mut f = Fixture::new();
     let first = f.fragment();
     let source = f.source();
@@ -95,7 +107,7 @@ fn both_quiet_reuses_one_image_across_fragment_and_compute() {
     let compute = stage_texture_raw::<MetalStage, _>(&mut f.state, &mut f.host, 1, 11, 33, false)
         .ok()
         .unwrap();
-    assert!(Arc::ptr_eq(&first, compute.rail.planar.as_ref().unwrap()));
+    assert!(!Arc::ptr_eq(&first, compute.rail.planar.as_ref().unwrap()));
     assert!(compute.bytes.is_empty());
     assert_eq!(first.plane_bytes(0), &[0x5a; 1024]);
     assert_eq!(first.plane_bytes(1), &[0x5a; 1024]);
@@ -117,6 +129,57 @@ fn guest_cpu_write_restages_even_when_host_epochs_are_quiet() {
 }
 
 #[test]
+fn current_write_observations_reuse_across_passes_but_never_trust_unharvested_writes() {
+    let mut f = Fixture::new();
+    f.host.guest_write_current_supported = true;
+    let first = f.fragment();
+    f.scope = crate::runtime::draw::BufferSnapshotScope::new();
+    assert!(Arc::ptr_eq(&first, &f.fragment()));
+    f.write(0x73);
+    f.host.guest_write_current_unavailable = true;
+    let changed = f.fragment();
+    assert!(!Arc::ptr_eq(&first, &changed));
+    assert_eq!(changed.plane_bytes(0), &[0x73; 1024]);
+    assert_eq!(first.plane_bytes(0), &[0x5a; 1024]);
+    f.host.guest_wrote_page(GPA);
+    f.host.guest_write_current_unavailable = false;
+    let current = f.fragment();
+    f.scope = crate::runtime::draw::BufferSnapshotScope::new();
+    assert!(Arc::ptr_eq(&current, &f.fragment()));
+    f.host.guest_write_current_supported = false;
+    f.scope = crate::runtime::draw::BufferSnapshotScope::new();
+    f.write(0x91);
+    let deferred = f.fragment();
+    assert!(!Arc::ptr_eq(&current, &deferred));
+    assert_eq!(deferred.plane_bytes(1), &[0x91; 1024]);
+}
+
+#[test]
+fn planar_completed_commands_refresh_cpu_iosurface_updates_without_a_harvest() {
+    use crate::backend::metal::planar::tests::cpu_surface::{CpuSurface, Sampler};
+    objc::rc::autoreleasepool(|| {
+        let mut source = CpuSurface::planar();
+        let sampler = Sampler::new();
+        let mut f = Fixture::new();
+        let device = crate::backend::metal::runtime::system_device().unwrap();
+        for round in 0..256u16 {
+            f.scope = crate::runtime::draw::BufferSnapshotScope::new();
+            let seed = source.seed();
+            let bytes = source.planar_pixels(
+                64 + (round * 29) % 876,
+                64 + (round * 47) % 896,
+                64 + (round * 71) % 896,
+            );
+            assert_ne!(source.seed(), seed);
+            let oracle = sampler.sample(source.texture());
+            f.host.write_gpa(GPA, &bytes).unwrap();
+            let snapshot = f.fragment();
+            let actual = sampler.sample(&snapshot.texture(device).unwrap());
+            assert_eq!(actual, oracle, "completed planar command round={round}");
+        }
+    });
+}
+#[test]
 fn exact_host_page_write_restages_but_disjoint_writes_do_not() {
     let mut f = Fixture::new();
     let first = f.fragment();
@@ -133,6 +196,50 @@ fn exact_host_page_write_restages_but_disjoint_writes_do_not() {
         !Arc::ptr_eq(&second, &f.fragment()),
         "an unnamed write fails closed"
     );
+}
+
+#[test]
+fn planar_expired_or_absent_scope_always_reads_fresh_planes() {
+    let mut f = Fixture::new();
+    f.fragment();
+    let expired = f.scope.reference();
+    f.scope = crate::runtime::draw::BufferSnapshotScope::new();
+    assert!(expired.current().is_none());
+    for scope in [Some(&expired), None] {
+        for byte in [0x61, 0x72] {
+            f.write(byte);
+            let image = try_stage_planar_sampled_in_scope(&mut f.state, &mut f.host, 1, 11, scope)
+                .unwrap()
+                .unwrap();
+            for plane in 0..2 {
+                assert_eq!(image.plane_bytes(plane), &[byte; 1024]);
+            }
+            let source = f.source();
+            assert!(source
+                .resource
+                .with_rail_state(|held: &mut RetainedPlanar| held.latest.is_none())
+                .unwrap());
+        }
+    }
+}
+
+#[test]
+fn planar_scope_ending_during_fill_cannot_retain_an_image() {
+    let mut f = Fixture::new();
+    let mut owner = Some(crate::runtime::draw::BufferSnapshotScope::new());
+    let mut source = f.source();
+    source.scope = Some(owner.as_ref().unwrap().reference());
+    let image = stage_with(&mut f.state, &mut f.host, &source, |state, host, source| {
+        let image = fill(state, host, source)?;
+        drop(owner.take());
+        Ok(image)
+    })
+    .unwrap();
+    assert_eq!(image.plane_bytes(0), &[0x5a; 1024]);
+    assert!(source
+        .resource
+        .with_rail_state(|held: &mut RetainedPlanar| held.latest.is_none())
+        .unwrap());
 }
 
 #[test]

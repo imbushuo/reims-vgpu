@@ -3,7 +3,10 @@
 //! Both fragment and compute staging enter here after the common layout decoder
 //! and writeback settlement. A hit requires exact source identity and the shared
 //! guest/host gather witness, including its audit of the *guest* allocation.
-//! A miss brackets the ordinary plane fill with that witness: a changed or
+//! Delayed observations confine read elision to one live decoded render pass.
+//! Only the optional current-write observer can establish freshness between
+//! passes; a construction descriptor or harvested generation cannot. A miss
+//! brackets the ordinary plane fill: a changed or
 //! unreadable generation may serve this copy, but can never retain it for reuse.
 //! Replacement/deletion drops only our Arc; encoded commands retain their own.
 
@@ -11,8 +14,9 @@ use super::{ComputeStatus, DeviceState, HostMemory, HostOps, MetalStage, PlanarS
 use crate::backend::metal::planar::SampledImage;
 use crate::model::RailResourceState;
 use crate::protocol::planar::{Layout, TextureDescription};
+use crate::runtime::draw::SnapshotScopeRef;
 use crate::runtime::gather_witness::{
-    note_gather, GatherKey, GatherOutcome, GatherRail, GatherWindow, GatheredIdentity,
+    note_scoped_gather, GatherKey, GatherOutcome, GatherRail, GatherWindow, GatheredIdentity,
 };
 use crate::runtime::guest_ram::GuestRun;
 use std::sync::Arc;
@@ -108,8 +112,13 @@ impl Window {
         }))
     }
 
-    fn observe<M: HostOps>(&self, state: &mut DeviceState, host: &mut M) -> GatherOutcome {
-        note_gather(
+    fn observe<M: HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        scope: Option<&SnapshotScopeRef>,
+    ) -> GatherOutcome {
+        note_scoped_gather(
             state,
             host,
             GatherRail::MapperRefTexture,
@@ -120,6 +129,7 @@ impl Window {
                 span: self.key.layout.allocation_size,
                 page_size: self.key.page_size,
             },
+            scope,
         )
     }
 }
@@ -158,18 +168,25 @@ fn stage_with<M: HostMemory + HostOps>(
     ) -> Result<Arc<SampledImage>, ComputeStatus>,
 ) -> Result<Arc<SampledImage>, ComputeStatus> {
     use crate::runtime::drain::{note_store_route, note_store_route_n};
+    let scope = source.scope.as_ref();
+    let scope_id = scope.and_then(SnapshotScopeRef::current);
+    if scope_id.is_none() {
+        note_store_route("metal_planar_sampled_unscoped");
+    }
     let before = Window::resolve(state, host, source)?;
     // Do not keep a pointer-bearing window across a fill, which can revalidate
     // and retire an alias. Only the exact key and witness identity survive it.
     let before = before.map(|window| {
-        let outcome = window.observe(state, host);
+        let outcome = window.observe(state, host, scope);
         (window.key, outcome)
     });
     let hit = source
         .resource
         .with_rail_state(|held: &mut RetainedPlanar| {
             if let (Some((key, outcome)), Some(entry)) = (&before, &held.latest) {
-                if outcome.vouch.is_vouched()
+                if outcome.cpu_read_vouched()
+                    && scope_id.is_some()
+                    && scope.and_then(SnapshotScopeRef::current) == scope_id
                     && entry.source == *key
                     && entry.identity == outcome.identity
                 {
@@ -193,8 +210,13 @@ fn stage_with<M: HostMemory + HostOps>(
     let image = fill(state, host, source)?;
     if let Some((key, before)) = before {
         if let Some(after) = Window::resolve(state, host, source)? {
-            let outcome = after.observe(state, host);
-            if after.key == key && outcome.vouch.is_vouched() && outcome.identity == before.identity
+            let outcome = after.observe(state, host, scope);
+            if after.key == key
+                && outcome.cpu_read_vouched()
+                && outcome.identity == before.identity
+                && before.cpu_read_settled
+                && scope_id.is_some()
+                && scope.and_then(SnapshotScopeRef::current) == scope_id
             {
                 let retained = source
                     .resource

@@ -6,6 +6,11 @@
 //! input count AND bytes. Tiny/empty submissions do not reset those bounds.
 //! Allocation counters count native constructors; byte levels count owned
 //! logical extents, not the driver's physical residency or eliminated copies.
+//! Known-zero ranges survive completion only for a reflected no-write input.
+//! A resource owner may freeze a certified no-write capture. These shared
+//! allocations reenter mutable inventory only after the final immutable lease
+//! and every command using them have completed.
+//! Shared bytes are attributed once to their capture class, not to every loan.
 
 use super::util::Status;
 use foreign_types::{ForeignType, ForeignTypeRef};
@@ -16,7 +21,11 @@ use metal::{
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicU64,
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
+};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(usize)]
@@ -39,6 +48,12 @@ const CLASSES: [Class; 5] = [
 // Metal Feature Set Tables, Apple2–Apple10: minimum constant-buffer offset.
 const APPLE_CONSTANT_BUFFER_OFFSET_ALIGNMENT: u64 = 4;
 
+fn binding_offset_supported(device: &Device, offset: u64) -> bool {
+    offset == 0
+        || (offset.is_multiple_of(APPLE_CONSTANT_BUFFER_OFFSET_ALIGNMENT)
+            && device.supports_family(metal::MTLGPUFamily::Apple2))
+}
+
 macro_rules! counters {
     ($($field:ident),+ $(,)?) => {
         struct Counters { $($field: AtomicU64),+ }
@@ -49,7 +64,7 @@ macro_rules! counters {
             }
         }
         #[derive(Clone, Copy, Debug, Default)]
-        pub(super) struct Snapshot { $(pub $field: u64),+ }
+        pub(crate) struct Snapshot { $(pub $field: u64),+ }
     };
 }
 
@@ -64,6 +79,8 @@ counters!(
     direct_fill_failures,
     direct_fill_partial_bytes,
     direct_fill_zeroed_bytes,
+    direct_fill_zero_reused_bytes,
+    direct_fill_readonly,
     resource_shaped_fills,
     resource_compact_fills,
     reuses,
@@ -132,9 +149,11 @@ impl Class {
 
 pub(super) fn emit_census() {
     // Requests partition into reuse or one miss. Absent means no inventory key
-    // (possibly evicted), exhausted means its available entries were leased
-    // since the last completion, and overlap means all remaining candidates
-    // overlap the source. None of these is a claim about historical length churn.
+    // (possibly evicted), exhausted means its entries were leased in the current
+    // depletion interval, and overlap means all remaining candidates overlap
+    // the source. Completion observations and completed-storage returns end
+    // that interval, including snapshots returning after their command completed.
+    // None of these is a claim about historical length churn.
     // A resource-shaped fill can request two lengths before capture if its
     // original-size allocation falls back to the compact suffix.
     for class in CLASSES {
@@ -144,6 +163,7 @@ pub(super) fn emit_census() {
              class={} allocations={} allocated_bytes={} copies={} copied_bytes={} reuses={} \
              direct_fill_requests={} direct_fills={} direct_fill_bytes={} direct_fill_failures={} \
              direct_fill_partial_bytes={} direct_fill_zeroed_bytes={} \
+             direct_fill_zero_reused_bytes={} direct_fill_readonly={} \
              resource_shaped_fills={} resource_compact_fills={} \
              requests={} miss_absent_length={} miss_exhausted_length={} miss_source_overlap={} \
              available_discards={} available_discard_bytes={} budget_discards={} budget_discard_bytes={} \
@@ -162,6 +182,8 @@ pub(super) fn emit_census() {
             s.direct_fill_failures,
             s.direct_fill_partial_bytes,
             s.direct_fill_zeroed_bytes,
+            s.direct_fill_zero_reused_bytes,
+            s.direct_fill_readonly,
             s.resource_shaped_fills,
             s.resource_compact_fills,
             s.requests,
@@ -253,6 +275,9 @@ impl Drop for Account {
 struct Allocation {
     buffer: Buffer,
     account: Account,
+    /// Initialized bytes outside this interval are known zero. Unqualified GPU
+    /// use widens it to the complete allocation before the handle is exposed.
+    dirty: std::ops::Range<usize>,
 }
 
 struct Available(Allocation);
@@ -296,9 +321,10 @@ pub(super) struct Pool {
     available_count: usize,
     available_bytes: u64,
     peak: Demand,
-    // An empty bucket records depletion since the previous completion, not
-    // historical length churn. Each key enters this list at most once between
-    // completions and is removed before returning any newly completed inputs.
+    // Empty buckets describe depletion since the last completion observation
+    // or completed-storage return, not historical length churn. Every return
+    // ends this interval before adding storage, even when a snapshot's final
+    // cache lease retires long after the completion that authorized its return.
     exhausted_lengths: Vec<usize>,
     #[cfg(test)]
     fail_allocation: bool,
@@ -480,14 +506,21 @@ impl Pool {
         self.forget_exhausted();
     }
 
-    fn observe_completion(&mut self, inputs: &[Sealed]) -> Result<(), Status> {
+    fn observe_completion(
+        &mut self,
+        inputs: &[Sealed],
+        snapshots: &[Arc<ReadOnlySnapshot>],
+    ) -> Result<(), Status> {
         let mut demand = Demand {
-            count: inputs.len(),
+            count: inputs.len() + snapshots.len(),
             bytes: 0,
         };
         let mut classes = [Demand::default(); CLASSES.len()];
-        for input in inputs {
-            let account = &input.0.account;
+        for account in inputs.iter().map(|input| &input.0.account).chain(
+            snapshots
+                .iter()
+                .map(|snapshot| &snapshot.allocation.account),
+        ) {
             demand.bytes = demand
                 .bytes
                 .checked_add(account.len)
@@ -531,7 +564,7 @@ impl Pool {
         }
         let possible_keys = self
             .available_count
-            .saturating_add(inputs.len())
+            .saturating_add(demand.count)
             .min(peak.count);
         self.exhausted_lengths
             .try_reserve(possible_keys)
@@ -540,6 +573,12 @@ impl Pool {
     }
 
     fn insert_completed(&mut self, mut allocation: Allocation) -> Result<(), Status> {
+        // This is the inventory's return boundary, not observe_completion:
+        // snapshot retirement can reach it between acquisitions. Clear the
+        // depletion-only keys before any bucket can be revived, evicted, or
+        // replaced by a different length. Thus each tombstone names exactly one
+        // empty bucket and metadata stays bounded by completed demand.
+        self.forget_exhausted();
         let len = allocation.account.len;
         debug_assert!(self.peak.count > 0 && len <= self.peak.bytes);
         let needs_eviction =
@@ -678,20 +717,154 @@ impl Filling {
         Ok(Self(Allocation {
             buffer,
             account: Account::new(class, len as u64),
+            dirty: 0..len,
         }))
     }
 }
 
-/// Immutable CPU-filled input, not yet owned by an encoded command. The Rc
+/// Immutable input binding, freshly filled or a contained readonly loan. The Rc
 /// keeps it on its originating thread and queue; dropping it never recycles it.
 pub(crate) struct Filled {
-    allocation: Allocation,
+    allocation: Storage,
     owner: Owner,
     offset: usize,
     captured_len: usize,
+    gpu_read_only: Option<super::buffer_extent::ReadOnlyCapture>,
+}
+
+enum Storage {
+    Exclusive(Allocation),
+    ReadOnly(Arc<ReadOnlySnapshot>),
+}
+
+impl std::ops::Deref for Storage {
+    type Target = Allocation;
+
+    fn deref(&self) -> &Allocation {
+        match self {
+            Self::Exclusive(allocation) => allocation,
+            Self::ReadOnly(snapshot) => &snapshot.allocation,
+        }
+    }
+}
+
+/// Private copied storage, not an import or a guest-memory lease. One physical
+/// allocation owns one Account; cloning a read lease never double-counts it.
+pub(crate) struct ReadOnlySnapshot {
+    allocation: Allocation,
+    queue: CommandQueue,
+    offset: usize,
+    captured_len: usize,
+    pending: AtomicU64,
+    completed: AtomicBool,
+}
+
+impl ReadOnlySnapshot {
+    /// A discarded/unverified submission leaves its pending count charged.
+    /// Even if a cache remains, that allocation can never be recycled early.
+    fn into_completed(self: Arc<Self>) -> Option<Allocation> {
+        let snapshot = Arc::try_unwrap(self).ok()?;
+        (snapshot.pending.load(Acquire) == 0 && snapshot.completed.load(Acquire))
+            .then_some(snapshot.allocation)
+    }
+
+    pub(crate) fn retire(self: Arc<Self>, device: &Device) {
+        let owner = super::runtime::thread_input_pool(device);
+        if owner.borrow().queue.as_ptr() != self.queue.as_ptr() {
+            return;
+        }
+        if let Some(allocation) = self.into_completed() {
+            if let Err(status) = owner.borrow_mut().insert_completed(allocation) {
+                if let Some(emit) =
+                    crate::observe::Emit::refusal("metal_input_snapshot_retire", &status)
+                {
+                    emit.fail();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn bind(
+        self: &Arc<Self>,
+        device: &Device,
+        proof: super::buffer_extent::ReadOnlyCapture,
+    ) -> Option<Filled> {
+        self.bind_window(device, proof, 0)
+    }
+
+    /// Lend a contained readonly view, keeping the allocation's original
+    /// initialized/dirty intervals. Bytes outside this binding's reflected
+    /// reach need not become zero, but remain initialized and cannot be read
+    /// by the certified shader. Never relabel them as known zero for recycling.
+    pub(crate) fn bind_window(
+        self: &Arc<Self>,
+        device: &Device,
+        proof: super::buffer_extent::ReadOnlyCapture,
+        relative_offset: usize,
+    ) -> Option<Filled> {
+        let remaining = self
+            .len()
+            .checked_sub(relative_offset)
+            .filter(|&len| len != 0)?;
+        let captured_len = usize::try_from(
+            proof
+                .bytes()
+                .unwrap_or(remaining as u64)
+                .min(remaining as u64),
+        )
+        .ok()?;
+        if relative_offset.checked_add(captured_len)? > self.captured_len {
+            return None;
+        }
+        let offset = self.offset.checked_add(relative_offset)?;
+        if !binding_offset_supported(device, offset as u64) {
+            return None;
+        }
+        let owner = super::runtime::thread_input_pool(device);
+        if owner.borrow().queue.as_ptr() != self.queue.as_ptr() {
+            return None;
+        }
+        Some(Filled {
+            allocation: Storage::ReadOnly(Arc::clone(self)),
+            owner,
+            offset,
+            captured_len,
+            gpu_read_only: Some(proof),
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.allocation.account.len as usize - self.offset
+    }
 }
 
 impl Filled {
+    /// Freeze only an already complete, certified capture. Neither the cache
+    /// nor its submission leases expose a refill route for this allocation.
+    pub(crate) fn freeze(self) -> Result<Arc<ReadOnlySnapshot>, Self> {
+        if self.gpu_read_only.is_none() {
+            return Err(self);
+        }
+        if let Storage::ReadOnly(snapshot) = &self.allocation {
+            // A view is not a new capture: returning the original snapshot
+            // under the view's source key would mislabel its offset/coverage.
+            if self.offset != snapshot.offset || self.captured_len != snapshot.captured_len {
+                return Err(self);
+            }
+        }
+        match self.allocation {
+            Storage::ReadOnly(snapshot) => Ok(snapshot),
+            Storage::Exclusive(allocation) => Ok(Arc::new(ReadOnlySnapshot {
+                allocation,
+                queue: self.owner.borrow().queue.clone(),
+                offset: self.offset,
+                captured_len: self.captured_len,
+                pending: AtomicU64::new(0),
+                completed: AtomicBool::new(false),
+            })),
+        }
+    }
+
     /// Shader-visible length, never the allocation's uncaptured prefix.
     pub(crate) fn len(&self) -> usize {
         self.allocation.account.len as usize - self.offset
@@ -701,8 +874,21 @@ impl Filled {
         self.offset as u64
     }
 
+    /// Required captured coverage for this binding. A readonly loan may be
+    /// backed by a wider immutable capture; copy counters name actual fills.
     pub(crate) fn captured_len(&self) -> usize {
         self.captured_len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_contents(&self) -> Vec<u8> {
+        unsafe {
+            std::slice::from_raw_parts(
+                self.allocation.buffer.contents().cast(),
+                self.allocation.account.len as usize,
+            )
+        }
+        .to_vec()
     }
 }
 
@@ -712,6 +898,7 @@ impl std::fmt::Debug for Filled {
             .field("len", &self.len())
             .field("offset", &self.offset)
             .field("captured_len", &self.captured_len)
+            .field("gpu_read_only", &self.gpu_read_only.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -790,7 +977,7 @@ pub(super) unsafe fn copy(
     if data.is_null() || len == 0 {
         return Err(Status::args("metal_render_input_span_invalid").field("len", len));
     }
-    let acquired = acquire(device, len, class, allocation_failure, Some(data), false)?;
+    let mut acquired = acquire(device, len, class, allocation_failure, Some(data), false)?;
     // SAFETY: the source is caller-bounded and the destination is an exclusively
     // filling, exact-length Shared allocation, either fresh or disjoint from
     // the source. No submitted draw can read it while filling.
@@ -800,11 +987,13 @@ pub(super) unsafe fn copy(
     let c = class.counters();
     c.copies.fetch_add(1, Relaxed);
     c.copied_bytes.fetch_add(len as u64, Relaxed);
+    acquired.allocation.dirty = 0..len;
     Ok(Filled {
-        allocation: acquired.allocation,
+        allocation: Storage::Exclusive(acquired.allocation),
         owner: acquired.owner,
         offset: 0,
         captured_len: len,
+        gpu_read_only: None,
     })
 }
 
@@ -932,6 +1121,41 @@ pub(crate) fn fill_resource_prefix<E>(
     )
 }
 
+/// A no-write shader input. The proof is tied to the same stage/slot
+/// as capture, and callers must seal it only for that input's draw.
+pub(crate) fn fill_read_only_resource_prefix<E>(
+    device: &Device,
+    allocation_len: u64,
+    offset: u64,
+    proof: super::buffer_extent::ReadOnlyCapture,
+    class: Class,
+    allocation_failure: &'static str,
+    callback: impl for<'bytes> FnOnce(&'bytes mut [u8]) -> Result<usize, E>,
+) -> Result<Filled, FillError<E>> {
+    let read_len = allocation_len
+        .checked_sub(offset)
+        .and_then(|len| usize::try_from(len.min(proof.bytes().unwrap_or(len))).ok())
+        .ok_or_else(|| {
+            FillError::Backend(
+                Status::args("metal_render_input_suffix_invalid")
+                    .field("allocation_len", allocation_len)
+                    .field("offset", offset),
+            )
+        })?;
+    let mut filled = fill_resource_prefix(
+        device,
+        allocation_len,
+        offset,
+        read_len,
+        class,
+        allocation_failure,
+        callback,
+    )?;
+    filled.gpu_read_only = Some(proof);
+    class.counters().direct_fill_readonly.fetch_add(1, Relaxed);
+    Ok(filled)
+}
+
 fn fill_resource_region<E>(
     device: &Device,
     allocation_len: u64,
@@ -966,11 +1190,7 @@ fn fill_resource_region<E>(
     let original = usize::try_from(allocation_len)
         .ok()
         .filter(|&size| size <= isize::MAX as usize);
-    let shaped = original.filter(|_| {
-        offset != 0
-            && offset.is_multiple_of(APPLE_CONSTANT_BUFFER_OFFSET_ALIGNMENT)
-            && device.supports_family(metal::MTLGPUFamily::Apple2)
-    });
+    let shaped = original.filter(|_| offset != 0 && binding_offset_supported(device, offset));
     let acquired = shaped.and_then(|size| {
         acquire(device, size, class, allocation_failure, None, offset != 0)
             .inspect_err(|status| {
@@ -1005,7 +1225,7 @@ fn fill_resource_region<E>(
 }
 
 fn complete_fill<E>(
-    acquired: Acquired,
+    mut acquired: Acquired,
     offset: usize,
     read_len: Option<usize>,
     class: Class,
@@ -1022,28 +1242,41 @@ fn complete_fill<E>(
                 .field("available", available),
         ));
     }
-    let zeroed = if acquired.fresh {
-        allocation_len
-    } else {
-        offset
-    };
-    if zeroed != 0 {
-        // Native allocation does not promise initialized Rust u8 values.
-        // Reused prefixes are not captured guest bytes and must not expose the
-        // previous snapshot. The suffix itself is initialized and fully refilled.
-        // SAFETY: this exclusively filling allocation owns all zeroed bytes.
-        unsafe {
-            std::ptr::write_bytes(acquired.destination, 0, zeroed);
-        }
-        c.direct_fill_zeroed_bytes.fetch_add(zeroed as u64, Relaxed);
-    }
     let tail = offset + len;
-    if !acquired.fresh && tail < allocation_len {
+    if acquired.fresh {
+        // Native allocation does not promise initialized Rust u8 values.
+        // SAFETY: the exclusively filling allocation owns every byte.
         unsafe {
-            std::ptr::write_bytes(acquired.destination.add(tail), 0, allocation_len - tail);
+            std::ptr::write_bytes(acquired.destination, 0, allocation_len);
         }
         c.direct_fill_zeroed_bytes
-            .fetch_add((allocation_len - tail) as u64, Relaxed);
+            .fetch_add(allocation_len as u64, Relaxed);
+    } else {
+        let dirty = &acquired.allocation.dirty;
+        let mut zeroed = 0;
+        for range in [
+            dirty.start..dirty.end.min(offset),
+            dirty.start.max(tail)..dirty.end,
+        ] {
+            if range.start < range.end {
+                unsafe {
+                    std::ptr::write_bytes(
+                        acquired.destination.add(range.start),
+                        0,
+                        range.end - range.start,
+                    );
+                }
+                zeroed += range.end - range.start;
+            }
+        }
+        if zeroed != 0 {
+            c.direct_fill_zeroed_bytes.fetch_add(zeroed as u64, Relaxed);
+        }
+        let reused = allocation_len - len - zeroed;
+        if reused != 0 {
+            c.direct_fill_zero_reused_bytes
+                .fetch_add(reused as u64, Relaxed);
+        }
     }
     // SAFETY: the full exact-length storage is initialized, exclusively filling,
     // and remains owned through this synchronous, non-escaping callback.
@@ -1062,11 +1295,13 @@ fn complete_fill<E>(
     }
     c.direct_fills.fetch_add(1, Relaxed);
     c.direct_fill_bytes.fetch_add(len as u64, Relaxed);
+    acquired.allocation.dirty = offset..tail;
     Ok(Filled {
-        allocation: acquired.allocation,
+        allocation: Storage::Exclusive(acquired.allocation),
         owner: acquired.owner,
         offset,
         captured_len: len,
+        gpu_read_only: None,
     })
 }
 
@@ -1077,11 +1312,12 @@ pub(super) struct Submission {
     owner: Option<Owner>,
     command: Option<CommandBuffer>,
     inputs: Vec<Sealed>,
+    snapshots: Vec<Arc<ReadOnlySnapshot>>,
 }
 
 impl Submission {
     pub(super) fn begin(&mut self, command: &CommandBufferRef, owner: Owner) -> Result<(), Status> {
-        if self.command.is_some() || !self.inputs.is_empty() {
+        if self.command.is_some() || !self.inputs.is_empty() || !self.snapshots.is_empty() {
             return Err(Status::execute("metal_render_input_submission_pending"));
         }
         if !super::raw_metal::command_buffer_uses_queue(command, &owner.borrow().queue) {
@@ -1092,6 +1328,9 @@ impl Submission {
         Ok(())
     }
 
+    /// Record only the input binding for which `Filled` was captured. A no-write
+    /// certificate belongs to that immutable shader/stage/slot, not to arbitrary
+    /// uses of a cloned Metal handle. Uncertified uses conservatively dirty all.
     pub(super) fn seal(&mut self, input: Filled) -> Result<Buffer, Status> {
         if !self
             .owner
@@ -1101,11 +1340,31 @@ impl Submission {
         {
             return Err(Status::execute("metal_render_input_owner_mismatch"));
         }
-        self.inputs
-            .try_reserve(1)
-            .map_err(|_| Status::execute("metal_render_input_tracking_alloc_failed"))?;
         let buffer = input.allocation.buffer.clone();
-        self.inputs.push(Sealed(input.allocation));
+        match input.allocation {
+            Storage::Exclusive(mut allocation) => {
+                self.inputs
+                    .try_reserve(1)
+                    .map_err(|_| Status::execute("metal_render_input_tracking_alloc_failed"))?;
+                if input.gpu_read_only.is_none() {
+                    allocation.dirty = 0..allocation.account.len as usize;
+                }
+                self.inputs.push(Sealed(allocation));
+            }
+            Storage::ReadOnly(snapshot) => {
+                if !self
+                    .snapshots
+                    .iter()
+                    .any(|held| Arc::ptr_eq(held, &snapshot))
+                {
+                    self.snapshots
+                        .try_reserve(1)
+                        .map_err(|_| Status::execute("metal_render_input_tracking_alloc_failed"))?;
+                    snapshot.pending.fetch_add(1, AcqRel);
+                    self.snapshots.push(snapshot);
+                }
+            }
+        }
         Ok(buffer)
     }
 
@@ -1121,9 +1380,16 @@ impl Submission {
         };
         let result = (|| {
             let mut pool = owner.borrow_mut();
-            pool.observe_completion(&self.inputs)?;
+            pool.observe_completion(&self.inputs, &self.snapshots)?;
             for Sealed(allocation) in self.inputs.drain(..) {
                 pool.insert_completed(allocation)?;
+            }
+            for snapshot in self.snapshots.drain(..) {
+                snapshot.pending.fetch_sub(1, AcqRel);
+                snapshot.completed.store(true, Release);
+                if let Some(allocation) = snapshot.into_completed() {
+                    pool.insert_completed(allocation)?;
+                }
             }
             Ok(())
         })();
@@ -1135,11 +1401,13 @@ impl Submission {
         }
         self.owner = None;
         self.command = None;
+        self.snapshots.clear();
         Ok(())
     }
 
     pub(super) fn discard(&mut self) {
         self.inputs.clear();
+        self.snapshots.clear();
         if let Some(owner) = self.owner.take() {
             owner.borrow_mut().clear();
         }
@@ -1148,7 +1416,7 @@ impl Submission {
 }
 
 #[cfg(test)]
-pub(super) fn snapshot(class: Class) -> Snapshot {
+pub(crate) fn snapshot(class: Class) -> Snapshot {
     class.counters().snapshot()
 }
 

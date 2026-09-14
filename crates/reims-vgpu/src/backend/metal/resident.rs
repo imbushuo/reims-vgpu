@@ -53,7 +53,7 @@
 
 use crate::backend::metal::raw_metal;
 use metal::{
-    DeviceRef, MTLPixelFormat, MTLResourceOptions, MTLStorageMode, MTLTextureType, MTLTextureUsage,
+    DeviceRef, MTLPixelFormat, MTLStorageMode, MTLTextureType, MTLTextureUsage,
     Texture, TextureDescriptor,
 };
 use parking_lot::Mutex;
@@ -366,20 +366,40 @@ pub fn borrow_published(key: &ResidentColorKey, content_gen: u64) -> Option<Text
 /// A live reader prevents `take` from lending this allocation to a writer.
 /// Replacement/eviction can remove the registry entry but not these pixels:
 /// a subsequent render must allocate its own target while this lease is held.
+/// A packed snapshot is immutable by construction instead: it has no registry
+/// writer to exclude, and its Arc is the entire publication lease.
 #[derive(Clone, Debug)]
 pub(crate) struct PublishedSample {
-    texture: Texture,
-    _reader: Arc<()>,
-    byte_len: u64,
+    source: PublishedSource,
+}
+
+#[derive(Clone, Debug)]
+enum PublishedSource {
+    Resident {
+        texture: Texture,
+        _reader: Arc<()>,
+        byte_len: u64,
+    },
+    Packed(Arc<super::packed::SampledImage>),
 }
 
 impl PublishedSample {
+    pub(crate) fn packed(image: Arc<super::packed::SampledImage>) -> Self {
+        Self { source: PublishedSource::Packed(image) }
+    }
+
     pub(crate) fn texture(&self) -> &metal::TextureRef {
-        &self.texture
+        match &self.source {
+            PublishedSource::Resident { texture, .. } => texture,
+            PublishedSource::Packed(image) => image.texture(),
+        }
     }
 
     pub(crate) fn byte_len(&self) -> u64 {
-        self.byte_len
+        match &self.source {
+            PublishedSource::Resident { byte_len, .. } => *byte_len,
+            PublishedSource::Packed(image) => image.byte_len(),
+        }
     }
 }
 
@@ -411,9 +431,11 @@ pub(crate) fn sample_published_rgba8(
         .checked_mul(u64::from(key.height))?
         .checked_mul(4)?;
     Some(PublishedSample {
-        texture,
-        _reader: reader,
-        byte_len,
+        source: PublishedSource::Resident {
+            texture,
+            _reader: reader,
+            byte_len,
+        },
     })
 }
 
@@ -512,7 +534,7 @@ pub fn create(
     descriptor.set_height(u64::from(key.height));
     descriptor.set_storage_mode(MTLStorageMode::Shared);
     descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-    let texture = linear_target(device, key, format, bpp, &descriptor)
+    let texture = linear_target(device, bpp, &descriptor)
         .or_else(|| raw_metal::new_texture(device, &descriptor))?;
     REGISTRY.lock().admit(*key, texture.clone(), key.bytes(bpp));
     Some(texture)
@@ -537,21 +559,10 @@ pub fn create(
 /// and a correctness requirement at the ones that do not.
 fn linear_target(
     device: &DeviceRef,
-    key: &ResidentColorKey,
-    format: MTLPixelFormat,
     bpp: usize,
     descriptor: &metal::TextureDescriptorRef,
 ) -> Option<Texture> {
-    let alignment = device.minimum_linear_texture_alignment_for_pixel_format(format);
-    let tight = u64::from(key.width).checked_mul(bpp as u64)?;
-    let bytes_per_row = if alignment == 0 {
-        tight
-    } else {
-        tight.div_ceil(alignment).checked_mul(alignment)?
-    };
-    let length = bytes_per_row.checked_mul(u64::from(key.height))?;
-    let buffer = raw_metal::new_buffer(device, length, MTLResourceOptions::StorageModeShared)?;
-    let texture = raw_metal::new_linear_texture(&buffer, descriptor, 0, bytes_per_row);
+    let texture = raw_metal::new_linear_texture_with_storage(device, descriptor, bpp);
     crate::runtime::drain::note_store_route(if texture.is_some() {
         "metal_resident_linear"
     } else {

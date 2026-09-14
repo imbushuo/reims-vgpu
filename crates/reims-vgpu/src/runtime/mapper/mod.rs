@@ -1470,10 +1470,9 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
 
 /// Release contiguous views whose page tables changed.
 ///
-/// A GPU object can retain a view only when [`HostOps::map_pages_stable`]
-/// promises the address until explicit retirement. A transient view is never
-/// admitted to a backend import, so its only users are CPU copies that finish
-/// inside their own call.
+/// Mapping-owned GPU imports may retain an owned-until-unmap view; borrowed-run
+/// clients still require `map_pages_stable`. Either retained import must release
+/// its GPU references before this owner calls the matching host unmap.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
@@ -2014,7 +2013,7 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
 /// it. The import therefore follows the mapping lifetime and is reused by all
 /// of those views. Hosts whose page aliases are transient or backends that did
 /// not publish host-pointer import limits retain the copy-backed paths.
-#[cfg(feature = "backend-vulkan")]
+#[cfg(any(feature = "backend-vulkan", feature = "backend-metal"))]
 pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2026,6 +2025,38 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     if !host.map_pages_stable() {
         return None;
     }
+    checked_contig_import_with_footprint(state, host, mapping_id)
+}
+
+/// The owning counterpart to the legacy stable-view import entry point.
+///
+/// `MappingEntry` retains the view and import identity, and its retirement path
+/// retires that import before unmapping. Metal's import deallocator completes
+/// the release handshake; generic borrowed-run consumers do not use this door.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+pub(crate) fn ensure_owned_contig_import_with_footprint<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<(
+    std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    crate::runtime::guest_ram::GuestPageFootprint,
+)> {
+    if !host.map_pages_owned() {
+        return None;
+    }
+    checked_contig_import_with_footprint(state, host, mapping_id)
+}
+
+#[cfg(any(feature = "backend-vulkan", feature = "backend-metal"))]
+fn checked_contig_import_with_footprint<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<(
+    std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    crate::runtime::guest_ram::GuestPageFootprint,
+)> {
     let (ptr, len, _pages) = ensure_contig_view_with_pages(state, host, mapping_id)?;
     let footprint = state.mappings.get(&mapping_id)?.contig_footprint.clone()?;
     let len = u64::try_from(len).ok()?;
@@ -2086,7 +2117,7 @@ pub(crate) fn note_mapping_write_footprint(
 /// These are the pages admitted with a guest-backed GPU resource. Consuming
 /// them directly keeps Store publication tied to the allocation that actually
 /// rendered, even if mutable mapping state changes after admission.
-#[cfg(any(feature = "backend-vulkan", test))]
+#[cfg(any(feature = "backend-vulkan", feature = "backend-metal", test))]
 pub(crate) fn note_physical_page_write_footprint(
     footprint: &crate::runtime::guest_ram::GuestPageFootprint,
     off: u64,

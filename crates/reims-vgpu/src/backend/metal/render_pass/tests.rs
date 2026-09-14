@@ -4,6 +4,7 @@ use metal::*;
 
 mod r32float;
 mod batching;
+mod gpu_store;
 
 #[test]
 fn deferred_pass_keeps_initial_store_pages_after_guest_rewire() {

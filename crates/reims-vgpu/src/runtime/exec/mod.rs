@@ -5211,6 +5211,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             out.metal_draws_fail = out.metal_draws_fail.saturating_add(1);
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
+        let input_scope = draw::BufferSnapshotScope::new();
         let mut render_pass = crate::backend::selected().begin_render_pass();
         for (di, pd) in draw_list.iter().enumerate() {
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
@@ -5228,6 +5229,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             {
                 fin.enter(crate::runtime::drain::FinishPhase::Binds);
                 fill_draw_binds_from_pending(&mut req, pd);
+                req.input_snapshot_scope = Some(input_scope.reference());
                 (req.continues_render_pass, req.render_pass_continues) =
                     render_pass_chain_position(di, draw_list.len());
                 // A resident mapper-ref-texture target carries attachment contents between
@@ -5276,6 +5278,11 @@ fn finish_stream<M: HostMemory + HostOps>(
                     }
                 }
                 let (do_writeback, force_full_store) = multi_draw_store_plan(draw_list.len(), di);
+                if do_writeback {
+                    // The final Store has no next draw to seed from this CPU
+                    // result. Presentation reads the published surface instead.
+                    req.color0_readback = draw::Color0Readback::Optional;
+                }
                 if do_writeback {
                     out.render_guest_stores = out.render_guest_stores.saturating_add(1);
                 }

@@ -2,6 +2,8 @@ use super::*;
 use crate::backend::metal::input::{self, Class, FillError};
 use crate::backend::metal::render::NativeBuffer;
 
+mod snapshot;
+
 pub(crate) enum PreparedInput {
     Cpu(Vec<u8>),
     Native(NativeBuffer),
@@ -9,7 +11,20 @@ pub(crate) enum PreparedInput {
 
 pub(crate) enum Capture {
     Cpu,
-    Native(Option<crate::backend::metal::buffer_extent::BoundedRead>),
+    Native(Option<crate::backend::metal::buffer_extent::BufferRead>),
+    ScopedNative(
+        Option<crate::backend::metal::buffer_extent::BufferRead>,
+        SnapshotScopeRef,
+    ),
+}
+
+impl Capture {
+    pub(crate) fn in_scope(self, scope: Option<&SnapshotScopeRef>) -> Self {
+        match (self, scope) {
+            (Self::Native(read), Some(scope)) => Self::ScopedNative(read, scope.clone()),
+            (capture, _) => capture,
+        }
+    }
 }
 
 pub(super) struct InputPlan {
@@ -35,18 +50,13 @@ impl InputPlan {
     }
 }
 
-/// Texture access/native-output reflection occurs after the existing buffer
-/// reads. Keep those draws on the CPU route rather than moving reads across
-/// their preflight/materialization. Attribute CPU views are excluded per bind.
+/// Both capture routes read the same checked, settled window synchronously,
+/// before texture staging. Texture participation does not require an extra CPU
+/// Vec: the native snapshot is private and is not sealed until encoding.
+/// Query/depth fallbacks remain conservative; attribute CPU views are excluded
+/// per bind by `InputPlan::native_vertex`.
 pub(super) fn plain_input_draw(req: &DrawEncodeRequest) -> bool {
-    req.visibility.is_none()
-        && req.depth_attach.is_none()
-        && req.stencil_attach.is_none()
-        && req
-            .vertex_textures
-            .iter()
-            .chain(req.fragment_textures.iter())
-            .all(|bind| bind.texture_ref == 0)
+    req.visibility.is_none() && req.depth_attach.is_none() && req.stencil_attach.is_none()
 }
 
 pub(crate) fn prepare<M: HostMemory + HostOps>(
@@ -58,26 +68,34 @@ pub(crate) fn prepare<M: HostMemory + HostOps>(
     capture: Capture,
     miss_reason: &'static str,
 ) -> Result<PreparedInput, EncodeStatus> {
-    let (native, extent) = match capture {
-        Capture::Cpu => (false, None),
+    let (native, bound, scope) = match capture {
+        Capture::Cpu => (false, None, None),
         Capture::Native(bounded) => (
             true,
-            bounded.and_then(|proof| proof.bytes_for(class, bind.index)),
+            bounded.and_then(|proof| proof.capture_for(class, bind.index)),
+            None,
+        ),
+        Capture::ScopedNative(bounded, scope) => (
+            true,
+            bounded.and_then(|proof| proof.capture_for(class, bind.index)),
+            Some(scope),
         ),
     };
+    let extent = bound.and_then(|(bytes, _)| bytes);
     let window = match extent {
         Some(extent) => {
             prepare_bound_buffer_read_with_extent(state, host, task, bind, Some(extent))
         }
         None => prepare_bound_buffer_read(state, host, task, bind),
     }
-        .ok_or(EncodeStatus::MetalFailed(miss_reason))?;
+    .ok_or(EncodeStatus::MetalFailed(miss_reason))?;
     if !native {
         return window
             .read_vec()
             .map(PreparedInput::Cpu)
             .ok_or(EncodeStatus::MetalFailed(miss_reason));
     }
+    let span = window.span;
     let device = crate::backend::metal::runtime::system_device().ok_or_else(|| {
         EncodeStatus::RailRefused(crate::backend::metal::util::Status::execute(
             "metal_render_device_unavailable",
@@ -87,15 +105,15 @@ pub(crate) fn prepare<M: HostMemory + HostOps>(
     // synchronous fill owns no pool/TLS borrow, HostOps or guest-memory alias.
     // Keep the declared allocation shape when the native owner can do so;
     // its filled range carries the exact shader-visible suffix and bind offset.
-    let bytes = input::fill_resource_prefix(
+    let bytes = snapshot::Request {
         device,
-        window.backing.size,
-        window.offset,
-        window.len,
+        bind,
+        span,
         class,
-        "metal_render_buffer_create_failed",
-        |bytes| window.read_into(bytes).map(|()| bytes.len()),
-    )
+        proof: bound.and_then(|(_, read_only)| read_only),
+        scope,
+    }
+    .capture(state, host)
     .map_err(|error| match error {
         FillError::Backend(status) => EncodeStatus::RailRefused(status),
         FillError::Callback(error) => {
@@ -107,8 +125,8 @@ pub(crate) fn prepare<M: HostMemory + HostOps>(
             EncodeStatus::MetalFailed(miss_reason)
         }
     })?;
-    debug_assert_eq!(bytes.captured_len(), window.len);
-    debug_assert_eq!(bytes.len() as u64, window.backing.size - window.offset);
+    debug_assert_eq!(bytes.captured_len(), span.len);
+    debug_assert_eq!(bytes.len() as u64, span.backing.size - span.offset);
     Ok(PreparedInput::Native(NativeBuffer {
         binding: bind.index,
         attribute_stride: bind.attribute_stride,
@@ -121,7 +139,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_fill_keeps_query_depth_and_texture_participants_on_cpu_route() {
+    fn texture_participation_keeps_native_buffers_but_queries_and_depth_remain_cpu() {
         let mut request = DrawEncodeRequest::default();
         assert!(plain_input_draw(&request));
         std::sync::Arc::make_mut(&mut request.fragment_textures).push(TextureBind {
@@ -129,8 +147,8 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            !plain_input_draw(&request),
-            "access is not reflected before buffer reads"
+            plain_input_draw(&request),
+            "a private buffer snapshot does not depend on later texture access reflection"
         );
         std::sync::Arc::make_mut(&mut request.fragment_textures)[0].texture_ref = 0;
         assert!(
@@ -167,7 +185,12 @@ mod tests {
             ],
             ..Default::default()
         };
-        let plan = InputPlan::new(&DrawEncodeRequest::default(), &pipeline);
+        let mut request = DrawEncodeRequest::default();
+        std::sync::Arc::make_mut(&mut request.fragment_textures).push(TextureBind {
+            texture_ref: 9,
+            ..Default::default()
+        });
+        let plan = InputPlan::new(&request, &pipeline);
         assert!(
             plan.native_plain,
             "plain fragment input is independently eligible"
