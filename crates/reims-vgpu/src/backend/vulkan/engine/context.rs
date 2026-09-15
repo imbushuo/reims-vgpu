@@ -730,6 +730,8 @@ fn storage_buffer_offset_alignment(limits: &vk::PhysicalDeviceLimits) -> u64 {
 }
 
 pub(crate) struct DeviceContext {
+    native_owner: Option<std::sync::Arc<NativeDeviceOwner>>,
+    compile_only: bool,
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
     pub pd: vk::PhysicalDevice,
@@ -799,7 +801,7 @@ pub(crate) struct DeviceContext {
     pub pipeline_cache: vk::PipelineCache,
     pub pipeline_diagnostics: bool,
     pub pipeline_creation_feedback: bool,
-    native_caches: native_cache::ResidentCaches,
+    native_caches: std::sync::Arc<native_cache::ResidentCaches>,
     pub vertex_divisor: VertexDivisorCapabilities,
     /// Offset alignment for every storage-buffer descriptor this engine writes,
     /// taken directly from `minStorageBufferOffsetAlignment`.
@@ -884,6 +886,21 @@ pub(crate) struct DeviceContext {
     pub swapchain: bool,
 }
 
+struct NativeDeviceOwner {
+    _entry: ash::Entry,
+    instance: ash::Instance,
+    device: ash::Device,
+}
+
+impl Drop for NativeDeviceOwner {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_device(None);
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
 /// Whether a display transaction completed inline on the raw-queue fallback or
 /// was handed to the ordered queue owner.
 #[cfg(feature = "host-window")]
@@ -950,7 +967,9 @@ mod storage_buffer_alignment_tests {
     }
 }
 
-// SAFETY: ash handles; only accessed under engine mutex.
+// SAFETY: each context has one mutable owner. A compile-only view moves to one
+// worker with private caches and no queue/query/completion state; its shared
+// Vulkan device lifetime is retained independently until that view is destroyed.
 unsafe impl Send for DeviceContext {}
 
 impl DeviceContext {
@@ -1558,7 +1577,13 @@ impl DeviceContext {
             "vk_pipeline_cache_load bytes={initial_len} path={}",
             pipeline_cache_path.display()
         ));
+        let native_owner = std::sync::Arc::new(NativeDeviceOwner {
+                _entry: entry.clone(), instance: instance.clone(), device: device.clone(),
+            });
+        let native_caches = std::sync::Arc::new(native_cache::ResidentCaches::with_owner(native_owner.clone()));
         Ok(Self {
+            native_owner: Some(native_owner),
+            compile_only: false,
             _entry: entry,
             instance,
             pd,
@@ -1579,7 +1604,7 @@ impl DeviceContext {
             pipeline_cache,
             pipeline_diagnostics,
             pipeline_creation_feedback,
-            native_caches: native_cache::ResidentCaches::default(),
+            native_caches,
             vertex_divisor,
             storage_buffer_offset_align: storage_buffer_offset_alignment(&props.limits),
             max_storage_buffer_range: u64::from(props.limits.max_storage_buffer_range),
@@ -1608,6 +1633,9 @@ impl DeviceContext {
     /// creation rather than at context destroy is deliberate: the testing boot
     /// SIGKILLs QEMU, so destroy never runs there.
     pub(crate) fn persist_pipeline_cache(&self) {
+        if self.pipeline_cache == vk::PipelineCache::null() {
+            return;
+        }
         let Some(path) = self.pipeline_cache_path.clone() else {
             return;
         };
@@ -1677,11 +1705,70 @@ impl DeviceContext {
         if let Some(probe) = self.draw_spans.take() {
             self.device.destroy_query_pool(probe.pool, None);
         }
-        self.native_caches.clear();
-        self.device
-            .destroy_pipeline_cache(self.pipeline_cache, None);
-        self.device.destroy_device(None);
-        self.instance.destroy_instance(None);
+        if !self.compile_only {
+            self.native_caches.clear();
+        }
+        if self.pipeline_cache != vk::PipelineCache::null() {
+            self.device.destroy_pipeline_cache(self.pipeline_cache, None);
+            self.pipeline_cache = vk::PipelineCache::null();
+        }
+        self.native_owner.take();
+    }
+
+    /// A compile-only view owns no queue, completion publisher, query pool or
+    /// guest allocation. Its final lease delays VkDevice destruction only.
+    pub(crate) fn compile_view(&self) -> Self {
+        Self {
+            native_owner: self.native_owner.clone(),
+            compile_only: true,
+            _entry: self._entry.clone(),
+            instance: self.instance.clone(),
+            pd: self.pd,
+            device: self.device.clone(),
+            caps: self.caps.clone(),
+            memory_properties: self.memory_properties,
+            external_memory_host: self.external_memory_host.clone(),
+            push_descriptor: self.push_descriptor.clone(),
+            extended_dynamic_state: self.extended_dynamic_state.clone(),
+            extended_dynamic_state3: self.extended_dynamic_state3.clone(),
+            gq: self.gq,
+            compute_capable: self.compute_capable,
+            storage_image_write_without_format: self.storage_image_write_without_format,
+            spirv_storage_write_without_format: self.spirv_storage_write_without_format,
+            spirv_storage_read_without_format: self.spirv_storage_read_without_format,
+            spirv_storage_extended_formats: self.spirv_storage_extended_formats,
+            sampled_linear_filter: self.sampled_linear_filter,
+            pipeline_cache: vk::PipelineCache::null(),
+            pipeline_diagnostics: self.pipeline_diagnostics,
+            pipeline_creation_feedback: self.pipeline_creation_feedback,
+            native_caches: self.native_caches.clone(),
+            vertex_divisor: self.vertex_divisor,
+            storage_buffer_offset_align: self.storage_buffer_offset_align,
+            max_storage_buffer_range: self.max_storage_buffer_range,
+            vertex_formats: self.vertex_formats,
+            max_sampler_anisotropy: self.max_sampler_anisotropy,
+            sampler_anisotropy: self.sampler_anisotropy,
+            features: self.features,
+            explicit_linear_support: Mutex::new(HashMap::new()),
+            depth_stencil_format: self.depth_stencil_format,
+            timestamps: None,
+            draw_spans: None,
+            stamp_completion: None,
+            queue_owner: None,
+            pipeline_cache_path: self.pipeline_cache_path.clone(),
+            pipeline_cache_saved_len: AtomicUsize::new(0),
+            #[cfg(feature = "host-window")]
+            swapchain: false,
+        }
+    }
+
+    pub(crate) fn native_identity(&self) -> usize {
+        self.native_owner.as_ref().map_or(0, |owner| std::sync::Arc::as_ptr(owner) as usize)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_hint_levels(&self) -> (usize, usize) {
+        self.native_caches.levels()
     }
 
     /// Pick a memory type for `class` on this device.

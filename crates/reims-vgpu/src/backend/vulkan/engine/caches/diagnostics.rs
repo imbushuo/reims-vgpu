@@ -238,6 +238,10 @@ pub(super) fn prepare(
 }
 
 impl Trace {
+    pub(super) fn actual_cache(&mut self, cache: CacheDiagnostic) {
+        self.cache = cache;
+    }
+
     pub(super) fn begin(&self) -> Instant {
         let payload = self.cache.initial_payload.map_or_else(
             || "initial_bytes=0 initial_xxh3=none".into(),

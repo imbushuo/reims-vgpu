@@ -759,6 +759,8 @@ fn load_command_streams<M: HostMemory + HostOps>(
 /// loaded once, here, and whoever executes them is handed the same `Vec`.
 #[derive(Debug)]
 pub struct ExecSubmission {
+    #[cfg(feature = "backend-vulkan")]
+    native_pipelines: std::sync::OnceLock<native_pipeline::Prepared>,
     task_id: u32,
     /// Per resource this submission touches, who owns the authoritative bytes
     /// afterwards. Applied by [`consume_resource_table`] *before* any of the
@@ -794,6 +796,8 @@ impl ExecSubmission {
     #[cfg(test)]
     pub(crate) fn stated(task_id: u32, streams: Vec<Vec<u8>>) -> Self {
         Self {
+            #[cfg(feature = "backend-vulkan")]
+            native_pipelines: std::sync::OnceLock::new(),
             task_id,
             resource_descs: Vec::new(),
             streams,
@@ -887,6 +891,8 @@ fn read_submission<M: HostMemory + HostOps>(
     crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Load, load_ns);
 
     Some(ExecSubmission {
+        #[cfg(feature = "backend-vulkan")]
+        native_pipelines: std::sync::OnceLock::new(),
         task_id,
         resource_descs,
         streams,
@@ -917,6 +923,21 @@ fn read_submission<M: HostMemory + HostOps>(
 /// verdict. Passing it rather than letting the rail rescan the bytes is what
 /// makes "nothing is pending" a statement about exactly the leases it will be
 /// used for — see [`vulkan::preflight_render_translations`].
+#[cfg(feature = "backend-vulkan")]
+mod native_pipeline;
+
+pub(crate) fn native_preflight_pending<M: HostMemory + HostOps>(
+    state: &DeviceState, host: &M, submission: &ExecSubmission,
+    resolved: &reims_vgpu_core::exec::ExecWork,
+) -> bool {
+    #[cfg(feature = "backend-vulkan")]
+    if crate::backend::selected().rail() == crate::backend::Rail::Vulkan {
+        return native_pipeline::pending(state, host, submission, resolved);
+    }
+    let _ = (state, host, submission, resolved);
+    false
+}
+
 pub fn preflight_submission<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -993,6 +1014,7 @@ fn execute_submission<M: HostMemory + HostOps>(
         task_id,
         resource_descs,
         streams,
+        ..
     } = submission;
     let task_id = *task_id;
 

@@ -26,6 +26,8 @@ use crate::observe::Decline;
 type FragmentRelocationCache = HashMap<(bool, bool), Arc<ShaderVariant>>;
 type M2vResult<T> = Result<T, M2vCacheDecline>;
 
+mod disk;
+
 #[cfg(all(test, feature = "backend-vulkan"))]
 #[path = "m2v_cache_rounding_gpu.rs"]
 mod rounding_gpu_tests;
@@ -984,6 +986,12 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     let _guard = translation_lock().lock().unwrap_or_else(|e| e.into_inner());
     let lock_wait_us = started.elapsed().as_micros();
     let translating = std::time::Instant::now();
+    let options = metal2vulkan::passes::TransformOptions::default();
+    let persisted = disk::Entry::for_air(air, stage, &options);
+    if let Some((spirv, reflection)) = persisted.as_ref().and_then(disk::Entry::load) {
+        capture_air(air, stage, &spirv);
+        return finish_translated(spirv, reflection, stage);
+    }
     let tmp = tmp_dir();
     let name = match stage {
         Stage::Vertex => "v.air",
@@ -996,8 +1004,9 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     // `reflection.datalayout` carries the source `target datalayout` the sanitizer
     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
     let (spirv, reflection) =
-        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
+        metal2vulkan::translate_reflected_with_options(path.to_str().unwrap_or(name), stage, &tmp, options)
             .map_err(|e| translate_decline(stage, e.to_string()))?;
+    if let Some(persisted) = &persisted { persisted.save(&spirv, &reflection); }
     capture_air(air, stage, &spirv);
     let shader = finish_translated(spirv, reflection, stage)?;
     crate::observe::off(format!(
@@ -1009,15 +1018,25 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
 
 fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedShader> {
     let _guard = translation_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let opts = metal2vulkan::passes::TransformOptions {
+        kernel_local_size: local_size,
+        ..Default::default()
+    };
+    let persisted = disk::Entry::for_air(air, Stage::Kernel, &opts);
+    if let Some((spirv, reflection)) = persisted.as_ref().and_then(disk::Entry::load) {
+        if reflection.local_size == Some(local_size) {
+            capture_air(air, Stage::Kernel, &spirv);
+            return finish_translated(spirv, reflection, Stage::Kernel);
+        }
+        crate::observe::Emit::decline("m2v_disk_cache", &M2vCacheDecline::KernelLocalSizeMismatch {
+            requested: local_size, reflected: reflection.local_size,
+        }).fail();
+    }
     let tmp = tmp_dir();
     let path = tmp.join("k.air");
     std::fs::write(&path, air).map_err(|e| M2vCacheDecline::KernelScratchWrite {
         detail: e.to_string(),
     })?;
-    let opts = metal2vulkan::passes::TransformOptions {
-        kernel_local_size: local_size,
-        ..Default::default()
-    };
     let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
         path.to_str().unwrap_or("k.air"),
         Stage::Kernel,
@@ -1034,6 +1053,7 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
             reflected: reflection.local_size,
         });
     }
+    if let Some(persisted) = &persisted { persisted.save(&spirv, &reflection); }
     finish_translated(spirv, reflection, Stage::Kernel)
 }
 

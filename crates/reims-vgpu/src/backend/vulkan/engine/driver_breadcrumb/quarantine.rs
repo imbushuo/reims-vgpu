@@ -128,7 +128,12 @@ fn entries() -> &'static HashMap<String, String> {
 /// Called from the one-time load, before the file is read, so a crash and the
 /// boot that follows it are separated by nothing the caller has to sequence.
 fn fold_surviving_breadcrumb() {
-    let Ok(meta) = std::fs::read_to_string(super::meta_path()) else {
+    fold_breadcrumb(false);
+    fold_breadcrumb(true);
+}
+
+fn fold_breadcrumb(background: bool) {
+    let Ok(meta) = std::fs::read_to_string(super::meta_path_for(background)) else {
         return;
     };
     let (what, key, stages) = parse_meta(&meta);
@@ -136,9 +141,9 @@ fn fold_surviving_breadcrumb() {
     // would be folded again by every later process, and a meta file with no
     // `key=` is one this device cannot act on either way.
     for stage in stages {
-        let _ = std::fs::remove_file(super::path(stage));
+        let _ = std::fs::remove_file(super::path_for(stage, background));
     }
-    let _ = std::fs::remove_file(super::meta_path());
+    let _ = std::fs::remove_file(super::meta_path_for(background));
     if key.is_empty() {
         crate::observe::fail(format!(
             "driver_quarantine reason=driver_quarantine_crash_unkeyed what={what} \

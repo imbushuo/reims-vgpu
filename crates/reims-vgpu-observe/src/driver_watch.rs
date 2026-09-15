@@ -72,6 +72,7 @@ pub const DRIVER_CALL_REPORT_PERIOD_S: u64 = 60;
 #[derive(Debug)]
 struct Outstanding {
     what: String,
+    background: bool,
     started: Instant,
     /// Elapsed seconds at which the next line is due.
     next_report_s: u64,
@@ -84,12 +85,15 @@ impl Outstanding {
             return None;
         }
         self.next_report_s = elapsed_s.saturating_add(DRIVER_CALL_REPORT_PERIOD_S);
+        let ownership = if self.background {
+            "a background compiler owns this call; dependent submissions wait without holding device service"
+        } else {
+            "the drain thread holds the device lock inside this call, so no FIFO, present or doorbell can make progress until it returns"
+        };
         Some(format!(
             "driver_call reason=driver_call_outstanding what={} elapsed_s={elapsed_s} \
-             deadline_s={DRIVER_CALL_DEADLINE_S} (the drain thread holds the device lock \
-             inside this call, so no FIFO, present or doorbell can make progress until it \
-             returns)",
-            self.what
+             deadline_s={DRIVER_CALL_DEADLINE_S} ({ownership})",
+            self.what,
         ))
     }
 }
@@ -99,6 +103,7 @@ impl Outstanding {
 /// displace an existing owner is what keeps that assumption from silently
 /// becoming false.
 static OUTSTANDING: Mutex<Option<Outstanding>> = Mutex::new(None);
+static BACKGROUND: Mutex<Option<Outstanding>> = Mutex::new(None);
 
 fn lock() -> std::sync::MutexGuard<'static, Option<Outstanding>> {
     OUTSTANDING.lock().unwrap_or_else(|e| e.into_inner())
@@ -117,10 +122,30 @@ pub fn enter(what: String) -> bool {
     }
     *slot = Some(Outstanding {
         what,
+        background: false,
         started: Instant::now(),
         next_report_s: DRIVER_CALL_DEADLINE_S,
     });
     true
+}
+
+#[must_use]
+pub fn enter_background(what: String) -> bool {
+    let mut slot = BACKGROUND.lock().unwrap_or_else(|error| error.into_inner());
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some(Outstanding {
+        what,
+        background: true,
+        started: Instant::now(),
+        next_report_s: DRIVER_CALL_DEADLINE_S,
+    });
+    true
+}
+
+pub fn leave_background() {
+    *BACKGROUND.lock().unwrap_or_else(|error| error.into_inner()) = None;
 }
 
 /// The call returned. Only the owner from [`enter`] may call this.
@@ -145,6 +170,14 @@ pub fn watching() -> Option<String> {
 /// Called from the device poll, which is not the stuck thread. Cheap enough for
 /// a display-timer cadence: one uncontended mutex and one `Instant::elapsed`.
 pub fn note_tick() {
+    let background = {
+        let mut slot = BACKGROUND.lock().unwrap_or_else(|error| error.into_inner());
+        slot.as_mut()
+            .and_then(|call| call.tick(call.started.elapsed().as_secs()))
+    };
+    if let Some(line) = background {
+        crate::fail(line);
+    }
     let line = {
         let mut slot = lock();
         match slot.as_mut() {
@@ -167,6 +200,7 @@ mod tests {
     fn outstanding(what: &str) -> Outstanding {
         Outstanding {
             what: what.to_string(),
+            background: false,
             started: Instant::now(),
             next_report_s: DRIVER_CALL_DEADLINE_S,
         }
@@ -181,6 +215,15 @@ mod tests {
         for elapsed_s in 0..DRIVER_CALL_DEADLINE_S {
             assert_eq!(o.tick(elapsed_s), None, "elapsed_s={elapsed_s}");
         }
+    }
+
+    #[test]
+    fn background_compile_never_claims_to_hold_device_service() {
+        let mut call = outstanding("create_graphics_pipelines");
+        call.background = true;
+        let line = call.tick(DRIVER_CALL_DEADLINE_S).unwrap();
+        assert!(line.contains("background compiler"));
+        assert!(!line.contains("drain thread holds"));
     }
 
     /// Crossing the deadline reports once, and then not again until a whole

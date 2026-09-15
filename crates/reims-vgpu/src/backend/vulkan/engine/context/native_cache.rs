@@ -341,10 +341,30 @@ impl<T> RetainedPrograms<T> {
 }
 
 struct Allocation {
+    access: parking_lot::Mutex<()>,
     device: ash::Device,
     handle: vk::PipelineCache,
     owned: bool,
     initial_payload: Option<InitialPayload>,
+}
+
+fn with_cache_access<R>(
+    access: &parking_lot::Mutex<()>, background: bool, handle: vk::PipelineCache,
+    create: impl FnOnce(vk::PipelineCache) -> R,
+) -> R {
+    if background {
+        let _access = access.lock();
+        return create(handle);
+    }
+    match access.try_lock() {
+        Some(_access) => create(handle),
+        None => {
+            // Cache hints are optional. A synchronous fallback must not wait
+            // on a compiler-owned cache while retaining device service locks.
+            crate::runtime::drain::note_store_route("native_cache_busy_uncached");
+            create(vk::PipelineCache::null())
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -360,6 +380,7 @@ pub(crate) enum Origin {
     Empty,
     Rejected,
     SharedFallback,
+    BusyUncached,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -378,20 +399,34 @@ impl Drop for Allocation {
     }
 }
 
-pub(super) struct ResidentCaches(parking_lot::Mutex<RetainedPrograms<Allocation>>);
+pub(super) struct ResidentCaches {
+    entries: parking_lot::Mutex<RetainedPrograms<Allocation>>,
+    // Fields drop in declaration order: every cache allocation precedes the device.
+    _device: Option<Arc<super::NativeDeviceOwner>>,
+}
 
 impl Default for ResidentCaches {
     fn default() -> Self {
-        Self(parking_lot::Mutex::new(RetainedPrograms::new(
-            32,
-            128 * 1024 * 1024,
-        )))
+        Self {
+            entries: parking_lot::Mutex::new(RetainedPrograms::new(32, 128 * 1024 * 1024)),
+            _device: None,
+        }
     }
 }
 
 impl ResidentCaches {
-    pub(super) fn clear(&mut self) {
-        self.0.get_mut().entries.clear();
+    pub(super) fn with_owner(owner: Arc<super::NativeDeviceOwner>) -> Self {
+        Self { _device: Some(owner), ..Self::default() }
+    }
+
+    pub(super) fn clear(&self) {
+        self.entries.lock().entries.clear();
+    }
+
+    #[cfg(test)]
+    pub(super) fn levels(&self) -> (usize, usize) {
+        let cache = self.entries.lock();
+        (cache.entries.len(), cache.entries.iter().map(|entry| entry.bytes).sum())
     }
 }
 
@@ -418,6 +453,7 @@ impl<'a> CompileCache<'a> {
             return Self {
                 context: ctx,
                 allocation: Arc::new(Allocation {
+                    access: parking_lot::Mutex::new(()),
                     device: ctx.device.clone(),
                     handle: ctx.pipeline_cache,
                     owned: false,
@@ -429,7 +465,7 @@ impl<'a> CompileCache<'a> {
             };
         }
         let path = directory.map(|directory| key.path(directory));
-        if let Some(allocation) = ctx.native_caches.0.lock().get(&key, &path) {
+        if let Some(allocation) = ctx.native_caches.entries.lock().get(&key, &path) {
             return Self {
                 context: ctx,
                 allocation,
@@ -484,6 +520,7 @@ impl<'a> CompileCache<'a> {
             }
         }
         let allocation = Arc::new(Allocation {
+            access: parking_lot::Mutex::new(()),
             device: ctx.device.clone(),
             handle,
             owned,
@@ -502,7 +539,7 @@ impl<'a> CompileCache<'a> {
             Origin::Empty
         };
         let allocation = if owned {
-            ctx.native_caches.0.lock().insert(
+            ctx.native_caches.entries.lock().insert(
                 key.clone(),
                 path.clone(),
                 allocation,
@@ -530,7 +567,7 @@ impl<'a> CompileCache<'a> {
         if let Some(size) = size {
             self.context
                 .native_caches
-                .0
+                .entries
                 .lock()
                 .size(&self.key, &self.path, size);
         }
@@ -586,17 +623,30 @@ impl<'a> CompileCache<'a> {
         self.allocation.handle
     }
 
+    pub(crate) fn with_handle<R>(&self, create: impl FnOnce(vk::PipelineCache) -> R) -> R {
+        with_cache_access(&self.allocation.access, self.context.compile_only, self.allocation.handle, create)
+    }
+
     pub(crate) fn diagnostic(&self) -> Diagnostic {
+        self.diagnostic_for(self.handle())
+    }
+
+    pub(crate) fn diagnostic_for(&self, handle: vk::PipelineCache) -> Diagnostic {
         use ash::vk::Handle as _;
+        let original = handle == self.handle();
         Diagnostic {
             program: self.key.bucket,
-            handle: self.handle().as_raw(),
-            origin: self.origin,
-            initial_payload: self.allocation.initial_payload,
+            handle: handle.as_raw(),
+            origin: if original { self.origin } else { Origin::BusyUncached },
+            initial_payload: if original { self.allocation.initial_payload } else { None },
         }
     }
 
     pub(crate) fn save(&self) {
+        let Some(_access) = self.allocation.access.try_lock() else {
+            crate::runtime::drain::note_store_route("native_cache_save_busy");
+            return;
+        };
         if !self.allocation.owned {
             return;
         }
@@ -762,6 +812,45 @@ fn save_bounded(path: &Path, data: &[u8], byte_cap: u64, entry_cap: usize) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_compile_hint_access_does_not_block_device_service() {
+        use ash::vk::Handle;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let access = parking_lot::Mutex::new(());
+        let handle = vk::PipelineCache::from_raw(7);
+        let (entered, started) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let access_ref = &access;
+            let thread = scope.spawn(move || with_cache_access(access_ref, true, handle, |seen| {
+                assert_eq!(seen, handle);
+                entered.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(2)).unwrap();
+            }));
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(access.try_lock().is_none());
+            assert_eq!(with_cache_access(&access, false, handle, |seen| seen), vk::PipelineCache::null());
+            release.send(()).unwrap();
+            thread.join().unwrap();
+        });
+        assert_eq!(with_cache_access(&access, false, handle, |seen| seen), handle);
+    }
+
+    #[test]
+    fn shared_program_budget_retains_one_payload_across_many_pipeline_views() {
+        let shared = Arc::new(parking_lot::Mutex::new(RetainedPrograms::new(32, 128 * 1024 * 1024)));
+        let views: Vec<_> = (0..64).map(|_| shared.clone()).collect();
+        let first = shared.lock().insert(key(1), None, Arc::new(42), 60 * 1024 * 1024);
+        for view in &views {
+            assert!(Arc::ptr_eq(view, &shared));
+            assert!(Arc::ptr_eq(&view.lock().get(&key(1), &None).unwrap(), &first));
+        }
+        let cache = shared.lock();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].bytes, 60 * 1024 * 1024);
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn with_directory(test: impl FnOnce(&Path)) {

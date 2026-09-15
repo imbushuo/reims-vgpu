@@ -110,14 +110,26 @@ fn prefix() -> String {
 /// One path per stage. Fixed rather than per-pipeline so a crash leaves exactly
 /// one set of files to look at, and so a previous boot's leftovers cannot
 /// accumulate.
+#[cfg(test)]
 fn path(stage: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{}-breadcrumb-{stage}.spv", prefix()))
+    path_for(stage, false)
+}
+
+fn path_for(stage: &str, background: bool) -> PathBuf {
+    let role = if background { "-compile" } else { "" };
+    std::env::temp_dir().join(format!("{}{role}-breadcrumb-{stage}.spv", prefix()))
 }
 
 /// The metadata file beside them, so a reader knows what the modules were for
 /// without disassembling anything.
+#[cfg(test)]
 fn meta_path() -> PathBuf {
-    std::env::temp_dir().join(format!("{}-breadcrumb.txt", prefix()))
+    meta_path_for(false)
+}
+
+fn meta_path_for(background: bool) -> PathBuf {
+    let role = if background { "-compile" } else { "" };
+    std::env::temp_dir().join(format!("{}{role}-breadcrumb.txt", prefix()))
 }
 
 /// Live for the duration of a driver call that could take the process down or
@@ -132,6 +144,7 @@ pub(crate) struct DriverBreadcrumb {
     /// Whether this guard owns [`crate::observe::driver_watch`]'s slot. False
     /// when an outer call already held it — see that module's `enter`.
     watching: bool,
+    background: bool,
 }
 
 impl DriverBreadcrumb {
@@ -155,7 +168,12 @@ impl DriverBreadcrumb {
         if let Some(hit) = quarantine::check(modules) {
             return Err(hit);
         }
-        let watching = crate::observe::driver_watch::enter(what.to_string());
+        let background = std::thread::current().name() == Some("reims-pso-compile");
+        let watching = if background {
+            crate::observe::driver_watch::enter_background(what.to_string())
+        } else {
+            crate::observe::driver_watch::enter(what.to_string())
+        };
         let mut stages = Vec::with_capacity(modules.len());
         let mut meta = format!("what={what}\n");
         for (stage, spirv) in modules {
@@ -163,7 +181,7 @@ impl DriverBreadcrumb {
             for word in *spirv {
                 bytes.extend_from_slice(&word.to_le_bytes());
             }
-            match std::fs::write(path(stage), &bytes) {
+            match std::fs::write(path_for(stage, background), &bytes) {
                 Ok(()) => stages.push(*stage),
                 Err(e) => crate::observe::fail(format!(
                     "driver_breadcrumb reason=write_failed what={what} stage={stage} err={e}"
@@ -179,8 +197,8 @@ impl DriverBreadcrumb {
         // what the next process needs to recognise this call, and it costs
         // nothing that a failed `.spv` write should be allowed to take away.
         meta.push_str(&format!("key={}\n", quarantine::key_of(modules)));
-        let _ = std::fs::write(meta_path(), meta);
-        Ok(Self { stages, watching })
+        let _ = std::fs::write(meta_path_for(background), meta);
+        Ok(Self { stages, watching, background })
     }
 
     /// The call returned, so the input is not the one that kills the process and
@@ -192,15 +210,16 @@ impl DriverBreadcrumb {
     fn clear(&mut self) {
         if self.watching {
             self.watching = false;
-            crate::observe::driver_watch::leave();
+            if self.background { crate::observe::driver_watch::leave_background(); }
+            else { crate::observe::driver_watch::leave(); }
         }
         if self.stages.is_empty() {
             return;
         }
         for stage in std::mem::take(&mut self.stages) {
-            let _ = std::fs::remove_file(path(stage));
+            let _ = std::fs::remove_file(path_for(stage, self.background));
         }
-        let _ = std::fs::remove_file(meta_path());
+        let _ = std::fs::remove_file(meta_path_for(self.background));
     }
 }
 

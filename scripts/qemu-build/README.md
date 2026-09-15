@@ -197,3 +197,20 @@ both success and failure by exact shader bytes and stage. Cold reflection is
 serialized, but native LLVM calls have no hard time or memory limit and cannot
 be safely cancelled. A reflection error is reported and leaves capture
 conservative; it does not trigger an external-tool fallback.
+
+Successful AIR translations also have a bounded disk cache in the host temporary
+directory, under `reims-vgpu-translations-v2`. Entries retain the validated SPIR-V
+and reflection together. Exact AIR bytes, stage, every translation option, the
+translator source/build identity and the actual loaded LLVM image identify an
+entry; a filename hash alone cannot authorize a hit. The bounded binary reflection
+encoding preserves floating-point bits, including non-finite sampler limits and
+signed zero. Layout repair and runtime
+format specialization still run at their normal owners after a hit.
+
+The cache uses a private directory, atomic replacement, payload checksums,
+bounded reads, SPIR-V revalidation, and reflection/schema checks. Corrupt or
+unusable hints are reported and translated normally, rather than becoming
+successful-looking shader results. Entries are limited to 24 MiB; the directory
+is trimmed to 512 MiB and 2,048 entries. It is a cache, not guest resource storage,
+and clearing it only makes later translations cold. `m2v_disk_cache_hit` and the
+`translation_disk_hit`/`translation_disk_miss` census identify activation.

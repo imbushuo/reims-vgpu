@@ -22,6 +22,8 @@ mod draw_preparation;
 pub(crate) mod draw_validation;
 mod driver_breadcrumb;
 mod exec;
+mod compile_work;
+pub(crate) mod precreated;
 mod exec_compute;
 pub mod graphics_storage;
 mod serial_interlock;
@@ -238,8 +240,8 @@ pub(crate) fn color_subresource_layers() -> ash::vk::ImageSubresourceLayers {
 /// Its own [`Mutex`] rather than a field under the engine's, because the slot
 /// it lives in belongs to [`crate::model::DeviceState`] and the engine may not
 /// be the thing that owns a device's lifetime. Every entry point that reaches
-/// it holds the engine guard first and this one second, which is the only order
-/// this crate ever takes them in. [`Self::take`] is the exception and is
+/// it holds this cache guard before the engine guard, as draw execution and
+/// native preflight both do. [`Self::end_device`] is the exception and is
 /// written to be one: it empties the caches under this lock, releases it, and
 /// only then asks the engine for a context to destroy them through — so the one
 /// path that runs at device teardown cannot invert the order.

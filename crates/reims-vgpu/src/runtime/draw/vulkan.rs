@@ -7311,11 +7311,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // against this device's 1.2 floor. So two draws sharing shaders and
             // differing only in a guest-supplied stride already get their own
             // pipelines, with no change to the key.
-            let stride =
-                super::bind_attribute_stride(&req.vertex_buffers, a.buffer_index, a.stride);
-            if a.format == 0 || stride == 0 {
-                continue;
-            }
+            let Some(stride) = super::active_vertex_attribute_stride(
+                a.format,
+                super::bind_attribute_stride(&req.vertex_buffers, a.buffer_index, a.stride),
+            ) else { continue; };
             let format = prepare_vertex_attribute_format(a).map_err(DrawError::DrawPreparation)?;
             let content = vtx_storage
                 .iter()
@@ -8220,9 +8219,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 };
                 let smp_bind = SAMPLER_BINDING_BASE + index + base_off;
                 let variant = if frag_stage { &f_variant } else { &v_variant };
-                if !variant.samplers.iter().any(|sampler|
-                    sampler.binding == smp_bind && sampler.guest_supplied())
-                { return Ok(()); }
+                if !guest_sampler_binding(&variant.samplers, smp_bind) { return Ok(()); }
                 if sampler_binds.insert(smp_bind) {
                     let mut sampler = if sampler_ref != 0 {
                         sampler_origin.insert(smp_bind, b'g');
@@ -13522,7 +13519,7 @@ fn frag_unbound_static_use(
     spirv_bind::descriptor_static_use(f_words, TEXTURE_BINDING_BASE + gap.metal_index + base_off)
 }
 
-pub(super) fn reflected_sampled_binding_collision(
+pub(crate) fn reflected_sampled_binding_collision(
     vertex: &metal2vulkan::reflect::ShaderReflection,
     fragment: &metal2vulkan::reflect::ShaderReflection,
 ) -> bool {
@@ -14031,6 +14028,13 @@ pub fn reflected_static_sampler_resource(
         max_anisotropy: sampler.max_anisotropy,
         unnormalized_coordinates: sampler.coordinates == SamplerCoordinates::Pixel,
     })
+}
+
+pub(crate) fn guest_sampler_binding(
+    samplers: &[crate::runtime::spirv_bind::ReflectedSamplerDescriptor],
+    binding: u32,
+) -> bool {
+    samplers.iter().any(|sampler| sampler.binding == binding && sampler.guest_supplied())
 }
 
 pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(

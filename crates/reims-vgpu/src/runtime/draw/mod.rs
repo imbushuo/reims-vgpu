@@ -366,6 +366,11 @@ pub fn bind_attribute_stride(
         .unwrap_or(pipeline_stride)
 }
 
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn active_vertex_attribute_stride(format: u32, stride: u32) -> Option<u32> {
+    (format != 0 && stride != 0).then_some(stride)
+}
+
 /// BGRA<->RGBA channel swap (swap byte 0 and 2 of each 4-byte pixel) producing a
 /// fresh `Vec`, in a SINGLE read+write pass. Replaces the `src.to_vec()` +
 /// in-place `chunks_exact_mut(4)` swizzle-loop idiom, which walked the pixel data

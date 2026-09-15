@@ -2431,9 +2431,19 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             if declined_by_the_device(state, ingress) {
                 continue;
             }
+            let native_pending = state.parked.planning(ingress).is_some_and(|(submission, resolved)| {
+                crate::runtime::exec::native_preflight_pending(state, &*host, submission, resolved)
+            });
+            if native_pending {
+                if let Some(domain) = state.parked.domain_of(ingress) {
+                    if domain == 0 { state.pending.main_drain = true; }
+                    else { state.pending.child_mask |= 1u32.checked_shl(domain).unwrap_or(0); }
+                }
+                continue;
+            }
             let Some(work) = state
                 .parked
-                .release(ingress, crate::runtime::parked::Release::Ready)
+                .release_ready_if(ingress, !native_pending)
             else {
                 continue;
             };

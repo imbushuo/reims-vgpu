@@ -365,6 +365,48 @@ fixtures stay outside version control; native diagnostics identify the actual
 modules and PSO. Functional pixel, staging and declared-binding regressions
 run separately on authored shaders in both descriptor transports.
 
+Ordinary decoded render submissions can precreate exact graphics variants on
+a single bounded application compiler (32 active/queued jobs). A native-pending
+submission remains in the existing ready-position store before resource-table
+consumption or any clear/draw/Store; unrelated ready positions can still run.
+Queue saturation is backpressure, not dropped work. The native worker owns
+immutable shader/state inputs, private pipeline/module/layout/pass objects and a device-lifetime
+lease, never guest-RAM aliases or the shared device/engine service locks.
+Results are keyed by complete pipeline state, descriptor-layout contents,
+attributes and layout mode, with exact shader-Arc/byte equality after cached
+digest hashing; draw-time lookup still requires that exact identity.
+Compiler views share the existing per-native-device 32-program/128MiB hint
+cache, rather than retaining a large hint blob per pipeline. Cache creation
+and serialization have per-allocation synchronization. A synchronous fallback
+never waits behind the compiler's hint-cache lock: it uses a null optional cache
+with `native_cache_busy_uncached` accounting; busy optional saves are deferred.
+Native diagnostics record the actual cache choice (`BusyUncached` when busy).
+Device retirement cancels publication while the old native device survives
+until its compiler-owned objects are released, without joining the compiler
+while holding service locks.
+
+The initial metadata-only profile excludes fixed-function vertex attributes,
+depth/stencil, multisampling, current storage-interlock proofs, unnormalized
+sampling, descriptor arrays, sparse attachment slots and shared-target placement
+on stable-map hosts. Unavailable or incomplete metadata emits
+`native_pipeline_preflight ... route=synchronous` and retains normal execution.
+These boundaries do not downgrade formats or grant shader admission.
+The attribute boundary uses the execution path's effective stride/format rule:
+inactive declarations do not become fixed vertex input. Complete two-stage
+descriptor proofs, cached with immutable module owners, exclude proven-absent
+ordinary sampled bindings from compile-only metadata resolution; draw-time
+staging, ownership and hazards are unchanged. Sampler metadata follows the
+renderer's guest-supplied/static/default selection and serializer-object resolver.
+Unchanged consecutive direct/indexed draw state is prepared once per retained
+stream, including fallback outcomes; state records and topology changes invalidate
+that reuse. Bounded preflight records carry task, pipeline generation and cached
+VS/runtime-FS source digests; `native_preflight_eligible` means metadata collection
+succeeded, not that native creation or draw-time adoption succeeded.
+`pipeline_precreated_hits` identifies exact draw-time reuse;
+`native_pipeline_compile_queued` and `native_pipeline_compile_backpressure`
+describe the compiler mailbox. Compiler breadcrumbs and watchdog reporting are
+separate from synchronous device-service calls.
+
 For creation-miss diagnostics only, set `REIMS_VGPU_PIPELINE_DIAGNOSTICS=on`.
 The default is off. An advertised `VK_EXT_pipeline_creation_feedback` is
 enabled only for this diagnostic; no unsupported feature is assumed from the

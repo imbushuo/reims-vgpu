@@ -2774,7 +2774,7 @@ fn guest_store_footprint_to_record(
 ///
 /// A draw with no depth state at all projects to the inert declaration, which
 /// is what a pass with no depth attachment would ignore anyway.
-fn depth_stencil_state(
+pub(super) fn depth_stencil_state(
     depth: Option<&super::types::DepthState>,
 ) -> reims_vgpu_core::depth_stencil::DepthStencilState {
     let face =
@@ -2802,6 +2802,47 @@ fn depth_stencil_state(
     }
     .checked()
     .expect("every ordinal in a draw request was parsed from an enum on the way in")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pipeline_key(
+    color_state: PipelineColorState,
+    vert: super::digest::Digest128,
+    frag: super::digest::Digest128,
+    attrs: super::caches::AttrsId,
+    pass: super::caches::PassCompatibilityKey,
+    topology: reims_vgpu_vulkan::topology::TopologyKey,
+    raster: reims_vgpu_vulkan::raster::RasterizationState,
+    depth_stencil: reims_vgpu_vulkan::depth_stencil::DepthStencilPlan,
+    viewport_slots: u32,
+    layout: super::caches::LayoutId,
+    feedback_colors: u8,
+) -> PipelineKey {
+    PipelineKey {
+        vert, frag, attrs, topology, blend: color_state.blend,
+        secondary_blend: color_state.secondary_blend, color_write_mask: color_state.color_write_mask,
+        pass, feedback_colors, raster,
+        depth_stencil, viewport_slots, layout,
+    }
+}
+
+pub(super) struct PipelineColorState {
+    pub blend: Option<super::types::BlendKey>,
+    pub secondary_blend: [Option<super::types::BlendKey>; MAX_SECONDARY_ATTACH],
+    pub color_write_mask: [ColorWriteMask; 1 + MAX_SECONDARY_ATTACH],
+}
+
+impl From<&DrawRequest> for PipelineColorState {
+    fn from(req: &DrawRequest) -> Self {
+        let mut secondary_blend = [None; MAX_SECONDARY_ATTACH];
+        let mut color_write_mask = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
+        color_write_mask[0] = req.color_write_mask;
+        for (slot, target) in req.secondary_targets.iter().take(MAX_SECONDARY_ATTACH).enumerate() {
+            secondary_blend[slot] = target.blend.map(|blend| blend.key());
+            color_write_mask[slot + 1] = target.color_write_mask;
+        }
+        Self { blend: req.blend.map(|blend| blend.key()), secondary_blend, color_write_mask }
+    }
 }
 
 pub(crate) unsafe fn execute_draw_inner(
@@ -3480,46 +3521,11 @@ pub(crate) unsafe fn execute_draw_inner(
             return Err(DrawError::Unsupported(reason));
         }
     };
-    let pipeline_key = PipelineKey {
-        vert: vert_digest,
-        frag: frag_digest,
-        attrs: attr_keys,
-        topology: topology_key,
-        blend: req.blend.map(|b| b.key()),
-        secondary_blend: {
-            let mut per_slot = [None; MAX_SECONDARY_ATTACH];
-            for (slot, target) in req
-                .secondary_targets
-                .iter()
-                .take(MAX_SECONDARY_ATTACH)
-                .enumerate()
-            {
-                per_slot[slot] = target.blend.map(|b| b.key());
-            }
-            per_slot
-        },
-        color_write_mask: {
-            let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
-            per_slot[0] = req.color_write_mask;
-            for (slot, target) in req
-                .secondary_targets
-                .iter()
-                .take(MAX_SECONDARY_ATTACH)
-                .enumerate()
-            {
-                per_slot[slot + 1] = target.color_write_mask;
-            }
-            per_slot
-        },
-        pass: pass_compatibility,
-        // Taken from the pass key this draw built, not from `pass`, which
-        // erases it once feedback stops changing the render pass.
-        feedback_colors: pass_key.feedback_colors,
-        raster: raster_plan.state,
-        depth_stencil: depth_stencil_plan.state,
-        viewport_slots: slot_count_u32,
-        layout: layout.id,
-    };
+    let pipeline_key = pipeline_key(
+        PipelineColorState::from(req), vert_digest, frag_digest, attr_keys, pass_compatibility,
+        topology_key, raster_plan.state, depth_stencil_plan.state, slot_count_u32, layout.id,
+        pass_key.feedback_colors,
+    );
     // One cache, consulted once. `get_or_create_pipeline` already counts the hit
     // and already checks the negative entry for a key that failed to compile.
     phase.enter(super::draw_phase::Phase::PipelineCompile);

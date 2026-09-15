@@ -341,6 +341,15 @@ impl ParkedStore {
         true
     }
 
+    /// Native compilation is a device readiness gate, not a second execution.
+    /// A pending position retains every byte and remains offered on re-entry.
+    pub(crate) fn release_ready_if(
+        &mut self, ingress: IngressOrdinal, device_ready: bool,
+    ) -> Option<ParkedWork> {
+        if !device_ready || !self.ready.contains(&ingress) { return None; }
+        self.release(ingress, Release::Ready)
+    }
+
     /// The positions that may run, in ingress order.
     ///
     /// A list rather than a `next()`, because **the caller may decline any one
@@ -507,6 +516,33 @@ mod tests {
 
         assert!(store.release(ordinal(2), Release::Ready).is_some());
         assert!(store.release(ordinal(2), Release::Ready).is_none());
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn native_compile_gate_retains_dependent_submission_and_allows_unrelated_service() {
+        let mut store = ParkedStore::new();
+        let mut dependent = packet(32);
+        dependent.payload[2] = 0xab;
+        store.park(ordinal(1), ParkedWork::with_submission(
+            1, EPOCH, dependent,
+            ExecSubmission::stated(1, vec![vec![11, 22, 33]]),
+            ExecWork::default(),
+        ));
+        store.park(ordinal(2), ParkedWork::new(2, EPOCH, packet(8)));
+        assert!(store.mark_ready(ordinal(1)));
+        assert!(store.mark_ready(ordinal(2)));
+        let held = store.retained_bytes();
+        for _ in 0..3 {
+            assert!(store.release_ready_if(ordinal(1), false).is_none());
+            assert_eq!(store.retained_bytes(), held);
+        }
+        assert!(store.release_ready_if(ordinal(2), true).is_some());
+        assert_eq!(store.ready_in_order(), vec![ordinal(1)]);
+        let work = store.release_ready_if(ordinal(1), true).unwrap();
+        assert_eq!(work.packet().payload[2], 0xab);
+        assert_eq!(work.submission().unwrap().streams(), &[vec![11, 22, 33]]);
+        assert!(store.release_ready_if(ordinal(1), true).is_none());
         assert!(store.is_empty());
     }
 

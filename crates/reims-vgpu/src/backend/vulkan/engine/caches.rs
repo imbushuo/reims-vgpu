@@ -1010,6 +1010,39 @@ pub(crate) struct PipelineKey {
     pub layout: LayoutId,
 }
 
+impl PipelineKey {
+    pub(super) fn normalize_interns(&mut self) {
+        self.attrs = AttrsId(0);
+        self.layout = LayoutId(0);
+    }
+
+    #[cfg(test)]
+    pub(super) fn collision_fixture() -> Self {
+        let request = super::types::DrawRequest::default();
+        let digest = Digest128::of_u32_words(&[0]);
+        let raster = reims_vgpu_vulkan::raster::plan(request.raster,
+            reims_vgpu_vulkan::raster::RasterCell {
+                depth_clamp: false, fill_mode_non_solid: false,
+                dynamic_cull_and_winding: false, dynamic_polygon_mode: false,
+                dynamic_depth_clamp: false,
+            }).unwrap().state;
+        super::exec::pipeline_key(
+            super::exec::PipelineColorState::from(&request),
+            digest, digest, AttrsId(0),
+            PassKey::single(Color0Load::Clear, vk::Format::R16G16B16A16_SFLOAT).compatibility(),
+            reims_vgpu_vulkan::topology::key(reims_vgpu_core::topology::PrimitiveType::Triangle,
+                reims_vgpu_vulkan::topology::TopologyCell { dynamic: false, unrestricted: false }),
+            raster,
+            reims_vgpu_vulkan::depth_stencil::plan(
+                &super::exec::depth_stencil_state(None),
+                reims_vgpu_vulkan::depth_stencil::DepthStencilCell { extended_dynamic_state: false },
+                false,
+            ).state,
+            1, LayoutId(0), 0,
+        )
+    }
+}
+
 /// Lc: compute pipeline cache key — SPIR-V content digest + entry name + layout
 /// + the workgroup size the module is specialized to. Never funcId / pipeline ref.
 ///
@@ -1097,7 +1130,7 @@ pub(crate) struct CachedShaderModule {
 /// that is not a fidelity question: an evicted negative entry costs a re-attempt
 /// of a create that has already been measured to fail, never a dropped guest
 /// object. The positive maps are deliberately unbounded — see [`ObjectCache`].
-const NEGATIVE_CAP: usize = 1024;
+pub(super) const NEGATIVE_CAP: usize = 1024;
 
 /// A content-keyed cache of immutable Vulkan objects, plus the typed refusal for
 /// keys whose create failed.
@@ -1339,6 +1372,7 @@ struct ShaderDigestEntry {
     native: Option<Digest128>,
     serial: Option<Result<std::sync::Arc<super::serial_interlock::Program>, super::serial_interlock::Refusal>>,
     serial_vertex: Option<std::sync::Arc<super::serial_interlock::VertexDeclarations>>,
+    metadata: Option<std::sync::Arc<super::precreated::SourceInfo>>,
 }
 
 impl ShaderDigestIndex {
@@ -1372,7 +1406,7 @@ impl ShaderDigestIndex {
             self.map.clear();
         }
         self.map.entry(address).or_insert_with(|| ShaderDigestEntry {
-            _source: words.clone(), native: None, serial: None, serial_vertex: None,
+            _source: words.clone(), native: None, serial: None, serial_vertex: None, metadata: None,
         })
     }
 
@@ -1392,12 +1426,20 @@ impl ShaderDigestIndex {
             super::serial_interlock::VertexDeclarations::analyze(words)).clone()
     }
 
+    fn metadata_source(
+        &mut self, words: &std::sync::Arc<Vec<u32>>,
+    ) -> std::sync::Arc<super::precreated::SourceInfo> {
+        self.entry(words).metadata
+            .get_or_insert_with(|| super::precreated::SourceInfo::new(words)).clone()
+    }
+
     fn clear(&mut self) {
         self.map.clear();
     }
 }
 
 pub(crate) struct ObjectCaches {
+    precreated: super::precreated::Cache,
     shaders: ObjectCache<Digest128, std::sync::Arc<CachedShaderModule>>,
     layouts: LayoutTable,
     attr_sets: SliceIntern<AttrKey>,
@@ -1855,8 +1897,20 @@ fn color_attachment_state(
 }
 
 impl ObjectCaches {
+    pub(crate) fn metadata_sources(
+        &mut self,
+        vertex: &std::sync::Arc<Vec<u32>>,
+        fragment: &std::sync::Arc<Vec<u32>>,
+    ) -> [std::sync::Arc<super::precreated::SourceInfo>; 2] {
+        [
+            self.shader_digests.metadata_source(vertex),
+            self.shader_digests.metadata_source(fragment),
+        ]
+    }
+
     pub(crate) fn new() -> Self {
         Self {
+            precreated: super::precreated::Cache::default(),
             shaders: ObjectCache::new(),
             layouts: LayoutTable::new(),
             attr_sets: SliceIntern::new(),
@@ -1871,6 +1925,7 @@ impl ObjectCaches {
     }
 
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        self.precreated.clear();
         self.diagnostics = None;
         // This index borrows handles owned by `pipelines`; forget those echoes
         // before destroying the authoritative objects.
@@ -1924,6 +1979,7 @@ impl ObjectCaches {
     }
 
     pub(crate) fn clear_logical(&mut self) {
+        self.precreated.clear();
         self.diagnostics = None;
         // Before the modules it indexes, so no window exists where a front-index
         // hit names a digest whose module has already gone.
@@ -2643,6 +2699,16 @@ impl ObjectCaches {
             }
             return Ok(p);
         }
+        if let Some(result) = self.precreated.ready(
+            ctx.native_identity(), key, self.attr_sets.get(key.attrs.0), &self.layouts.entries[key.layout.0 as usize].bindings,
+            self.layouts.entries[key.layout.0 as usize].push_constant,
+            self.layouts.entries[key.layout.0 as usize].push_descriptors,
+            vert_spirv, frag_spirv,
+        ) {
+            counters.pipeline_hits.fetch_add(1, Ordering::Relaxed);
+            counters.pipeline_precreated_hits.fetch_add(1, Ordering::Relaxed);
+            return result;
+        }
         counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
 
         // Every colour attachment, parsed once and planned once.
@@ -3078,13 +3144,14 @@ impl ObjectCaches {
         if ctx.pipeline_creation_feedback {
             gpci = gpci.push_next(&mut feedback);
         }
-        let trace = trace.map(|trace| {
-            let started = trace.begin();
-            (trace, started)
+        let (created, trace) = native_cache.with_handle(|cache| {
+            let trace = trace.map(|mut trace| {
+                trace.actual_cache(native_cache.diagnostic_for(cache));
+                let started = trace.begin();
+                (trace, started)
+            });
+            (ctx.device.create_graphics_pipelines(cache, &[gpci], None), trace)
         });
-        let created = ctx
-            .device
-            .create_graphics_pipelines(native_cache.handle(), &[gpci], None);
         if let Some((trace, started)) = trace {
             let result = created.as_ref().err().map_or(vk::Result::SUCCESS, |(_, result)| *result);
             let _observation = trace.finish(
@@ -3112,6 +3179,37 @@ impl ObjectCaches {
             self.pipeline_objects.remember(identity, key, pipe);
         }
         Ok(pipe)
+    }
+
+    pub(crate) fn precreate_pipeline(
+        &mut self,
+        ctx: &DeviceContext,
+        key: &PipelineKey,
+        vertex: &std::sync::Arc<Vec<u32>>,
+        fragment: &std::sync::Arc<Vec<u32>>,
+        pass: PassKey,
+    ) -> super::precreated::Progress {
+        if self.pipelines.map.contains_key(key) || self.pipelines.get_negative(key).is_some() {
+            return super::precreated::Progress::Ready;
+        }
+        let plan = super::precreated::Plan {
+            key: super::precreated::Key::new(
+                key, self.attr_sets.get(key.attrs.0),
+                &self.layouts.entries[key.layout.0 as usize].bindings,
+                self.layouts.entries[key.layout.0 as usize].push_constant,
+                self.layouts.entries[key.layout.0 as usize].push_descriptors,
+                vertex, fragment,
+            ),
+            vertex: vertex.clone(),
+            fragment: fragment.clone(),
+            pass,
+        };
+        self.precreated.prepare(ctx, plan)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn precreated_results(&self) -> Vec<Result<(), DrawError>> {
+        self.precreated.results()
     }
 
     pub(crate) unsafe fn get_or_create_compute_pipeline(
@@ -3197,9 +3295,9 @@ impl ObjectCaches {
                 return Err(err);
             }
         };
-        let created = ctx
-            .device
-            .create_compute_pipelines(native_cache.handle(), &[cpci], None);
+        let created = native_cache.with_handle(|cache| {
+            ctx.device.create_compute_pipelines(cache, &[cpci], None)
+        });
         breadcrumb.disarm();
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateComputePipelines, e));
