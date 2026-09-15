@@ -977,10 +977,13 @@ fn capture_air(air: &[u8], stage: Stage, spirv: &[u8]) {
 }
 
 fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
+    let started = std::time::Instant::now();
     // metal2vulkan's tool boundary uses fixed scratch names inside `tmp_dir`.
     // Serialize sync and background calls so their AIR/LLVM/SPIR-V files never
     // alias one another.
     let _guard = translation_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let lock_wait_us = started.elapsed().as_micros();
+    let translating = std::time::Instant::now();
     let tmp = tmp_dir();
     let name = match stage {
         Stage::Vertex => "v.air",
@@ -996,7 +999,12 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
         metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
             .map_err(|e| translate_decline(stage, e.to_string()))?;
     capture_air(air, stage, &spirv);
-    finish_translated(spirv, reflection, stage)
+    let shader = finish_translated(spirv, reflection, stage)?;
+    crate::observe::off(format!(
+        "m2v_translation stage={stage:?} air_bytes={} spirv_bytes={} lock_wait_us={lock_wait_us} translate_us={}",
+        air.len(), shader.spirv.len(), translating.elapsed().as_micros()
+    ));
+    Ok(shader)
 }
 
 fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedShader> {
