@@ -1290,6 +1290,7 @@ impl ResourcePools {
             (Some(memory), 1) => match super::super::linear_target_import::create(
                 ctx,
                 &mut self.host_ram_imports,
+                counters,
                 &memory.import,
                 memory.backing,
                 width,
@@ -1822,7 +1823,7 @@ impl ResourcePools {
     /// One function because the resident rail and the transient fallback must
     /// pick the same format for the same draw — they feed the same render pass,
     /// whose attachment format is fixed by `PassKey`.
-    fn depth_format(ctx: &DeviceContext, with_stencil: bool) -> vk::Format {
+    pub(crate) fn depth_format(ctx: &DeviceContext, with_stencil: bool) -> vk::Format {
         if with_stencil {
             ctx.depth_stencil_format
         } else {
@@ -2061,6 +2062,7 @@ impl ResourcePools {
         identity: &TargetIdentity,
         access: ResidentAccess,
     ) {
+        self.journal_resident(identity);
         let guest_backed = self
             .registry
             .get(identity)
@@ -2071,6 +2073,64 @@ impl ResourcePools {
         }
         self.set_registry_access(identity, access);
         self.set_sole_copy(identity, !guest_backed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn batch_attachment_states(
+        &self,
+        target: &BatchTarget,
+    ) -> Result<Vec<BatchResidentState>, DrawError> {
+        target.identities().map(|identity| {
+            let slot = self.registry.get(identity).ok_or_else(|| DrawError::DrawExecution(
+                super::super::draw_execution::DrawExecutionDecline::BatchAttachmentNotRetainable {
+                    identity: identity.clone(),
+                },
+            ))?;
+            Ok(BatchResidentState {
+                identity: identity.clone(),
+                image: slot.image,
+                access: slot.access,
+                content_ready: slot.content_ready,
+                content_epoch: slot.content_epoch,
+                sole_copy: slot.gpu_only_content,
+            })
+        }).collect()
+    }
+
+    pub(crate) fn begin_resident_journal(&mut self) {
+        debug_assert!(self.resident_journal.is_none(), "resident publication already in progress");
+        self.resident_journal = Some(Vec::new());
+    }
+
+    pub(crate) fn take_resident_journal(&mut self) -> Vec<BatchResidentState> {
+        self.resident_journal.take().expect("resident publication owns its journal")
+    }
+
+    fn journal_resident(&mut self, identity: &TargetIdentity) {
+        let Some(journal) = self.resident_journal.as_mut() else { return };
+        let Some(slot) = self.registry.get(identity) else { return };
+        if journal.iter().any(|before| before.identity == *identity && before.image == slot.image) {
+            return;
+        }
+        journal.push(BatchResidentState {
+            identity: identity.clone(),
+            image: slot.image,
+            access: slot.access,
+            content_ready: slot.content_ready,
+            content_epoch: slot.content_epoch,
+            sole_copy: slot.gpu_only_content,
+        });
+    }
+
+    pub(super) fn restore_batch_residents(&mut self, states: Vec<BatchResidentState>) {
+        for state in states {
+            let Some(slot) = self.registry.get_mut(&state.identity) else { continue };
+            if slot.image != state.image { continue; }
+            slot.content_ready = state.content_ready;
+            slot.content_epoch = state.content_epoch;
+            self.set_registry_access(&state.identity, state.access);
+            self.set_sole_copy(&state.identity, state.sole_copy);
+        }
     }
 
     /// Mark a depth resident as holding rendered contents, after a pass that
@@ -2094,6 +2154,7 @@ impl ResourcePools {
     /// bounded by the idle age, and it is visible. Read that counter before
     /// deciding depth needs its own age.
     pub(crate) fn registry_mark_depth_ready(&mut self, identity: &TargetIdentity) {
+        self.journal_resident(identity);
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
         }
@@ -2155,6 +2216,12 @@ impl ResourcePools {
             slot.pin_count -= 1;
         }
         let after_non_pinned = slot.pin_count == 0;
+        if !pinned && slot.released_and_collectable() {
+            self.released_resident_allocations.push(ResidentAllocationRef {
+                identity: identity.clone(),
+                image: slot.image,
+            });
+        }
         if before_non_pinned != after_non_pinned {
             let bytes = Self::slot_attachment_bytes(slot);
             self.registry_non_pinned_adjust(bytes, after_non_pinned);
@@ -2210,7 +2277,7 @@ impl ResourcePools {
             return false;
         };
         if unpinned {
-            self.retire_resident(ctx, identity, ResidentReclaim::ResourceReleased, counters);
+            self.retire_ready_residents(ctx, counters);
         }
         true
     }
@@ -2218,7 +2285,7 @@ impl ResourcePools {
     /// Device-free ownership transition behind resource release. Returns
     /// whether the ownership pin was the last pin and the resident may retire
     /// immediately, or `None` when the identity was already absent.
-    fn release_resident_ownership(&mut self, identity: &TargetIdentity) -> Option<bool> {
+    pub(super) fn release_resident_ownership(&mut self, identity: &TargetIdentity) -> Option<bool> {
         let slot = self.registry.get_mut(identity)?;
         if slot.resource_owner_count == 0 {
             crate::observe::fail(format!(
@@ -2290,7 +2357,7 @@ impl ResourcePools {
         self.window_published.contains(identity)
     }
 
-    fn released_resident_keys(&self, max: usize) -> Vec<TargetIdentity> {
+    pub(super) fn released_resident_keys(&self, max: usize) -> Vec<TargetIdentity> {
         self.registry_order
             .iter()
             .filter(|identity| {
@@ -2303,6 +2370,27 @@ impl ResourcePools {
             .take(max)
             .cloned()
             .collect()
+    }
+
+    /// Last-pin completion is a lifetime event, not a budgeted idle eviction.
+    /// Recheck the native allocation and authority before handing it to disposal.
+    pub(super) fn take_ready_resident_retirements(&mut self) -> Vec<TargetIdentity> {
+        std::mem::take(&mut self.released_resident_allocations).into_iter()
+            .filter(|retired| self.registry.get(&retired.identity).is_some_and(|slot| {
+                slot.image == retired.image && slot.released_and_collectable()
+            }))
+            .map(|retired| retired.identity)
+            .collect()
+    }
+
+    pub(super) unsafe fn retire_ready_residents(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+    ) {
+        for identity in self.take_ready_resident_retirements() {
+            self.retire_resident(ctx, &identity, ResidentReclaim::ResourceReleased, counters);
+        }
     }
 
     pub(super) unsafe fn retire_released_residents(
@@ -2437,14 +2525,20 @@ impl ResourcePools {
     /// — must take host memory rather than build a barrier from an access it has
     /// itself invalidated.
     fn set_registry_access(&mut self, identity: &TargetIdentity, access: ResidentAccess) {
+        self.journal_resident(identity);
         let Some(slot) = self.registry.get_mut(identity) else {
             return;
         };
-        if slot.access == access {
-            return;
-        }
+        let changed = slot.access != access;
+        let guest_backed = slot.memory.is_guest_imported();
         slot.access = access;
-        if self.window_published.contains(identity) {
+        // A stable layout does not mean the GPU has finished using guest RAM.
+        // This owner covers sampled reads, seed copies and attachment accesses,
+        // including a pass split that has not reached its guest Store yet.
+        if guest_backed {
+            self.note_guest_read_recorded();
+        }
+        if changed && self.window_published.contains(identity) {
             self.invalidate_window_sources();
         }
     }
@@ -2583,9 +2677,14 @@ impl ResourcePools {
     /// is no slot to read yet, and it sets it to the default that counts for
     /// nothing.
     fn set_sole_copy(&mut self, identity: &TargetIdentity, sole: bool) -> bool {
+        self.journal_resident(identity);
         let Some(slot) = self.registry.get_mut(identity) else {
             return false;
         };
+        // Encoder retirement owns the discard; rollback cannot resurrect it.
+        // Backed residents retain their separate authoritative-content duty.
+        let sole = sole
+            && !(slot.resource_released && matches!(identity, TargetIdentity::PassLocal { .. }));
         // Returning early on a no-op is what keeps the totals a population
         // rather than a transition count: `registry_mark_ready` fires on every
         // draw into an already-sole-copy slot.
@@ -4383,9 +4482,7 @@ pub(super) mod pin_count_tests {
         assert_eq!(slot.pin_count, 0, "no deferred window holds it yet");
     }
 
-    #[test]
-    fn a_guest_import_is_born_with_shared_contents_and_never_becomes_sole_copy() {
-        let mut pools = ResourcePools::new();
+    fn guest_resident() -> NewResident {
         let mut resident = new_resident(some_framebuffer(), vk::RenderPass::null());
         resident.memory = ResidentMemory::GuestImported {
             guest: crate::backend::vulkan::engine::GuestTargetMemory {
@@ -4408,8 +4505,14 @@ pub(super) mod pin_count_tests {
                 .expect("page footprint"),
             },
         };
+        resident
+    }
+
+    #[test]
+    fn a_guest_import_is_born_with_shared_contents_and_never_becomes_sole_copy() {
+        let mut pools = ResourcePools::new();
         let identity = surf(1);
-        pools.register_resident(&identity, resident);
+        pools.register_resident(&identity, guest_resident());
 
         let slot = pools.registry.get(&identity).expect("registered");
         assert!(
@@ -4427,6 +4530,39 @@ pub(super) mod pin_count_tests {
             !pools.registry.get(&identity).unwrap().gpu_only_content,
             "rendering writes the shared allocation itself"
         );
+        pools.take_guest_read_debt();
+    }
+
+    #[test]
+    fn imported_resident_access_owes_completion_even_when_its_layout_is_unchanged() {
+        let mut pools = ResourcePools::new();
+        let imported = surf(1);
+        let copied = surf(2);
+        pools.register_resident(&imported, guest_resident());
+        pools.register_resident(
+            &copied,
+            new_resident(some_framebuffer(), vk::RenderPass::null()),
+        );
+        assert!(!pools.take_guest_read_debt());
+        for access in [
+            ResidentAccess::shader_read(true),
+            ResidentAccess::shader_read(true),
+            ResidentAccess::transfer_read(true),
+            ResidentAccess::transfer_read(true),
+        ] {
+            pools.registry_note_access(&copied, access);
+            assert!(!pools.take_guest_read_debt());
+            pools.registry_note_access(&imported, access);
+            assert!(pools.take_guest_read_debt());
+            assert!(!pools.take_guest_read_debt());
+        }
+        for _ in 0..2 {
+            pools.registry_mark_ready_at(&imported, vk::ImageLayout::GENERAL);
+            assert!(
+                pools.take_guest_read_debt(),
+                "a guest-backed attachment cannot outlive its guest completion stamp"
+            );
+        }
     }
 
     /// Registration writes the map and the order together.

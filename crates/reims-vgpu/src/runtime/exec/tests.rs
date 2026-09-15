@@ -2741,12 +2741,19 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
             store_action: MTL_STORE_ACTION_STORE,
             clear_color: [0.1, 0.2, 0.3, 1.0],
             target_seed_rgba: Some(vec![0xbb; 16]),
+            target_seed_native: Some(draw::NativeColorSeed {
+                layout: crate::protocol::pixel_format::TexelLayout::Rgba16Float,
+                bytes: std::sync::Arc::new(vec![0; 16]),
+            }),
+            guest_mip_level: 2,
             multisample_source_ref: 0,
         }],
         ..Default::default()
     };
     let template = render_pass_attachment_template(&first);
     assert!(template.colors[0].target_seed_rgba.is_none());
+    assert!(template.colors[0].target_seed_native.is_none());
+    assert_eq!(template.colors[0].guest_mip_level, 2);
     assert_eq!(template.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
     assert_eq!(template.colors[0].mapping_id, 3);
     assert_eq!(

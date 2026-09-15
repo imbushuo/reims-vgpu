@@ -1521,6 +1521,55 @@ pub(crate) struct StagedTexture<R: RailStage> {
     pub rail: R,
 }
 
+#[cfg(feature = "backend-vulkan")]
+impl<R: RailStage> StagedTexture<R> {
+    pub(crate) fn writeback_footprint(
+        &self,
+        state: &DeviceState,
+    ) -> Option<crate::runtime::guest_ram::GuestPageFootprint> {
+        let pages = match &self.writeback {
+            TextureWriteback::None => return None,
+            TextureWriteback::Linear { gva, pages, .. } =>
+                pages.ordered_complete(*gva, state.page_size())?.to_vec(),
+            // This older writeback record does not retain its stage-time map
+            // generation. It may be observed, but cannot grant new isolation.
+            TextureWriteback::MapperRefTexture { .. } => return None,
+        };
+        crate::runtime::guest_ram::GuestPageFootprint::new(pages.into(), state.page_size())
+    }
+
+    pub(crate) fn diagnostic_writeback_generation(&self, state: &DeviceState) -> Option<u32> {
+        match self.writeback {
+            TextureWriteback::MapperRefTexture { mapping_id, .. } =>
+                state.mappings.get(&mapping_id).map(|mapping| mapping.map_generation),
+            TextureWriteback::None | TextureWriteback::Linear { .. } => None,
+        }
+    }
+
+    pub(crate) fn diagnostic_writeback_pages(
+        &self,
+        state: &DeviceState,
+    ) -> (String, Option<Vec<u64>>) {
+        match &self.writeback {
+            TextureWriteback::None => ("none".into(), None),
+            TextureWriteback::Linear { texture_ref, gva, row_stride, height, pages, .. } => (
+                format!("linear:ref{texture_ref}:gva{gva:#x}:pitch{row_stride}:height{height}:span{:?}",
+                    row_stride.checked_mul(u64::from(*height))),
+                pages.ordered_complete(*gva, state.page_size())
+                    .filter(|pages| !pages.is_empty()).map(<[u64]>::to_vec),
+            ),
+            TextureWriteback::MapperRefTexture {
+                mapping_id, surface_offset, surface_bpr, span_end, ..
+            } => (
+                format!("mapping:mid{mapping_id}:offset{surface_offset}:pitch{surface_bpr}:end{span_end}:gen{:?}",
+                    state.mappings.get(mapping_id).map(|mapping| mapping.map_generation)),
+                state.mappings.get(mapping_id).filter(|mapping| mapping.mapped)
+                    .and_then(|_| state.mapping_reach_pages(*mapping_id)),
+            ),
+        }
+    }
+}
+
 /// What an engine-resident copy of a window can serve one staged binding.
 ///
 /// `Seed` means a storage binding's output is already GPU-resident at this
@@ -3537,6 +3586,8 @@ pub mod metal;
 pub mod stall_watchdog;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
+#[cfg(feature = "backend-vulkan")]
+pub(crate) mod planar_snapshot;
 
 // The two constructors are free functions here rather than an inherent `impl`
 // on `Extent3`, because both refuse with `ComputeStatus` and one reads a decoded

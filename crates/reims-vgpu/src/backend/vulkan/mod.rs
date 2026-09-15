@@ -614,6 +614,17 @@ impl Backend for VulkanBackend {
         draw::vulkan::gva_load_seed_elidable(state, host, task_id, span)
     }
 
+    fn gva_color_load_seed<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        span: GvaSpan,
+        guest_mip_level: u32,
+    ) -> Option<draw::ColorLoadSeed> {
+        draw::vulkan::gva_color_load_seed(state, host, task_id, span, guest_mip_level)
+    }
+
     fn read_abandoned_chain_rgba(
         &self,
         state: &DeviceState,

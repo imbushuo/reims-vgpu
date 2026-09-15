@@ -234,7 +234,8 @@ fn memoryless_r32float_gpu_split_fetch_blend_and_retirement() {
             });
             assert!(matches!(result.0, EncodeStatus::Ok), "pass admission: {:?}", result.0);
         }
+        engine::test_quiesce_ring();
         assert!(identities.iter().all(|identity| !engine::resident_content_ready(identity)),
-            "end-of-pass retires both native images, not just their Rust names");
+            "completed encoder retirement releases both native images");
     }
 }

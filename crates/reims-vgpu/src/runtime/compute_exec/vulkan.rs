@@ -283,7 +283,7 @@ pub(super) fn mapper_ref_texture_destination<M: HostMemory + HostOps>(
 /// [`RailStage`]: crate::runtime::compute_exec::RailStage
 #[derive(Debug, Default)]
 pub(crate) struct VulkanStage {
-    pub(crate) planar: Option<crate::backend::vulkan::planar::Image>,
+    pub(crate) planar: Option<std::sync::Arc<crate::backend::vulkan::planar::Image>>,
     /// Which element of the descriptor binding's array this fills.
     pub(crate) array_element: u32,
     /// How many descriptors the binding declares.
@@ -319,6 +319,30 @@ pub(crate) struct VulkanStage {
 impl RailStage for VulkanStage {
     fn supports_planar_samples() -> bool { true }
 
+    fn stage_planar_source<M: HostMemory + HostOps>(
+        state: &mut DeviceState,
+        host: &mut M,
+        source: &PlanarSource,
+    ) -> Result<Self, ComputeStatus> {
+        const COUNTERS: super::planar_snapshot::Counters = super::planar_snapshot::Counters {
+            unscoped: "vulkan_planar_sampled_unscoped",
+            reuses: "vulkan_planar_sampled_reuses",
+            reuse_bytes: "vulkan_planar_sampled_reuse_bytes",
+            misses: "vulkan_planar_sampled_misses",
+            unretained: "vulkan_planar_sampled_unretained",
+        };
+        let image = super::planar_snapshot::stage_with(
+            state, host, source, &COUNTERS,
+            |state, host, source| {
+                Self::stage_planar(
+                    source.texture_ref, source.description, source.layout.clone(),
+                    |planes| source.fill(state, host, planes),
+                )?.planar.ok_or(ComputeStatus::Unsupported("planar_staging_missing"))
+            },
+        )?;
+        Ok(Self { planar: Some(image), descriptor_count: 1, ..Self::default() })
+    }
+
     fn stage_planar(
         _texture_ref: u32,
         description: crate::protocol::planar::TextureDescription,
@@ -348,7 +372,11 @@ impl RailStage for VulkanStage {
         let planes = planes.map(|plane| unsafe { plane.assume_init().into_vec() });
         let image = crate::backend::vulkan::planar::Image::expand(description, layout, planes)
             .map_err(|error| ComputeStatus::Unsupported(error.slug()))?;
-        Ok(Self { planar: Some(image), descriptor_count: 1, ..Self::default() })
+        Ok(Self {
+            planar: Some(std::sync::Arc::new(image)),
+            descriptor_count: 1,
+            ..Self::default()
+        })
     }
 
     /// The guest ref is not kept: this rail reaches its images through the
@@ -1181,7 +1209,10 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 sampled_images.push(ComputeSampledImageResource {
                     binding: t.binding, array_element: 0, descriptor_count: 1,
                     format: image.engine_format(), width: image.width, height: image.height,
-                    mip_levels: 1, source: ComputeSampledSource::Bytes(image.bytes),
+                    mip_levels: 1,
+                    source: ComputeSampledSource::Bytes(std::sync::Arc::unwrap_or_clone(
+                        std::sync::Arc::unwrap_or_clone(image).bytes,
+                    )),
                 });
                 continue;
             }

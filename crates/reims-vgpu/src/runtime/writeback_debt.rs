@@ -571,6 +571,17 @@ impl PendingWritebacks {
             .map(|resource| (resource.generation, resource.span, resource.pages.is_some()))
     }
 
+    pub(crate) fn gva_store_generation_is_live(
+        &self,
+        key: GvaResourceKey,
+        gva: u64,
+        generation: u64,
+        span: u64,
+    ) -> bool {
+        generation != 0
+            && self.gva_resource_status(key.plane(gva)) == Some((generation, span, true))
+    }
+
     /// Release the transfer buffer of each named resource while preserving its
     /// host texture and lifetime identity.
     ///
@@ -1438,11 +1449,9 @@ fn release_gva<B: crate::backend::Backend>(rail: B, debt: GvaWritebackDebt) {
     }
 }
 
-/// Pay one ledger entry named by key, for the arm that had to evict it.
-///
-/// Gated on the arm whose draw rail evicts: the `cfg` answers "did this build
-/// compile a caller", which is the one question a `cfg` may answer.
-#[cfg(feature = "backend-vulkan")]
+/// Pay an evicted entry in the legacy mapped-debt fixture. Product mapped
+/// Stores publish before completion rather than leaving this debt unpaid.
+#[cfg(all(test, feature = "backend-vulkan"))]
 pub(crate) fn pay_key<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,

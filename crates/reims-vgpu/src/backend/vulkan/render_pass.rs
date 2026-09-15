@@ -79,6 +79,7 @@ impl VulkanRenderPass {
             super::translate::pixel::memoryless_color_attachment(color.format)
                 .map_err(|_| "draw_vk_memoryless_pass_format")?;
             if color.mapping_id != 0 || color.target_gva != 0 || color.target_seed_rgba.is_some()
+                || color.target_seed_native.is_some()
                 || color.store_action != MTL_STORE_ACTION_DONT_CARE
             {
                 return Err("draw_vk_memoryless_backing");

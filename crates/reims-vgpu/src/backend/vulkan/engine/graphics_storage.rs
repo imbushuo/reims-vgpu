@@ -62,6 +62,7 @@ pub enum GraphicsStorageDecline {
     DuplicateBinding { binding: u32 },
     StageUnsupported,
     PixelInterlockUnsupported,
+    SerialInterlock(super::serial_interlock::Refusal),
     FormatUnsupported { format: vk::Format },
 }
 
@@ -89,6 +90,7 @@ impl crate::observe::Decline for GraphicsStorageDecline {
             Self::DuplicateBinding { .. } => "draw_vk_storage_duplicate_binding",
             Self::StageUnsupported => "draw_vk_storage_stage_unsupported",
             Self::PixelInterlockUnsupported => "draw_vk_storage_pixel_interlock_unsupported",
+            Self::SerialInterlock(reason) => crate::observe::Decline::slug(reason),
             Self::FormatUnsupported { .. } => "draw_vk_storage_format_unsupported",
         }
     }
@@ -164,6 +166,10 @@ pub(super) struct PreparedTexture {
     len: u64,
 }
 
+impl PreparedTexture {
+    pub(super) fn image(&self) -> vk::Image { self.image.image }
+}
+
 pub(super) unsafe fn prepare(
     ctx: &DeviceContext,
     pools: &mut ResourcePools,
@@ -236,6 +242,7 @@ fn texture_descriptors(
 pub(super) fn assert_final_descriptor_writes(
     req: &DrawRequest,
     prepared: &[PreparedTexture],
+    admission: &super::caches::storage_descriptors::StorageDescriptorAdmission<'_>,
     writes: &[vk::WriteDescriptorSet<'_>],
     site: &str,
 ) {
@@ -244,6 +251,10 @@ pub(super) fn assert_final_descriptor_writes(
             let matches: Vec<_> = writes.iter().filter(|write| {
                 write.dst_binding == binding.binding && write.dst_array_element == 0
             }).collect();
+            if !admission.retains_descriptor(binding.binding, binding.access.descriptor_type()) {
+                assert!(matches.is_empty(), "an omitted sampled descriptor cannot still be written");
+                continue;
+            }
             assert_eq!(matches.len(), 1, "final descriptor must not be missing or overwritten");
             let write = matches[0];
             assert_eq!(write.descriptor_type, binding.access.descriptor_type());

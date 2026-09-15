@@ -47,6 +47,7 @@ pub enum DrawPreparationDecline {
         width: u32,
         height: u32,
     },
+    NativeLoadSeedUnavailable { texture_ref: u32, format: u16 },
     /// A live bind names a slot past its class's argument table, so no encoder
     /// of this backend has anywhere to put it. See
     /// [`crate::runtime::draw::first_bind_past_table`] for why the whole draw is
@@ -227,6 +228,7 @@ impl Decline for DrawPreparationDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::PipelineMissing { .. } => "draw_prepare_pipeline_missing",
+            Self::NativeLoadSeedUnavailable { .. } => "draw_prepare_native_load_seed_unavailable",
             Self::VertexMtlbMissing { .. } => "draw_prepare_vertex_mtlb_missing",
             Self::FragmentMtlbMissing { .. } => "draw_prepare_fragment_mtlb_missing",
             Self::VertexAirExtract { reason, .. } | Self::FragmentAirExtract { reason, .. } => {
@@ -350,6 +352,9 @@ impl Decline for DrawPreparationDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
+            Self::NativeLoadSeedUnavailable { texture_ref, format } => vec![
+                ("texture_ref", texture_ref.to_string()), ("format", format!("{format:#x}")),
+            ],
             Self::PipelineMissing {
                 task_id,
                 pipeline_ref,

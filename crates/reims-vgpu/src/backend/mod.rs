@@ -885,6 +885,19 @@ pub(crate) trait Backend: Copy {
         false
     }
 
+    fn gva_color_load_seed<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        span: GvaSpan,
+        _guest_mip_level: u32,
+    ) -> Option<crate::runtime::draw::ColorLoadSeed> {
+        crate::runtime::draw::seed_color_load(
+            state, host, task_id, span.texture_ref, span.gva, span.width, span.height,
+        ).map(crate::runtime::draw::ColorLoadSeed::Rgba8)
+    }
+
     /// Colour 0 of a chain this device is abandoning, read back from the rail.
     ///
     /// The chain broke, so no span carries the key its last good record
@@ -1738,6 +1751,22 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.gva_load_seed_elidable(state, host, task_id, span),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.gva_load_seed_elidable(state, host, task_id, span),
+        }
+    }
+
+    fn gva_color_load_seed<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        span: GvaSpan,
+        guest_mip_level: u32,
+    ) -> Option<crate::runtime::draw::ColorLoadSeed> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.gva_color_load_seed(state, host, task_id, span, guest_mip_level),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.gva_color_load_seed(state, host, task_id, span, guest_mip_level),
         }
     }
 

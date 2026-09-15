@@ -39,7 +39,7 @@ use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
 
 /// One host allocation living on the GPU as a bindable buffer, with no copy
 /// between it and the guest's own view of those bytes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ImportedHostRam {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
@@ -54,6 +54,9 @@ pub(crate) struct ImportedHostRam {
     /// Constructed HostOps alias backing this import. RAMBlock imports have no
     /// release; packed aliases are returned only after Vulkan destruction.
     pub alias: Option<(usize, usize)>,
+    /// The native allocation retains the physical lease, not its metadata.
+    /// Metadata retirement can therefore revoke this cache without a cycle.
+    pub owned: Option<std::sync::Arc<crate::runtime::guest_ram::OwnedHostAllocation>>,
 }
 
 impl ImportedHostRam {
@@ -73,6 +76,7 @@ impl ImportedHostRam {
         if let Some(alias) = self.alias {
             super::release_host_alias(alias);
         }
+        drop(self.owned);
     }
 }
 
@@ -218,7 +222,7 @@ pub(crate) struct BoundGuestRam {
 }
 
 /// Every bounded host allocation this device has imported, keyed by identity.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LiveImport {
     allocation: ImportedHostRam,
     child_images: usize,
@@ -367,6 +371,7 @@ impl HostRamImports {
         import_id: crate::runtime::guest_ram::ImportId,
     ) -> ParentRetire {
         let key = import_id.get();
+        self.declined.remove(&key);
         let Some(entry) = self.live.get_mut(&key) else {
             return ParentRetire::NotImported;
         };
@@ -393,7 +398,7 @@ impl HostRamImports {
             return Err(HostRamDecline::Retired { import_id: key });
         }
         if let Some(live) = self.live.get(&key) {
-            return Ok((live.allocation, false));
+            return Ok((live.allocation.clone(), false));
         }
         if let Some(decline) = self.declined.get(&key) {
             return Err(*decline);
@@ -408,7 +413,7 @@ impl HostRamImports {
         self.live.insert(
             key,
             LiveImport {
-                allocation: made,
+                allocation: made.clone(),
                 child_images: 0,
                 retired: false,
                 retirement_fences_cleared: false,
@@ -577,10 +582,11 @@ unsafe fn import_ramblock(
                 memory,
                 memory_type_index,
                 size,
-                alias: import.gpa_base().is_none().then_some((
+                alias: (import.gpa_base().is_none() && import.owned_host_allocation().is_none()).then_some((
                     host_base,
                     usize::try_from(size).expect("host allocation size fits this process"),
                 )),
+                owned: import.owned_host_allocation(),
             }),
             Err(result) => {
                 // Freeing the memory is what ends the GPU's access to the
@@ -832,6 +838,7 @@ mod tests {
             memory_type_index: 0,
             size: 0x4000,
             alias: Some((0x1000, 0x4000)),
+            owned: None,
         };
         let mut imports = HostRamImports::default();
         imports.live.insert(
@@ -885,6 +892,7 @@ mod tests {
                     memory_type_index: 0,
                     size: 0x4000,
                     alias: Some((0x5000, 0x4000)),
+                    owned: None,
                 },
                 child_images: 0,
                 retired: false,
@@ -1029,5 +1037,16 @@ mod tests {
         let imports = HostRamImports::default();
         assert_eq!(imports.counts(), (0, 0));
         assert_eq!(imports.imported_bytes(), 0);
+    }
+
+    #[test]
+    fn retiring_an_unadmitted_import_forgets_its_cached_driver_refusal() {
+        let import = GuestRamImport::new_host_allocation(0x1000, 0x4000, 0x1000).unwrap();
+        let mut imports = HostRamImports::default();
+        imports.declined.insert(import.id().get(), HostRamDecline::TooSmall {
+            required: 0x8000, available: 0x4000,
+        });
+        assert!(matches!(imports.retire(import.id()), ParentRetire::NotImported));
+        assert!(imports.declined.is_empty());
     }
 }

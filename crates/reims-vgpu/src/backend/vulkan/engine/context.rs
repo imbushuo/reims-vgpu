@@ -22,6 +22,8 @@ use crate::backend::vulkan::caps::memory_topology::{
 use crate::backend::vulkan::caps::{DriverQuirk, HostGpuCaps};
 use crate::protocol::pixel_format::TexelLayout;
 
+pub(crate) mod native_cache;
+
 /// Max device recreates **that produce no guest work between them**.
 ///
 /// The bound is on a recreate *storm* — lost, rebuilt, lost again before
@@ -128,13 +130,18 @@ const _: () = assert!(PIPELINE_CACHE_MAX_WARM_BYTES >= 2 * PIPELINE_CACHE_WORKIN
 /// On-disk pipeline-cache blob location for a device, keyed by its
 /// pipelineCacheUUID (hex) so blobs from other GPUs/driver versions land in
 /// distinct files and never collide.
-fn pipeline_cache_disk_path(uuid: &[u8; 16]) -> std::path::PathBuf {
+fn pipeline_cache_disk_path(props: &vk::PhysicalDeviceProperties) -> std::path::PathBuf {
     use std::fmt::Write as _;
     let mut hex = String::with_capacity(32);
-    for b in uuid {
+    for b in &props.pipeline_cache_uuid {
         let _ = write!(hex, "{b:02x}");
     }
-    std::env::temp_dir().join(format!("reims-vgpu-vk-pipeline-cache-{hex}.bin"))
+    std::env::temp_dir()
+        .join(format!(
+            "reims-vgpu-vk-pipeline-v2-{:08x}-{:08x}-{hex}",
+            props.vendor_id, props.device_id,
+        ))
+        .join("shared.bin")
 }
 
 /// Outcome of one atomic pipeline-cache blob save.
@@ -271,6 +278,9 @@ fn write_cache_atomic(
     data: &[u8],
     persisted_len: &AtomicUsize,
 ) -> Result<CacheSaveOutcome, PipelineCacheDecline> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| PipelineCacheDecline::write(&error))?;
+    }
     std::fs::write(tmp, data).map_err(|error| PipelineCacheDecline::write(&error))?;
     // Claim newest-wins before the rename: if a larger snapshot already landed,
     // drop this one rather than regress the on-disk cache to a stale subset.
@@ -327,14 +337,12 @@ fn discard_cache_blob(
 /// than belt-and-braces. There is one writer now, so there is one tmp file and
 /// the saves are totally ordered.
 ///
-/// The mailbox holds **one** job, and a new job replaces whatever is waiting.
-/// That is not a dropped save: a `VkPipelineCache` only grows, so the newer blob
-/// is a superset of the one it displaces, and a discard is by construction the
-/// newest decision about what the file should be. What it buys is the bound —
-/// a queue would let a compile storm grow the backlog without limit while the
-/// disk is the slow part.
+/// The mailbox coalesces only the same destination. Independent native pipeline
+/// entries must not displace one another, and pending bytes and job count bound
+/// a compile storm while the filesystem is slow.
 mod persist {
     use super::{discard_cache_blob, write_cache_atomic, CacheSaveOutcome};
+    use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Condvar, Mutex, OnceLock};
@@ -342,13 +350,76 @@ mod persist {
     /// What the owner has been asked to make true of the on-disk blob.
     pub(super) enum Job {
         /// Make the file be these bytes.
-        Write { path: PathBuf, data: Vec<u8> },
+        Write {
+            path: PathBuf,
+            data: Vec<u8>,
+        },
         /// Make the file not exist, and let the next boot start cold.
-        Discard { path: PathBuf },
+        Discard {
+            path: PathBuf,
+        },
+        Native(super::native_cache::Save),
+    }
+
+    impl Job {
+        fn path(&self) -> &std::path::Path {
+            match self {
+                Self::Write { path, .. } | Self::Discard { path } => path,
+                Self::Native(save) => save.path(),
+            }
+        }
+
+        fn bytes(&self) -> usize {
+            match self {
+                Self::Write { data, .. } => data.len(),
+                Self::Discard { .. } => 0,
+                Self::Native(save) => save.bytes(),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    pub(super) struct Pending {
+        jobs: VecDeque<Job>,
+        bytes: usize,
+    }
+
+    impl Pending {
+        const MAX_JOBS: usize = 32;
+        const MAX_BYTES: usize = 2 * super::native_cache::MAX_ENTRY_BYTES;
+
+        pub(super) fn push(&mut self, job: Job) -> bool {
+            let existing = self
+                .jobs
+                .iter()
+                .position(|queued| queued.path() == job.path());
+            if matches!(&job, Job::Native(save) if save.is_touch()) && existing.is_some() {
+                return true;
+            }
+            let previous = existing.map_or(0, |index| self.jobs[index].bytes());
+            let bytes = self.bytes - previous + job.bytes();
+            if bytes > Self::MAX_BYTES || (existing.is_none() && self.jobs.len() == Self::MAX_JOBS)
+            {
+                return false;
+            }
+            if let Some(index) = existing {
+                self.jobs[index] = job;
+            } else {
+                self.jobs.push_back(job);
+            }
+            self.bytes = bytes;
+            true
+        }
+
+        pub(super) fn pop(&mut self) -> Option<Job> {
+            let job = self.jobs.pop_front()?;
+            self.bytes -= job.bytes();
+            Some(job)
+        }
     }
 
     struct Mailbox {
-        pending: Mutex<Option<Job>>,
+        pending: Mutex<Pending>,
         arrived: Condvar,
     }
 
@@ -359,7 +430,7 @@ mod persist {
             // only thread this subsystem ever creates.
             std::thread::spawn(persist_forever);
             Mailbox {
-                pending: Mutex::new(None),
+                pending: Mutex::new(Pending::default()),
                 arrived: Condvar::new(),
             }
         })
@@ -373,9 +444,13 @@ mod persist {
             .pending
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        *pending = Some(job);
+        let accepted = pending.push(job);
         drop(pending);
-        mailbox.arrived.notify_one();
+        if accepted {
+            mailbox.arrived.notify_one();
+        } else {
+            super::native_cache::report_queue_full(Pending::MAX_JOBS, Pending::MAX_BYTES);
+        }
     }
 
     fn persist_forever() {
@@ -385,7 +460,7 @@ mod persist {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         loop {
-            match pending.take() {
+            match pending.pop() {
                 Some(job) => {
                     // The filesystem work runs with the mailbox unlocked, so a
                     // save submitted during a slow write still lands in it.
@@ -437,6 +512,7 @@ mod persist {
                     crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0);
                 }
             }
+            Job::Native(save) => save.run(),
         }
     }
 }
@@ -721,6 +797,9 @@ pub(crate) struct DeviceContext {
     /// native sampled rails (see [`DeviceFeatures::sampled_linear_filter`]).
     pub sampled_linear_filter: [bool; TexelLayout::ALL.len()],
     pub pipeline_cache: vk::PipelineCache,
+    pub pipeline_diagnostics: bool,
+    pub pipeline_creation_feedback: bool,
+    native_caches: native_cache::ResidentCaches,
     pub vertex_divisor: VertexDivisorCapabilities,
     /// Offset alignment for every storage-buffer descriptor this engine writes,
     /// taken directly from `minStorageBufferOffsetAlignment`.
@@ -1082,6 +1161,11 @@ impl DeviceContext {
                 .iter()
                 .any(|extension| CStr::from_ptr(extension.extension_name.as_ptr()) == name)
         };
+        let pipeline_diagnostics = super::caches::diagnostics::requested();
+        let pipeline_creation_feedback = super::caches::diagnostics::feedback_enabled(
+            pipeline_diagnostics,
+            has_device_extension(ash::ext::pipeline_creation_feedback::NAME),
+        );
         // Every device feature and format capability, resolved in one place.
         // Enumerating extensions first is what lets `mirror_clamp_to_edge`
         // choose between the 1.2 core feature and the KHR extension there
@@ -1192,6 +1276,9 @@ impl DeviceContext {
         };
         let vertex_formats = crate::backend::vulkan::translate::support::probe(&instance, pd);
         let mut enabled_device_extensions = Vec::new();
+        if pipeline_creation_feedback {
+            enabled_device_extensions.push(ash::ext::pipeline_creation_feedback::NAME.as_ptr());
+        }
         if portability_subset {
             enabled_device_extensions.push(vk::KHR_PORTABILITY_SUBSET_NAME.as_ptr());
         }
@@ -1420,6 +1507,11 @@ impl DeviceContext {
         // and a rail never asked for look identical in a log that only reports
         // what was enabled.
         crate::observe::off(features.report_line());
+        if pipeline_diagnostics {
+            crate::observe::off(format!(
+                "vk_pipeline_diagnostics enabled=true feedback={pipeline_creation_feedback} api=1.2"
+            ));
+        }
         // What the operator set. A boot whose rails were narrowed from outside
         // the process reads as a slow device unless the narrowing is on the
         // same page as the capabilities.
@@ -1431,7 +1523,7 @@ impl DeviceContext {
         // incompatible cache, and the header is validated before use
         // (passing a blob not produced by vkGetPipelineCacheData for this
         // device is a Vulkan valid-usage violation, not a soft fallback).
-        let pipeline_cache_path = pipeline_cache_disk_path(&props.pipeline_cache_uuid);
+        let pipeline_cache_path = pipeline_cache_disk_path(&props);
         let initial_blob = match read_pipeline_cache_blob(&pipeline_cache_path, &props) {
             Ok(blob) => blob,
             Err(decline) => {
@@ -1485,6 +1577,9 @@ impl DeviceContext {
             spirv_storage_extended_formats: features.storage_image_extended_formats,
             sampled_linear_filter,
             pipeline_cache,
+            pipeline_diagnostics,
+            pipeline_creation_feedback,
+            native_caches: native_cache::ResidentCaches::default(),
             vertex_divisor,
             storage_buffer_offset_align: storage_buffer_offset_alignment(&props.limits),
             max_storage_buffer_range: u64::from(props.limits.max_storage_buffer_range),
@@ -1516,11 +1611,14 @@ impl DeviceContext {
         let Some(path) = self.pipeline_cache_path.clone() else {
             return;
         };
-        let data = match unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache) } {
+        let data = match native_cache::CompileCache::bounded_data(
+            &self.device,
+            self.pipeline_cache,
+            PIPELINE_CACHE_MAX_WARM_BYTES,
+        ) {
             Ok(d) => d,
-            Err(e) => {
-                let decline = VkCall::new(VkOp::ContextPipelineCacheGetData, e);
-                crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0);
+            Err(refusal) => {
+                native_cache::report(&refusal);
                 return;
             }
         };
@@ -1579,6 +1677,7 @@ impl DeviceContext {
         if let Some(probe) = self.draw_spans.take() {
             self.device.destroy_query_pool(probe.pool, None);
         }
+        self.native_caches.clear();
         self.device
             .destroy_pipeline_cache(self.pipeline_cache, None);
         self.device.destroy_device(None);
@@ -2205,14 +2304,13 @@ mod pipeline_cache_blob_tests {
     /// The path is UUID-keyed: distinct devices never share a blob file.
     #[test]
     fn disk_path_keyed_by_uuid() {
-        let a = pipeline_cache_disk_path(&[1u8; 16]);
-        let b = pipeline_cache_disk_path(&[2u8; 16]);
+        let a = pipeline_cache_disk_path(&props(1, 2, [1u8; 16]));
+        let b = pipeline_cache_disk_path(&props(1, 2, [2u8; 16]));
         assert_ne!(a, b);
-        assert!(a
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .contains(&"01".repeat(16)));
+        assert_ne!(a, pipeline_cache_disk_path(&props(3, 2, [1u8; 16])));
+        assert_ne!(a, pipeline_cache_disk_path(&props(1, 3, [1u8; 16])));
+        assert!(a.to_string_lossy().contains(&"01".repeat(16)));
+        assert_eq!(a.file_name().unwrap(), "shared.bin");
     }
 
     /// A single save lands the blob at `path` and consumes its tmp file.

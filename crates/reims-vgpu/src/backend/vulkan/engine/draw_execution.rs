@@ -31,6 +31,9 @@ pub enum DrawExecutionDecline {
     LoadTargetContentNotReady {
         identity: TargetIdentity,
     },
+    BatchAttachmentNotRetainable {
+        identity: TargetIdentity,
+    },
     /// An MRT **secondary** colour attachment asked to `LOAD` content this
     /// device has not produced.
     ///
@@ -171,6 +174,7 @@ impl Decline for DrawExecutionDecline {
                 "vk_draw_exec_constant_vertex_allocation_overflow"
             }
             Self::LoadTargetContentNotReady { .. } => "vk_draw_exec_load_target_content_not_ready",
+            Self::BatchAttachmentNotRetainable { .. } => "vk_draw_exec_batch_attachment_not_retainable",
             Self::LoadSecondaryContentNotReady { .. } => {
                 "vk_draw_exec_load_secondary_content_not_ready"
             }
@@ -210,6 +214,7 @@ impl Decline for DrawExecutionDecline {
                 ("bytes_len", bytes_len.to_string()),
             ],
             Self::LoadTargetContentNotReady { identity }
+            | Self::BatchAttachmentNotRetainable { identity }
             | Self::LoadSecondaryContentNotReady { identity }
             | Self::SeedResidentMissing { identity }
             | Self::SeedResidentNotReady { identity } => identity_fields(identity),

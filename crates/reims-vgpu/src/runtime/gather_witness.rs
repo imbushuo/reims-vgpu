@@ -865,7 +865,7 @@ pub struct GatherWindow<'a> {
 enum ReadScope {
     Existing,
     Command(u64),
-    Current { command: u64, available: bool },
+    Current { command: Option<u64>, available: bool },
     Unavailable,
 }
 
@@ -899,7 +899,7 @@ impl ReadScope {
                 // within the pass. Two delayed observations retain only the
                 // original command-local reuse contract.
                 (available && was_available)
-                    || (command == before && !available && !was_available)
+                    || (command.is_some() && command == before && !available && !was_available)
             }
             _ => self != Self::Unavailable && self == previous,
         }
@@ -1187,7 +1187,14 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     key: GatherKey,
     window: GatherWindow<'_>,
 ) -> GatherOutcome {
-    note_gather_with_scope(state, host, rail, key, window, ReadScope::Existing)
+    // No issuing command scope is available here. Delayed observations must
+    // recapture, while an actual current observer can license a retained copy.
+    let scope = if host.guest_write_gen_is_current() {
+        ReadScope::Existing
+    } else {
+        ReadScope::Current { command: None, available: false }
+    };
+    note_gather_with_scope(state, host, rail, key, window, scope)
 }
 
 /// Delayed observations confine a CPU copy's claim to its decoded render pass.
@@ -1210,7 +1217,7 @@ pub(crate) fn note_scoped_gather<M: crate::runtime::host::HostOps>(
             {
                 ReadScope::Command(id)
             } else {
-                ReadScope::Current { command: id, available: false }
+                ReadScope::Current { command: Some(id), available: false }
             }
         }
     };
@@ -1665,7 +1672,8 @@ fn observe_with<M: crate::runtime::host::HostOps, E>(
     };
     entry.stated_gen = stated_now;
 
-    let needs_fold = pending.settled()
+    let auditable = !matches!(read_scope, ReadScope::Current { command: None, available: false });
+    let needs_fold = auditable && pending.settled()
         && if entry.audit_armed {
             vouched || entry.rebaselines < AUDIT_REBASELINE_LIMIT
         } else {
@@ -1683,7 +1691,15 @@ fn observe_with<M: crate::runtime::host::HostOps, E>(
     } else {
         None
     };
-    let audit = if !pending.settled() {
+    let audit = if !auditable {
+        // No current proof and no command scope means no copy can be reused.
+        // Auditing those compulsory gathers would validate no elision.
+        entry.audit_armed = false;
+        entry.fold_valid = false;
+        entry.rebaselines = 0;
+        entry.binds_since_fold = 0;
+        ContentAudit::Skipped
+    } else if !pending.settled() {
         // A copy this device submitted is in flight over these pages and the
         // fold is a CPU read of them, so whatever it reads now is neither the
         // before nor reliably the after. Comparing across that reports the
@@ -1793,6 +1809,45 @@ fn observe_with<M: crate::runtime::host::HostOps, E>(
 mod tests {
     use super::*;
     use crate::runtime::guest_ram::GuestRun;
+
+    #[test]
+    fn unscoped_gpu_gathers_require_current_proof_and_do_not_audit_compulsory_copies() {
+        use crate::model::{DeviceId, DeviceState, PAGE_SHIFT_X86};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.gather_witness = witness_auditing(AuditDensity::EveryBind);
+        let mut host = crate::runtime::host::FakeHost::new();
+        host.guest_write_deferred = true;
+        let mut bytes = vec![0x51; PAGE];
+        let observe = |state: &mut DeviceState, host: &mut _, bytes: &[u8]| {
+            note_gather(state, host, GatherRail::MapperRefTexture, KEY,
+                one_page(&GPAS, &[run_over(bytes)]))
+        };
+        let mut previous = observe(&mut state, &mut host, &bytes);
+        for n in 0..128 {
+            bytes[0] = n;
+            let next = observe(&mut state, &mut host, &bytes);
+            assert!(!next.vouch.is_vouched());
+            assert_ne!(previous.identity, next.identity);
+            assert_eq!(next.audit_bytes, 0, "no reuse claim exists to audit");
+            previous = next;
+        }
+        host.guest_write_current_supported = true;
+        let current = observe(&mut state, &mut host, &bytes);
+        assert!(!current.vouch.is_vouched(), "a delayed capture cannot upgrade in place");
+        let reusable = observe(&mut state, &mut host, &bytes);
+        assert!(reusable.vouch.is_vouched());
+        assert_eq!(reusable.identity, current.identity);
+        host.guest_write_current_unavailable = true;
+        bytes[0] ^= 0xff;
+        let dirty = observe(&mut state, &mut host, &bytes);
+        assert!(!dirty.vouch.is_vouched());
+        assert_ne!(dirty.identity, reusable.identity);
+        assert_eq!(dirty.audit_bytes, 0);
+        host.guest_write_current_unavailable = false;
+        let recaptured = observe(&mut state, &mut host, &bytes);
+        assert!(!recaptured.vouch.is_vouched());
+        assert!(observe(&mut state, &mut host, &bytes).vouch.is_vouched());
+    }
 
     #[test]
     fn scoped_gather_expires_claims_without_fake_writes_or_disabling_the_audit() {

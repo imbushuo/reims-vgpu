@@ -15,6 +15,10 @@ use std::collections::BTreeMap;
 
 #[cfg(test)]
 mod tests;
+mod interlock_diagnostic;
+mod backing_coverage;
+mod isolation;
+pub use isolation::{InterlockIsolation, InterlockIsolationRefusal};
 
 pub(super) fn used_bindings(words: &[u32]) -> std::sync::Arc<[u32]> {
     spirv_bind::declared_binding_numbers(words).into_iter()
@@ -25,6 +29,7 @@ pub(super) fn used_bindings(words: &[u32]) -> std::sync::Arc<[u32]> {
 struct StorageTexture {
     staged: StagedTexture<VulkanStage>,
     bindings: Vec<GraphicsTextureBinding>,
+    owner: Option<std::sync::Arc<crate::model::TaskResource>>,
 }
 
 #[derive(Default)]
@@ -51,41 +56,21 @@ fn ordinary_single_level(
         })
 }
 
-// Reflected imageblock ABIs are refused before staging. Metadata-free private
-// slices can still be admitted: those producers must carry their own preserved
-// conversion contract, not inherit ordinary AIR texture-write policy.
-fn specialize_write_rounding(
-    resources: &[GraphicsStorageTexture],
-    words: &mut std::sync::Arc<Vec<u32>>,
-    stage: ash::vk::ShaderStageFlags,
-) -> Result<(), Refused> {
-    use metal2vulkan::texture_write_rounding::{
-        specialize_texture_write_rounding, TextureWriteFormat, TextureWriteTarget,
-    };
-    if !resources.iter().any(|texture| texture.bindings.iter().any(|binding| {
-        binding.stage == stage && binding.access == GraphicsTextureAccess::Storage
-    })) {
-        return Ok(());
-    }
-    // BGRA has no SPIR-V image-format token. Its runtime descriptor supplies the
-    // normalized target fact; every other admitted format is now in TypeImage.
-    let targets: Vec<_> = resources.iter()
-        .filter(|texture| texture.format == crate::backend::vulkan::engine::StorageImageFormat::Bgra8Unorm)
-        .flat_map(|texture| &texture.bindings)
-        .filter(|binding| binding.stage == stage && binding.access == GraphicsTextureAccess::Storage)
-        .map(|binding| TextureWriteTarget {
-            descriptor_set: 0, binding: binding.binding, format: TextureWriteFormat::Normalized,
-        }).collect();
-    *words = std::sync::Arc::new(specialize_texture_write_rounding(
-        words, crate::runtime::m2v_cache::NATIVE_TEXTURE_WRITE_ROUNDING, &targets,
-    ).map_err(|detail| Refused::WriteRounding { stage, detail })?);
-    Ok(())
-}
-
 impl StorageTextures {
     pub(super) fn is_empty(&self) -> bool {
         self.textures.is_empty()
     }
+
+    pub(super) fn diagnose_interlock_backing<M: HostMemory>(
+        &self,
+        state: &DeviceState,
+        host: &M,
+        req: &DrawEncodeRequest,
+        raster_samples: u32,
+    ) {
+        interlock_diagnostic::report(self, state, host, req, raster_samples);
+    }
+
     pub(super) fn stage<M: HostMemory + HostOps>(
         state: &mut DeviceState,
         host: &mut M,
@@ -155,7 +140,13 @@ impl StorageTextures {
         if staged.storage_selector.is_none() {
             return Err(Refused::Format { texture_ref }.into());
         }
-        self.textures.insert(texture_ref, StorageTexture { staged, bindings: Vec::new() });
+        let owner = state.object_name(req.task_id, texture_ref)
+            .and_then(|name| state.task_resources.get(req.task_id, name))
+            .filter(|current| req.vertex_textures.iter().chain(req.fragment_textures.iter())
+                .filter(|binding| binding.texture_ref == texture_ref)
+                .all(|binding| binding.resource.as_ref().is_some_and(|held|
+                    std::sync::Arc::ptr_eq(current, held))));
+        self.textures.insert(texture_ref, StorageTexture { staged, bindings: Vec::new(), owner });
         Ok(())
     }
 
@@ -195,8 +186,13 @@ impl StorageTextures {
         fragment: &metal2vulkan::reflect::ShaderReflection,
         vertex_words: &mut std::sync::Arc<Vec<u32>>,
         fragment_words: &mut std::sync::Arc<Vec<u32>>,
+        vertex_variant: &crate::runtime::m2v_cache::ShaderVariant,
+        fragment_variant: &crate::runtime::m2v_cache::ShaderVariant,
     ) -> Result<Vec<GraphicsStorageTexture>, DrawError> {
+        use crate::runtime::m2v_cache::{GraphicsStorageVariantKey, GraphicsStorageVariantError};
         let mut resources = Vec::with_capacity(self.textures.len());
+        let mut vertex_key = GraphicsStorageVariantKey::default();
+        let mut fragment_key = GraphicsStorageVariantKey::default();
         for (&texture_ref, texture) in &mut self.textures {
             let selector = texture.staged.storage_selector.ok_or(Refused::Format { texture_ref })?;
             let format = translate::pixel::storage_image_from_selector(selector);
@@ -220,11 +216,11 @@ impl StorageTextures {
                 {
                     return Err(Refused::Format { texture_ref }.into());
                 }
-                let words = std::sync::Arc::make_mut(if is_fragment {
-                    &mut *fragment_words
-                } else { &mut *vertex_words });
-                spirv_bind::specialize_image_formats(words, &[(binding.binding, specialized)])
-                    .map_err(|_| Refused::Specialization)?;
+                let key = if is_fragment { &mut fragment_key } else { &mut vertex_key };
+                key.formats.push((binding.binding, specialized));
+                if format == crate::backend::vulkan::engine::StorageImageFormat::Bgra8Unorm {
+                    key.normalized.push(binding.binding);
+                }
             }
             resources.push(GraphicsStorageTexture {
                 format, width: texture.staged.width, height: texture.staged.height,
@@ -232,8 +228,16 @@ impl StorageTextures {
                 bindings: texture.bindings.clone(),
             });
         }
-        specialize_write_rounding(&resources, vertex_words, ash::vk::ShaderStageFlags::VERTEX)?;
-        specialize_write_rounding(&resources, fragment_words, ash::vk::ShaderStageFlags::FRAGMENT)?;
+        for (variant, words, key, stage) in [
+            (vertex_variant, vertex_words, vertex_key, ash::vk::ShaderStageFlags::VERTEX),
+            (fragment_variant, fragment_words, fragment_key, ash::vk::ShaderStageFlags::FRAGMENT),
+        ] {
+            if key.formats.is_empty() { continue; }
+            *words = variant.storage_words(words, key).map_err(|error| match error {
+                GraphicsStorageVariantError::Format => Refused::Specialization,
+                GraphicsStorageVariantError::Rounding(detail) => Refused::WriteRounding { stage, detail },
+            })?;
+        }
         Ok(resources)
     }
 

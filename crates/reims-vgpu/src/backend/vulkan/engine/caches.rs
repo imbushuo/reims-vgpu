@@ -17,6 +17,9 @@ use super::types::{
 };
 use super::vk_call::{VkCall, VkOp};
 
+pub(super) mod diagnostics;
+pub(super) mod storage_descriptors;
+
 pub(crate) fn vk_sample_count(count: u32) -> vk::SampleCountFlags {
     match count {
         2 => vk::SampleCountFlags::TYPE_2,
@@ -596,7 +599,10 @@ mod memoryless_tests {
         assert_eq!(refs[1].layout, vk::ImageLayout::GENERAL);
         let mut other = key;
         other.color_input = 1;
-        assert_ne!(key.framebuffer_compatibility(), other.framebuffer_compatibility());
+        assert_ne!(
+            key.framebuffer_compatibility(),
+            other.framebuffer_compatibility()
+        );
     }
 }
 
@@ -621,14 +627,19 @@ impl PassKey {
     /// the fetched subset. Holes stay UNUSED so dest_1 cannot read color zero.
     fn color_input_references(self) -> Vec<vk::AttachmentReference> {
         let count = u8::BITS - self.color_input.leading_zeros();
-        (0..count).map(|slot| {
-            if self.color_input & (1 << slot) != 0 {
-                vk::AttachmentReference::default().attachment(slot).layout(self.color_layout(slot as usize))
-            } else {
-                vk::AttachmentReference::default().attachment(vk::ATTACHMENT_UNUSED)
-                    .layout(vk::ImageLayout::UNDEFINED)
-            }
-        }).collect()
+        (0..count)
+            .map(|slot| {
+                if self.color_input & (1 << slot) != 0 {
+                    vk::AttachmentReference::default()
+                        .attachment(slot)
+                        .layout(self.color_layout(slot as usize))
+                } else {
+                    vk::AttachmentReference::default()
+                        .attachment(vk::ATTACHMENT_UNUSED)
+                        .layout(vk::ImageLayout::UNDEFINED)
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn color_feedback(self, index: usize) -> bool {
@@ -698,7 +709,8 @@ impl PassKey {
         if self.color_feedback(index) {
             color_feedback_layout()
         } else if (index < 8 && self.color_input & (1 << index) != 0)
-            || (index == 0 && self.host_accessible_color0) {
+            || (index == 0 && self.host_accessible_color0)
+        {
             vk::ImageLayout::GENERAL
         } else {
             // The same layout the pass exits at, so an ordinary pass performs no
@@ -1013,6 +1025,56 @@ pub(crate) struct ComputePipelineKey {
     pub local_size: Option<[u32; 3]>,
 }
 
+fn graphics_native_cache_key(fragment: &[u32]) -> super::context::native_cache::Key {
+    // This is a driver hint, not a PSO lookup. Sharing one exact fragment
+    // program preserves its compiled work across vertex/layout/blend variants.
+    super::context::native_cache::Key::new(0, &"fragment", &[fragment])
+}
+
+fn compute_native_cache_key(
+    key: &ComputePipelineKey,
+    shader: &[u32],
+) -> super::context::native_cache::Key {
+    super::context::native_cache::Key::new(1, &key.entry, &[shader])
+}
+
+#[cfg(test)]
+mod native_program_key_tests {
+    use super::*;
+
+    #[test]
+    fn native_program_hints_share_variants_without_aliasing_runtime_pso_keys() {
+        let shader = [1, 2, 3];
+        let first = ComputePipelineKey {
+            spirv: Digest128::of_u32_words(&shader),
+            entry: "main".into(),
+            layout: LayoutId(0),
+            local_size: Some([1, 1, 1]),
+        };
+        let mut second = first.clone();
+        second.layout = LayoutId(19);
+        second.local_size = Some([8, 1, 1]);
+        assert_ne!(first, second);
+        assert_eq!(
+            compute_native_cache_key(&first, &shader),
+            compute_native_cache_key(&second, &shader),
+        );
+        second.entry = "other".into();
+        assert_ne!(
+            compute_native_cache_key(&first, &shader),
+            compute_native_cache_key(&second, &shader),
+        );
+        assert_ne!(
+            compute_native_cache_key(&first, &shader),
+            compute_native_cache_key(&first, &[1, 2, 4]),
+        );
+        assert_ne!(
+            graphics_native_cache_key(&shader),
+            compute_native_cache_key(&first, &shader),
+        );
+    }
+}
+
 /// A shader module and the words the driver compiles from it.
 ///
 /// They travel together because a pipeline create needs the handle and the
@@ -1022,6 +1084,11 @@ pub(crate) struct ComputePipelineKey {
 pub(crate) struct ShaderModuleSource<'a> {
     pub module: vk::ShaderModule,
     pub spirv: &'a [u32],
+}
+
+pub(crate) struct CachedShaderModule {
+    pub module: vk::ShaderModule,
+    pub declarations: storage_descriptors::DeclarationProof,
 }
 
 /// How many distinct never-creatable keys a cache remembers the refusal for.
@@ -1110,7 +1177,7 @@ impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
 
     fn get(&mut self, k: &K) -> Option<V>
     where
-        V: Copy,
+        V: Clone,
     {
         self.get_routed(k).map(|(value, _)| value)
     }
@@ -1118,15 +1185,15 @@ impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
     /// Positive lookup and whether the one-entry front index answered it.
     fn get_routed(&mut self, k: &K) -> Option<(V, bool)>
     where
-        V: Copy,
+        V: Clone,
     {
         if let Some((front_key, value)) = &self.front {
             if front_key == k {
-                return Some((*value, true));
+                return Some((value.clone(), true));
             }
         }
-        let value = *self.map.get(k)?;
-        self.front = Some((k.clone(), value));
+        let value = self.map.get(k)?.clone();
+        self.front = Some((k.clone(), value.clone()));
         Some((value, false))
     }
 
@@ -1146,10 +1213,10 @@ impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
     /// is ever displaced for capacity.
     fn insert(&mut self, k: K, v: V) -> Option<V>
     where
-        V: Copy,
+        V: Clone,
     {
         self.negative.remove(&k);
-        let old = self.map.insert(k.clone(), v);
+        let old = self.map.insert(k.clone(), v.clone());
         self.front = Some((k, v));
         old
     }
@@ -1264,7 +1331,14 @@ const SHADER_DIGEST_ENTRIES: usize = 4096;
 /// through to the full path, which recomputes and re-inserts.
 #[derive(Default)]
 struct ShaderDigestIndex {
-    map: std::collections::HashMap<usize, (std::sync::Arc<Vec<u32>>, Digest128)>,
+    map: std::collections::HashMap<usize, ShaderDigestEntry>,
+}
+
+struct ShaderDigestEntry {
+    _source: std::sync::Arc<Vec<u32>>,
+    native: Option<Digest128>,
+    serial: Option<Result<std::sync::Arc<super::serial_interlock::Program>, super::serial_interlock::Refusal>>,
+    serial_vertex: Option<std::sync::Arc<super::serial_interlock::VertexDeclarations>>,
 }
 
 impl ShaderDigestIndex {
@@ -1273,7 +1347,7 @@ impl ShaderDigestIndex {
     fn get(&self, words: &std::sync::Arc<Vec<u32>>) -> Option<Digest128> {
         self.map
             .get(&(std::sync::Arc::as_ptr(words) as usize))
-            .map(|(_, digest)| *digest)
+            .and_then(|entry| entry.native)
     }
 
     /// Record what a full walk of this allocation produced.
@@ -1284,7 +1358,12 @@ impl ShaderDigestIndex {
     /// equally cheap to rebuild, and a boot that reaches the bound is reporting
     /// something rather than asking for a policy.
     fn insert(&mut self, words: &std::sync::Arc<Vec<u32>>, digest: Digest128) {
-        if self.map.len() >= SHADER_DIGEST_ENTRIES {
+        self.entry(words).native = Some(digest);
+    }
+
+    fn entry(&mut self, words: &std::sync::Arc<Vec<u32>>) -> &mut ShaderDigestEntry {
+        let address = std::sync::Arc::as_ptr(words) as usize;
+        if !self.map.contains_key(&address) && self.map.len() >= SHADER_DIGEST_ENTRIES {
             crate::observe::off(format!(
                 "shader_digest_reset entries={} words={}",
                 self.map.len(),
@@ -1292,10 +1371,25 @@ impl ShaderDigestIndex {
             ));
             self.map.clear();
         }
-        self.map.insert(
-            std::sync::Arc::as_ptr(words) as usize,
-            (std::sync::Arc::clone(words), digest),
-        );
+        self.map.entry(address).or_insert_with(|| ShaderDigestEntry {
+            _source: words.clone(), native: None, serial: None, serial_vertex: None,
+        })
+    }
+
+    fn serial_program(
+        &mut self,
+        words: &std::sync::Arc<Vec<u32>>,
+    ) -> Result<std::sync::Arc<super::serial_interlock::Program>, super::serial_interlock::Refusal> {
+        self.entry(words).serial.get_or_insert_with(||
+            super::serial_interlock::Program::analyze(words)).clone()
+    }
+
+    fn serial_vertex_declarations(
+        &mut self,
+        words: &std::sync::Arc<Vec<u32>>,
+    ) -> std::sync::Arc<super::serial_interlock::VertexDeclarations> {
+        self.entry(words).serial_vertex.get_or_insert_with(||
+            super::serial_interlock::VertexDeclarations::analyze(words)).clone()
     }
 
     fn clear(&mut self) {
@@ -1304,7 +1398,7 @@ impl ShaderDigestIndex {
 }
 
 pub(crate) struct ObjectCaches {
-    shaders: ObjectCache<Digest128, vk::ShaderModule>,
+    shaders: ObjectCache<Digest128, std::sync::Arc<CachedShaderModule>>,
     layouts: LayoutTable,
     attr_sets: SliceIntern<AttrKey>,
     passes: ObjectCache<PassKey, vk::RenderPass>,
@@ -1320,6 +1414,7 @@ pub(crate) struct ObjectCaches {
     /// to, so a repeat bind of the same module does not walk it three times to
     /// find that out.
     shader_digests: ShaderDigestIndex,
+    diagnostics: Option<diagnostics::State>,
 }
 
 struct ObjectVariantIndex<K, V> {
@@ -1771,10 +1866,12 @@ impl ObjectCaches {
             samplers: ObjectCache::new(),
             compute_pipelines: ObjectCache::new(),
             shader_digests: ShaderDigestIndex::default(),
+            diagnostics: None,
         }
     }
 
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        self.diagnostics = None;
         // This index borrows handles owned by `pipelines`; forget those echoes
         // before destroying the authoritative objects.
         self.pipeline_objects.clear();
@@ -1797,7 +1894,7 @@ impl ObjectCaches {
             device.destroy_render_pass(rp, None);
         }
         for s in self.shaders.take_all() {
-            device.destroy_shader_module(s, None);
+            device.destroy_shader_module(s.module, None);
         }
         for s in self.samplers.take_all() {
             device.destroy_sampler(s, None);
@@ -1827,6 +1924,7 @@ impl ObjectCaches {
     }
 
     pub(crate) fn clear_logical(&mut self) {
+        self.diagnostics = None;
         // Before the modules it indexes, so no window exists where a front-index
         // hit names a digest whose module has already gone.
         self.shader_digests.clear();
@@ -1865,6 +1963,30 @@ impl ObjectCaches {
         DrawError::Unsupported(reason)
     }
 
+    pub(super) fn prepare_serial_interlock(
+        &mut self,
+        ctx: &DeviceContext,
+        req: &super::types::DrawRequest,
+        polygon_mode: vk::PolygonMode,
+    ) -> Result<Option<super::serial_interlock::Plan>, DrawError> {
+        if ctx.features.fragment_shader_pixel_interlock || req.interlock_isolation.is_none() {
+            return Ok(None);
+        }
+        if !ctx.features.fragment_stores_and_atomics {
+            return Err(super::graphics_storage::GraphicsStorageDecline::SerialInterlock(
+                super::serial_interlock::Refusal::State("fragment_storage_feature"),
+            ).into());
+        }
+        super::serial_interlock::Plan::admit(
+            req, ctx.features.extended_dynamic_state, polygon_mode,
+            || Ok((
+                self.shader_digests.serial_program(&req.frag_spirv)?,
+                self.shader_digests.serial_vertex_declarations(&req.vert_spirv),
+            )),
+        ).map(Some).map_err(|reason|
+            super::graphics_storage::GraphicsStorageDecline::SerialInterlock(reason).into())
+    }
+
     /// [`Self::get_or_create_shader`] with the three whole-module walks skipped
     /// for an allocation that has been through it before.
     ///
@@ -1884,7 +2006,7 @@ impl ObjectCaches {
         words: &std::sync::Arc<Vec<u32>>,
         counters: &EngineCounters,
         pools: &mut ResourcePools,
-    ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
+    ) -> Result<(Digest128, std::sync::Arc<CachedShaderModule>), DrawError> {
         if let Some(key) = self.shader_digests.get(words) {
             // Negative before positive, in the order the walking form asks them:
             // a module this device refused is refused again without being
@@ -1913,11 +2035,13 @@ impl ObjectCaches {
         words: &[u32],
         counters: &EngineCounters,
         pools: &mut ResourcePools,
-    ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
+    ) -> Result<(Digest128, std::sync::Arc<CachedShaderModule>), DrawError> {
         if crate::runtime::spirv_bind::requires_pixel_interlock(words)
             && !ctx.features.fragment_shader_pixel_interlock
         {
-            return Err(super::graphics_storage::GraphicsStorageDecline::PixelInterlockUnsupported.into());
+            return Err(
+                super::graphics_storage::GraphicsStorageDecline::PixelInterlockUnsupported.into(),
+            );
         }
         // Declare the storage-image capabilities this module's own contents
         // require, before it is keyed or validated.
@@ -1996,7 +2120,10 @@ impl ObjectCaches {
         if let Err(reason) = admit_shader_input_output(words, &ctx.features) {
             crate::observe::Emit::decline("spirv_capability", &reason)
                 .field("words", words.len())
-                .field("storage_input_output16", ctx.features.storage_input_output16)
+                .field(
+                    "storage_input_output16",
+                    ctx.features.storage_input_output16,
+                )
                 .fail();
             let err = DrawError::Unsupported(reason);
             self.shaders.insert_negative(key, err.clone());
@@ -2055,8 +2182,12 @@ impl ObjectCaches {
             err
         })?;
         counters.note_create(CreateSite::ShaderModule);
-        if let Some(old) = self.shaders.insert(key, module) {
-            pools.dispose(&ctx.device, DeferredHandle::ShaderModule(old));
+        let declarations = storage_descriptors::DeclarationProof::of_final_module(words);
+        counters.shader_descriptor_proofs.fetch_add(1, Ordering::Relaxed);
+        declarations.report_unproven(key);
+        let module = std::sync::Arc::new(CachedShaderModule { module, declarations });
+        if let Some(old) = self.shaders.insert(key, module.clone()) {
+            pools.dispose(&ctx.device, DeferredHandle::ShaderModule(old.module));
         }
         Ok((key, module))
     }
@@ -2478,12 +2609,12 @@ impl ObjectCaches {
         // The post-relocation words `vert_module` was built from. Read only to
         // answer how wide this shader's stage-in reads are, and only on a host
         // that substitutes a vertex format; see the resolution loop below.
-        vert_spirv: &[u32],
+        vert_spirv: &std::sync::Arc<Vec<u32>>,
         frag_module: vk::ShaderModule,
         // Read only by the driver breadcrumb: a graphics compile consumes both
         // stages and nothing outside the driver can say which one it choked on,
         // so both go to disk across the call.
-        frag_spirv: &[u32],
+        frag_spirv: &std::sync::Arc<Vec<u32>>,
         pipeline_layout: vk::PipelineLayout,
         render_pass: vk::RenderPass,
         counters: &EngineCounters,
@@ -2879,7 +3010,9 @@ impl ObjectCaches {
             blend_plans.iter().map(|p| p.native()).collect();
         let mut blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_att);
         if key.pass.0.color_input != 0 && ctx.features.rasterization_order_color_access {
-            blend = blend.flags(vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT);
+            blend = blend.flags(
+                vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT,
+            );
         }
         // Depth-stencil state: attached ONLY when the pass carries a depth
         // attachment (Vulkan requires the pipeline's depth-stencil state to be
@@ -2906,6 +3039,17 @@ impl ObjectCaches {
         if key.pass.has_depth() {
             gpci = gpci.depth_stencil_state(&depth_stencil);
         }
+        let native_cache = super::context::native_cache::CompileCache::new(
+            ctx,
+            graphics_native_cache_key(frag_spirv),
+        );
+        let trace = ctx.pipeline_diagnostics.then(|| {
+            diagnostics::prepare(
+                self, key, vert_spirv, frag_spirv, &attrs, &attribute_formats,
+                render_pass, gpci.flags.as_raw(), blend.flags.as_raw(), &dynamic_states,
+                native_cache.diagnostic(),
+            )
+        });
         // The third call that compiles a module this device assembled, and the
         // only one that compiles two at once. A macOS 15 guest's CoreAnimation
         // uber fragment shader has been observed keeping NVIDIA's compiler in
@@ -2926,9 +3070,31 @@ impl ObjectCaches {
                 return Err(err);
             }
         };
+        let mut pipeline_feedback = vk::PipelineCreationFeedback::default();
+        let mut stage_feedback = [vk::PipelineCreationFeedback::default(); 2];
+        let mut feedback = vk::PipelineCreationFeedbackCreateInfo::default()
+            .pipeline_creation_feedback(&mut pipeline_feedback)
+            .pipeline_stage_creation_feedbacks(&mut stage_feedback);
+        if ctx.pipeline_creation_feedback {
+            gpci = gpci.push_next(&mut feedback);
+        }
+        let trace = trace.map(|trace| {
+            let started = trace.begin();
+            (trace, started)
+        });
         let created = ctx
             .device
-            .create_graphics_pipelines(ctx.pipeline_cache, &[gpci], None);
+            .create_graphics_pipelines(native_cache.handle(), &[gpci], None);
+        if let Some((trace, started)) = trace {
+            let result = created.as_ref().err().map_or(vk::Result::SUCCESS, |(_, result)| *result);
+            let _observation = trace.finish(
+                started, result, ctx.pipeline_creation_feedback, pipeline_feedback, stage_feedback,
+            );
+            #[cfg(test)]
+            if let Some(state) = self.diagnostics.as_mut() {
+                state.observations.push(_observation);
+            }
+        }
         breadcrumb.disarm();
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateGraphicsPipelines, e));
@@ -2936,8 +3102,8 @@ impl ObjectCaches {
             err
         })?[0];
         counters.note_create(CreateSite::GraphicsPipeline);
-        // A fresh pipeline compile grew the VkPipelineCache — persist it so
-        // the next boot warm-starts (file write is off-thread, debounced).
+        native_cache.save();
+        // Utility transfer pipelines still share the context's small cache.
         ctx.persist_pipeline_cache();
         if let Some(old) = self.pipelines.insert(key.clone(), pipe) {
             pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
@@ -3013,6 +3179,10 @@ impl ObjectCaches {
         let cpci = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(pipeline_layout);
+        let native_cache = super::context::native_cache::CompileCache::new(
+            ctx,
+            compute_native_cache_key(key, shader.spirv),
+        );
         // The other call that compiles the module, and the one an NVIDIA driver
         // has been observed dying inside on a macos-14 guest's first dispatch.
         let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
@@ -3029,7 +3199,7 @@ impl ObjectCaches {
         };
         let created = ctx
             .device
-            .create_compute_pipelines(ctx.pipeline_cache, &[cpci], None);
+            .create_compute_pipelines(native_cache.handle(), &[cpci], None);
         breadcrumb.disarm();
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateComputePipelines, e));
@@ -3038,7 +3208,7 @@ impl ObjectCaches {
             err
         })?[0];
         counters.note_create(CreateSite::ComputePipeline);
-        // Same warm-start persistence as the graphics path.
+        native_cache.save();
         ctx.persist_pipeline_cache();
         if let Some(old) = self.compute_pipelines.insert(key.clone(), pipe) {
             pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
@@ -3190,10 +3360,7 @@ mod shader_input_output16_tests {
                     } else {
                         Ok(())
                     };
-                    assert_eq!(
-                        admit_shader_input_output(&words, &features),
-                        expected
-                    );
+                    assert_eq!(admit_shader_input_output(&words, &features), expected);
                 }
             }
             assert_eq!(
@@ -3223,6 +3390,39 @@ mod shader_input_output16_tests {
 #[cfg(test)]
 mod object_cache_tests {
     use super::*;
+
+    #[test]
+    fn serial_declaration_cache_reuses_retained_arcs_without_populating_native_slots() {
+        use std::sync::Arc;
+        let mut index = ShaderDigestIndex::default();
+        let words = Arc::new(Vec::new());
+        let weak = Arc::downgrade(&words);
+        let first = index.serial_vertex_declarations(&words);
+        let again = index.serial_vertex_declarations(&words);
+        assert!(Arc::ptr_eq(&first, &again), "even an unproven declaration result is memoized");
+        assert!(index.serial_program(&words).is_err());
+        assert_eq!(index.get(&words), None, "declaration/projection caches cannot admit a native module");
+        let equal_words = Arc::new(Vec::new());
+        let other = index.serial_vertex_declarations(&equal_words);
+        assert!(!Arc::ptr_eq(&first, &other), "another allocation has its own proof owner");
+        assert_eq!(index.map.len(), 2);
+        drop(words);
+        index.clear();
+        assert!(weak.upgrade().is_some(), "a live plan still retains its exact source");
+        drop(first);
+        drop(again);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn serial_declaration_cache_uses_the_existing_shader_index_bound() {
+        let mut index = ShaderDigestIndex::default();
+        for _ in 0..=SHADER_DIGEST_ENTRIES {
+            index.serial_vertex_declarations(&std::sync::Arc::new(Vec::new()));
+            assert!(index.map.len() <= SHADER_DIGEST_ENTRIES);
+        }
+        assert_eq!(index.map.len(), 1, "the existing index reset also releases declaration owners");
+    }
 
     #[derive(Clone)]
     struct CountingKey {

@@ -256,8 +256,8 @@ impl ImportId {
         Self(std::num::NonZeroU64::new(raw).expect("import identity space exhausted"))
     }
 
-    /// The raw identity, for log fields only. Nothing may key a GPU resource on
-    /// this without also holding the [`GuestRamImport`] it came from.
+    /// The raw identity, for log fields only. A native cache also retains the
+    /// import's physical lease, where owned, until native retirement completes.
     pub fn get(self) -> u64 {
         self.0.get()
     }
@@ -277,6 +277,8 @@ impl std::fmt::Display for ImportId {
 /// presented to the wrong import.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuestRamError {
+    /// An owned alias and its physical-page footprint disagree on their extent.
+    OwnedFootprintExtent { bytes: u64, pages: usize, page_size: u64 },
     /// The shim described a zero-length RAMBlock. Nothing to import.
     RegionEmpty,
     /// The shim described a RAMBlock at host address 0. Either the block is not
@@ -335,6 +337,7 @@ pub enum GuestRamError {
 impl Decline for GuestRamError {
     fn slug(&self) -> &'static str {
         match self {
+            Self::OwnedFootprintExtent { .. } => "guest_ram_owned_footprint_extent",
             Self::RegionEmpty => "guest_ram_region_empty",
             Self::RegionUnmapped => "guest_ram_region_unmapped",
             Self::RegionWraps { .. } => "guest_ram_region_wraps",
@@ -355,6 +358,10 @@ impl Decline for GuestRamError {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match *self {
+            Self::OwnedFootprintExtent { bytes, pages, page_size } => vec![
+                ("bytes", bytes.to_string()), ("pages", pages.to_string()),
+                ("page_size", page_size.to_string()),
+            ],
             Self::RegionEmpty
             | Self::RegionUnmapped
             | Self::SliceEmpty
@@ -452,6 +459,20 @@ pub struct GuestRamImport {
     /// The backend's import granularity — `minImportedHostPointerAlignment` on
     /// Vulkan, the host page size on Metal-direct.
     align: u64,
+    owned: Option<std::sync::Arc<OwnedHostAllocation>>,
+}
+
+mod owned;
+pub use owned::{
+    take_owned_import_retirements, take_released_owned_host_allocations, OwnedHostAllocation,
+};
+
+impl Drop for GuestRamImport {
+    fn drop(&mut self) {
+        if self.owned.is_some() {
+            self.retire();
+        }
+    }
 }
 
 impl GuestRamImport {
@@ -522,7 +543,47 @@ impl GuestRamImport {
             host_base: host_base as usize,
             len,
             align,
+            owned: None,
         })
+    }
+
+    /// Transfer one caller-owned HostOps alias to this checked import.
+    ///
+    /// # Safety
+    /// On success, the caller must no longer unmap this acquisition itself.
+    /// It must drain `take_released_owned_host_allocations` through the same
+    /// HostOps owner. The footprint must name the ordered pages of this exact
+    /// acquisition, and the mapping must remain valid until that unmap.
+    pub unsafe fn new_owned_host_allocation(
+        host_base: usize,
+        len: u64,
+        align: u64,
+        footprint: GuestPageFootprint,
+    ) -> Result<Self, GuestRamError> {
+        let mut import = Self::new_host_allocation(host_base, len, align)?;
+        if (footprint.pages().len() as u64).checked_mul(footprint.page_size()) != Some(len) {
+            return Err(GuestRamError::OwnedFootprintExtent {
+                bytes: len, pages: footprint.pages().len(), page_size: footprint.page_size(),
+            }.report());
+        }
+        import.owned = Some(std::sync::Arc::new(OwnedHostAllocation::new(
+            host_base, len as usize, footprint,
+        )));
+        Ok(import)
+    }
+
+    /// Rebind an existing physical lease without acquiring a second host view.
+    pub fn from_owned_allocation(
+        owner: std::sync::Arc<OwnedHostAllocation>,
+        align: u64,
+    ) -> Result<Self, GuestRamError> {
+        let mut import = Self::new_host_allocation(owner.host_base(), owner.len() as u64, align)?;
+        import.owned = Some(owner);
+        Ok(import)
+    }
+
+    pub fn owned_host_allocation(&self) -> Option<std::sync::Arc<OwnedHostAllocation>> {
+        self.owned.clone()
     }
 
     /// Bound an already-packed, stable host allocation for backend import.
@@ -561,6 +622,7 @@ impl GuestRamImport {
             host_base,
             len,
             align,
+            owned: None,
         })
     }
 
@@ -572,8 +634,11 @@ impl GuestRamImport {
     /// End this allocation identity. Existing backend children may finish,
     /// but no new child or import may be created from it afterward.
     pub fn retire(&self) {
-        self.retired
-            .store(true, std::sync::atomic::Ordering::Release);
+        if !self.retired.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            if let Some(owner) = &self.owned {
+                owner.retire(self.id);
+            }
+        }
     }
 
     /// Whether the allocation identity has ended and may no longer acquire new
@@ -1028,11 +1093,22 @@ pub struct BoundRange {
 /// argument, and it returns `None` rather than a span reaching past it. The
 /// same window expressed in the wrong coordinates now fails the bound instead
 /// of producing a wild pointer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct GuestRun {
     host_ptr: usize,
     len: u64,
+    owner: Option<std::sync::Arc<GuestRamImport>>,
 }
+
+impl PartialEq for GuestRun {
+    fn eq(&self, other: &Self) -> bool {
+        self.host_ptr == other.host_ptr && self.len == other.len
+            && self.owner.as_ref().map(|owner| owner.id())
+                == other.owner.as_ref().map(|owner| owner.id())
+    }
+}
+
+impl Eq for GuestRun {}
 
 impl GuestRun {
     /// The `offset..offset + len` window of a live host mapping: `base` is its
@@ -1057,7 +1133,18 @@ impl GuestRun {
         }
         let host_ptr = base.checked_add(usize::try_from(offset).ok()?)?;
         host_ptr.checked_add(usize::try_from(len).ok()?)?;
-        Some(Self { host_ptr, len })
+        Some(Self { host_ptr, len, owner: None })
+    }
+
+    /// A CPU-readable exact window retaining its checked import and alias lease.
+    pub fn from_reference(reference: &GuestRef) -> Option<Self> {
+        let range = reference.bound().ok()?;
+        let mut run = Self::in_mapping(
+            reference.import.host_base(), reference.import.len(),
+            range.offset.checked_add(reference.head())?, reference.requested(),
+        )?;
+        run.owner = Some(std::sync::Arc::clone(reference.import()));
+        Some(run)
     }
 
     /// A run over the whole of one mapping: the mapping *is* the window.

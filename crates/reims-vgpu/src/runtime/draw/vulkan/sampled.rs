@@ -68,6 +68,120 @@ mod tests {
     use crate::runtime::gva_mem::{define_task_pages_arm64e, write_task_gva_arm64e};
     use crate::runtime::host::FakeHost;
 
+    #[test]
+    fn same_layout_fp16_miss_preserves_native_hdr_bytes_without_current_observation() {
+        use crate::protocol::iosurface_pages::{
+            DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS,
+            DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT,
+        };
+        use crate::runtime::compute_exec::planar_snapshot::tests::Fixture;
+        use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+        use crate::runtime::gva_mem::write_task_gva;
+        for shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+            let mut f = Fixture::new(shift);
+            f.host.guest_write_deferred = true;
+            f.host.guest_write_current_supported = true;
+            f.host.guest_write_current_unavailable = true;
+            let format = pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+            let (width, height, pitch) = (2u32, 2u32, 64u32);
+            assert!(f.state.set_mapping_geom(5, width, height, format));
+            let mut device = vec![0; DEVICE_DESC_LEN];
+            st32(&mut device[DEVICE_DESC_PIXEL_FORMAT..], 0x5247_6841);
+            st32(&mut device[DEVICE_DESC_ALLOC_SIZE..], f.state.page_size() as u32);
+            st64(&mut device[DEVICE_DESC_DIMS..],
+                (u64::from(width) << 8) | (u64::from(height) << 40));
+            st32(&mut device[DEVICE_DESC_BPR..], pitch);
+            st16(&mut device[DEVICE_DESC_BPE..], 8);
+            assert!(f.state.set_mapping_device_desc(5, &device));
+            let descriptor = reims_vgpu_wire::device_desc::RefTextureBuilder::new(
+                5, 1, 11, reims_vgpu_wire::device_desc::TYPE5_RECORD_TAG_COLOR_VIEW,
+            ).geometry(format, width, height, 1).plane_index(0);
+            write_task_gva(&mut f.host, &f.state.tasks[1], 0x300, descriptor.bytes(), shift).unwrap();
+            let mut entry = [0; OBJECT_LIST_ENTRY_LEN];
+            st32(&mut entry, u32::from(objects::OBJECT_TYPE_REF_TEXTURE)
+                | ((descriptor.bytes().len() as u32) << 8));
+            st64(&mut entry[4..], 0x300);
+            write_task_gva(&mut f.host, &f.state.tasks[1],
+                list_object_entry_offset(11, 32).unwrap(), &entry, shift).unwrap();
+            let expected: Vec<u8> = [0xbc00u16, 0x4200, 0x3555, 0x3c00]
+                .repeat(4).into_iter().flat_map(u16::to_le_bytes).collect();
+            for y in 0..height as usize {
+                f.host.write_gpa(f.state.pfn_gpa(0x20) + y as u64 * u64::from(pitch),
+                    &expected[y * 16..(y + 1) * 16]).unwrap();
+            }
+            mapper::stamp_guest_write_gen(&mut f.state, &mut f.host, 5);
+            crate::runtime::surface_cache::store(
+                &mut f.state, 5, width, height, [255, 0, 0, 255].repeat(4),
+            );
+            let scope = f.scope.reference();
+            let (w, h, mid, source) = resolve_sampled_source(
+                &mut f.state, &mut f.host, 1, 11, None, true, Some(&scope),
+            ).unwrap();
+            assert_eq!((w, h, mid), (width, height, 5));
+            let actual = match source {
+                SampledSourceRequest::Bytes(bytes, _, format, _) => {
+                    assert_eq!(format.layout(), TexelLayout::Rgba16Float);
+                    bytes.as_ref().clone()
+                }
+                SampledSourceRequest::GuestRuns(source, layout, format, _, _, vouch, _) => {
+                    assert_eq!(layout, TexelLayout::Rgba16Float);
+                    assert_eq!(format, ash::vk::Format::R16G16B16A16_SFLOAT);
+                    assert!(!vouch.is_vouched());
+                    let mut mapped = Vec::new();
+                    for run in source.runs.iter() {
+                        // SAFETY: the fixture retains each resolved FakeHost alias.
+                        mapped.extend_from_slice(unsafe {
+                            std::slice::from_raw_parts(run.host_ptr() as *const u8, run.len() as usize)
+                        });
+                    }
+                    let offset = source.source_offset as usize;
+                    let row = source.row_length_texels as usize * 8;
+                    (0..height as usize).flat_map(|y|
+                        mapped[offset + y * row..offset + y * row + 16].iter().copied()
+                    ).collect()
+                }
+                _ => panic!("a native miss must read the current guest bytes"),
+            };
+            assert_eq!(actual, expected, "negative, HDR and fractional half values survive");
+        }
+    }
+
+    #[test]
+    fn vulkan_planar_draw_threads_the_pass_scope_and_keeps_upload_bytes_owned() {
+        use crate::runtime::compute_exec::planar_snapshot::tests::Fixture;
+        use crate::runtime::draw::BufferSnapshotScope;
+        use std::sync::Arc;
+        for shift in [crate::model::PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+            let mut f = Fixture::new(shift);
+            f.host.guest_write_current_supported = true;
+            let resolve = |f: &mut Fixture| {
+                let scope = f.scope.reference();
+                let (_, _, _, source) = resolve_sampled_source(
+                    &mut f.state, &mut f.host, 1, 11, None, true, Some(&scope),
+                ).unwrap();
+                let SampledSourceRequest::Planar(image) = source else {
+                    panic!("composite texture must use the planar source");
+                };
+                image
+            };
+            let first = resolve(&mut f);
+            let uploaded_bytes = Arc::clone(&first.bytes);
+            assert!(Arc::ptr_eq(&first, &resolve(&mut f)));
+            f.scope = BufferSnapshotScope::new();
+            assert!(Arc::ptr_eq(&first, &resolve(&mut f)));
+            f.host.guest_write_current_unavailable = true;
+            f.host.write_gpa(f.state.pfn_gpa(0x20),
+                &vec![0x67; f.state.page_size() as usize]).unwrap();
+            let changed = resolve(&mut f);
+            assert!(!Arc::ptr_eq(&first, &changed));
+            assert_ne!(uploaded_bytes, changed.bytes);
+            assert!(Arc::ptr_eq(&uploaded_bytes, &first.bytes));
+            assert!(f.state.delete_object(1, 11));
+            assert_eq!(Arc::strong_count(&changed), 1);
+            assert_eq!(uploaded_bytes.len(), 8 * 4 * 4);
+        }
+    }
+
     fn descriptor(format: u16, tight: usize) -> BufferTextureDescriptor {
         BufferTextureDescriptor {
             new_texture_ref: 21, buffer_ref: 7, offset: 8, bytes_per_row: (tight + 16) as u64,

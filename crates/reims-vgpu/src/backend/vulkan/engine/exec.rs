@@ -9,13 +9,14 @@ use super::caches::{
     canonicalize_layout_bindings, AttrKey, BindingSig, Color0Load, ObjectCaches, PassKey,
     PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
 };
+use super::caches::storage_descriptors::StorageDescriptorAdmission;
 use super::context::ContextOwner;
 use super::counters::{CreateSite, EngineCounters};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::draw_execution::DrawExecutionDecline;
 use super::draw_validation::DrawValidationDecline;
 use super::pools::{
-    BatchFit, BatchTarget, BufferSlot, CbBind, ResourcePools, SampledKey, SampledSlot, TargetKey,
+    BatchAttachment, BatchDrawAttachments, BatchFit, BatchTarget, BufferSlot, CbBind, ResourcePools, SampledKey, SampledSlot, TargetKey,
 };
 use super::stage_phase;
 use super::types::{
@@ -24,6 +25,13 @@ use super::types::{
     ViewportResource, VisibilityResultMode,
 };
 use super::vk_call::{VkCall, VkOp};
+
+#[cfg(test)]
+mod mrt_batch_tests;
+#[cfg(test)]
+mod mrt_retirement_gpu_tests;
+#[cfg(test)]
+mod storage_descriptor_tests;
 
 /// A buffer a draw binds, and where in it the bytes start.
 ///
@@ -672,7 +680,7 @@ unsafe fn stage_buffer_content(
     // to what it names are taken together here — see [`super::pools::CbBind`].
     // The map cannot be told about a bind without being handed this, which is
     // what keeps the key's address from being recycled under a live entry.
-    let bind = super::pools::CbBind::of(content);
+    let mut bind = super::pools::CbBind::of(content);
     debug_assert_eq!(bind.key(), key, "the probe and the record name one bind");
     // Set by the one arm that returns a slot it has not filled. Read after the
     // `match` so the flag and the `note_cb_bound_buffer` below it cannot be
@@ -700,6 +708,7 @@ unsafe fn stage_buffer_content(
             // and freeing the import is what ends the access.
             if let Some(bound) = unsafe { import_guest_buffer_window(ctx, pools, src, gather_role) }
             {
+                bind.note_guest_read();
                 pools.note_guest_read_recorded();
                 counters.note_buffer_guest_import(src.total_len, gather_role);
                 bound
@@ -708,6 +717,7 @@ unsafe fn stage_buffer_content(
             {
                 // The copies read guest RAM when the CB executes, exactly as a
                 // direct bind does, so this owes the same quiesce.
+                bind.note_guest_read();
                 pools.note_guest_read_recorded();
                 counters.note_buffer_guest_gather(src.total_len, pending.regions(), gather_role);
                 // Counted here and not at the top of this arm, because only a
@@ -1505,6 +1515,30 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         }
     }
+    if let Some(seed) = &req.target_native_seed {
+        if super::super::translate::pixel::texel_layout_of(req.primary_format()) != Some(seed.layout) {
+            return Err(DrawError::DrawValidation(DrawValidationDecline::TargetGuestSeedFormat {
+                source: super::super::translate::pixel::vk_texel_layout(seed.layout),
+                target: req.primary_format(),
+            }));
+        }
+        let expected = reims_vgpu_protocol::extent::tight_image_bytes(
+            req.width, req.height, seed.layout.bytes_per_texel() as usize,
+        ).ok_or(DrawError::DrawValidation(DrawValidationDecline::UnrepresentableImageBytes {
+            width: req.width, height: req.height, layers: 1,
+            bytes_per_texel: seed.layout.bytes_per_texel(),
+        }))?;
+        if seed.bytes.len() != expected {
+            return Err(DrawError::DrawValidation(DrawValidationDecline::TargetSeedLength {
+                actual: seed.bytes.len(), expected,
+            }));
+        }
+        if req.target_rgba8.is_some() || req.target_guest_seed.is_some()
+            || req.seed_from_target.is_some() || req.load_from_target
+        {
+            return Err(DrawError::DrawValidation(DrawValidationDecline::SeedConflictsCpuSeed));
+        }
+    }
     if let Some(seed) = &req.target_guest_seed {
         let target_format = req.primary_format();
         if seed.format != target_format {
@@ -1581,7 +1615,8 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if req.target_rgba8.is_some() || req.load_from_target || req.seed_from_target.is_some() {
+        if req.target_rgba8.is_some() || req.target_native_seed.is_some()
+            || req.load_from_target || req.seed_from_target.is_some() {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SeedConflictsGuestSeed,
             ));
@@ -1593,7 +1628,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 DrawValidationDecline::SeedMissingTargetIdentity,
             ));
         }
-        if req.target_rgba8.is_some() || req.target_guest_seed.is_some() {
+        if req.target_rgba8.is_some() || req.target_guest_seed.is_some() || req.target_native_seed.is_some() {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SeedConflictsCpuSeed,
             ));
@@ -2180,12 +2215,12 @@ unsafe fn upload_buffer_to_sampled_image(
     );
 }
 
-/// The ten conditions that decide how a draw reaches the submission ring.
+/// The conditions that decide how a draw reaches the submission ring.
 ///
 /// Two questions, one set of fields. `batch_eligible` asks whether this draw
 /// may leave its command buffer in recording state for a successor to append
 /// to; [`Self::refusal`] asks whether *this* draw may be that successor. The
-/// first seven terms answer both, and while they were two hand-written lists a
+/// draw-scoped terms answer both, and while they were two hand-written lists a
 /// `debug_assert` was the only thing keeping the shared prefix in step —
 /// which caught a divergence in debug builds and shipped it in release.
 /// Deriving `batch_eligible` from the fields the ladder reads removes the
@@ -2229,7 +2264,6 @@ unsafe fn upload_buffer_to_sampled_image(
 struct JoinTerms {
     force_loss: bool,
     quirk: bool,
-    is_mrt: bool,
     /// A depth draw whose submit may not be deferred.
     ///
     /// Depth itself is not the reason and never was. A depth pass builds a
@@ -2243,6 +2277,9 @@ struct JoinTerms {
     reads_back: bool,
     has_query: bool,
     no_identity: bool,
+    mrt_boundary: bool,
+    mrt_sampled_attachment: bool,
+    retired_attachment: bool,
     cpu_seed: bool,
     gpu_seed: bool,
     no_open_batch: bool,
@@ -2386,6 +2423,32 @@ enum JoinScope {
 type JoinRefusal = (fn(&JoinTerms) -> bool, JoinScope, &'static str);
 
 impl JoinTerms {
+    fn for_draw(
+        req: &DrawRequest,
+        fit: BatchFit,
+        force_loss: bool,
+        quirk: bool,
+        depth_barred: bool,
+        has_attachment_set: bool,
+    ) -> Self {
+        Self {
+            force_loss,
+            quirk,
+            depth_barred,
+            reads_back: !req.skip_readback || super::graphics_storage::requires_completion(req),
+            has_query: req.occlusion_query.is_some(),
+            no_identity: !has_attachment_set,
+            mrt_boundary: Self::mrt_batch_boundary(req),
+            mrt_sampled_attachment: Self::mrt_samples_attachment(req),
+            retired_attachment: matches!(fit, BatchFit::RetiredAttachment),
+            cpu_seed: req.target_rgba8.is_some() || req.target_native_seed.is_some(),
+            gpu_seed: req.seed_from_target.is_some() || req.target_guest_seed.is_some(),
+            no_open_batch: matches!(fit, BatchFit::None),
+            batch_full: matches!(fit, BatchFit::Full),
+            target_switch: matches!(fit, BatchFit::OtherTarget),
+        }
+    }
+
     /// The refusals in ladder order.
     ///
     /// [`Self::batch_eligible`] is this same list filtered to [`JoinScope::Draw`]
@@ -2393,14 +2456,16 @@ impl JoinTerms {
     /// one question and miss the other, and cannot be mis-scoped by landing at
     /// the wrong index — its scope is written beside it, not inferred from
     /// where it sits.
-    const LADDER: [JoinRefusal; 12] = [
+    const LADDER: [JoinRefusal; 14] = [
         (|t| t.force_loss, JoinScope::Draw, "nojoin_force_loss"),
         (|t| t.quirk, JoinScope::Draw, "nojoin_quirk"),
-        (|t| t.is_mrt, JoinScope::Draw, "nojoin_mrt"),
         (|t| t.depth_barred, JoinScope::Draw, "nojoin_depth"),
         (|t| t.reads_back, JoinScope::Draw, "nojoin_reads_back"),
         (|t| t.has_query, JoinScope::Draw, "nojoin_query"),
         (|t| t.no_identity, JoinScope::Draw, "nojoin_no_identity"),
+        (|t| t.mrt_boundary, JoinScope::Fit, "nojoin_mrt_boundary"),
+        (|t| t.mrt_sampled_attachment, JoinScope::Fit, "nojoin_mrt_sampled_attachment"),
+        (|t| t.retired_attachment, JoinScope::Fit, "nojoin_retired_attachment"),
         (|t| t.cpu_seed, JoinScope::Fit, "nojoin_cpu_seed"),
         (|t| t.gpu_seed, JoinScope::Fit, "nojoin_gpu_seed"),
         (|t| t.no_open_batch, JoinScope::Fit, "nojoin_no_open_batch"),
@@ -2414,6 +2479,46 @@ impl JoinTerms {
         !Self::LADDER
             .iter()
             .any(|(refuses, scope, _)| *scope == JoinScope::Draw && refuses(self))
+    }
+
+    fn draw_batch_target(req: &DrawRequest, depth_format: Option<vk::Format>) -> Option<BatchTarget> {
+        let mut target = BatchTarget::single(
+            req.target_identity.clone()?, req.width, req.height, req.primary_format(),
+        );
+        target.samples = req.color_sample_count.max(1);
+        target.secondaries = req.secondary_targets.iter().map(|secondary| BatchAttachment {
+            identity: secondary.identity.clone(),
+            width: secondary.width,
+            height: secondary.height,
+            format: secondary.attachment.format(),
+        }).collect();
+        if let Some(depth) = &req.depth {
+            match depth.identity.as_ref() {
+                Some(identity) => target.depth = Some(BatchAttachment {
+                    identity: identity.clone(),
+                    width: req.width,
+                    height: req.height,
+                    format: depth_format?,
+                }),
+                None if target.is_mrt() => return None,
+                None => {}
+            }
+        }
+        Some(target)
+    }
+
+    fn mrt_batch_boundary(req: &DrawRequest) -> bool {
+        !req.secondary_targets.is_empty()
+            && (!req.continues_render_pass
+                || !req.load_from_target
+                || req.secondary_targets.iter().any(|target| !target.load)
+                || req.depth.as_ref().is_some_and(|depth| !depth.load))
+    }
+
+    fn mrt_samples_attachment(req: &DrawRequest) -> bool {
+        !req.secondary_targets.is_empty() && req.sampled_images.iter().any(|sample| {
+            matches!(&sample.source, SampledSource::Target(identity) if req.writes_attachment(identity))
+        })
     }
 
     /// Why this draw does not append to the open batch, named by its first
@@ -2731,7 +2836,7 @@ pub(crate) unsafe fn execute_draw_inner(
     pools.ensure_init(ctx, counters)?;
 
     // Draw batching (deferred submit): a draw that hands the CPU nothing
-    // (skip_readback + resident target, no MRT) leaves its CB in recording
+    // (skip_readback + retained attachments) leaves its CB in recording
     // state for same-target successors; a successor whose work folds into the
     // open CB (LoadFromTarget — no CPU/GPU seed, not sampling its own target,
     // same identity/geometry/format) appends to it, skipping slot claim and
@@ -2769,15 +2874,13 @@ pub(crate) unsafe fn execute_draw_inner(
         .sampled_images
         .iter()
         .any(|s| matches!(&s.source, SampledSource::Target(t) if req.writes_attachment(t)));
-    // Built once and asked twice: the join test below and the append at the end
-    // of this function are the same four words, and a `BatchTarget` is how they
-    // stay the same four words.
-    let batch_target = req.target_identity.as_ref().map(|id| BatchTarget {
-        identity: id.clone(),
-        width: req.width,
-        height: req.height,
-        bgra: output_bgra,
-    });
+    let batch_target = JoinTerms::draw_batch_target(req, req.depth.as_ref().map(|depth| {
+        ResourcePools::depth_format(ctx, depth.stencil.is_some())
+    }));
+    // MRT uses a complete, retained attachment set and keeps a Vulkan render
+    // pass boundary per draw. The historical measurements below describe the
+    // single-color batching path; MRT eligibility is no longer a blanket bar.
+    //
     // Why this draw does not append to the open batch, named by its first
     // refusing term.
     //
@@ -2882,20 +2985,10 @@ pub(crate) unsafe fn execute_draw_inner(
         .as_ref()
         .map(|t| pools.batch_fit(t, batch_mixed_targets_disabled()))
         .unwrap_or(BatchFit::None);
-    let terms = JoinTerms {
-        force_loss,
-        quirk: ctx.caps.quirks.no_deferred_draw_batching,
-        is_mrt,
-        depth_barred: depth_bars_batching(req.depth.is_some()),
-        reads_back: !req.skip_readback || super::graphics_storage::requires_completion(req),
-        has_query: req.occlusion_query.is_some(),
-        no_identity: req.target_identity.is_none(),
-        cpu_seed: req.target_rgba8.is_some(),
-        gpu_seed: req.seed_from_target.is_some() || req.target_guest_seed.is_some(),
-        no_open_batch: matches!(fit, BatchFit::None),
-        batch_full: matches!(fit, BatchFit::Full),
-        target_switch: matches!(fit, BatchFit::OtherTarget),
-    };
+    let terms = JoinTerms::for_draw(
+        req, fit, force_loss, ctx.caps.quirks.no_deferred_draw_batching,
+        depth_bars_batching(req.depth.is_some()), batch_target.is_some(),
+    );
     let batch_eligible = terms.batch_eligible();
     let no_join = terms.refusal();
     // The join arm splits by self-alias, and the two must sum to the joins.
@@ -3049,6 +3142,7 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         req.target_rgba8.as_ref().map(|v| v.as_slice())
     };
+    let native_seed_bytes = req.target_native_seed.as_ref().map(|seed| seed.bytes.as_slice());
     // Three questions, not one: can this device offer prior contents, and if
     // not, did the guest ask for a clear or merely permit undefined contents?
     // The second question used to have no representation here, so both answers
@@ -3057,6 +3151,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let color0_load = if load_uses_gpu_content
         || seed_bytes.is_some()
         || req.target_guest_seed.is_some()
+        || native_seed_bytes.is_some()
         || req.seed_from_target.is_some()
     {
         Color0Load::Preserve
@@ -3177,6 +3272,7 @@ pub(crate) unsafe fn execute_draw_inner(
             if !req.skip_readback
                 || req.target_rgba8.is_some()
                 || req.target_guest_seed.is_some()
+                || req.target_native_seed.is_some()
                 || req.load_guest_target_backing
             {
                 return Err(DrawError::Unsupported(
@@ -3205,15 +3301,43 @@ pub(crate) unsafe fn execute_draw_inner(
     }));
     let attr_keys = caches.intern_attrs(pools.attr_keys());
 
+    let raster_cell = reims_vgpu_vulkan::raster::RasterCell {
+        depth_clamp: ctx.features.depth_clamp,
+        fill_mode_non_solid: ctx.features.fill_mode_non_solid,
+        dynamic_cull_and_winding: ctx.features.extended_dynamic_state,
+        dynamic_polygon_mode: ctx.features.dynamic_polygon_mode,
+        dynamic_depth_clamp: ctx.features.dynamic_depth_clamp,
+    };
+    let raster_plan = match reims_vgpu_vulkan::raster::plan(req.raster, raster_cell) {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            let reason = super::reason::DrawReason::Raster(refusal);
+            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            return Err(DrawError::Unsupported(reason));
+        }
+    };
+    let serial_interlock = caches.prepare_serial_interlock(ctx, req, raster_plan.polygon_mode())?;
+    let fragment_words = serial_interlock.as_ref().map_or(&req.frag_spirv, |plan| plan.words());
     phase.enter(super::draw_phase::Phase::PipelineShader);
-    let (vert_digest, vert_module) =
+    let (vert_digest, vertex_shader) =
         caches.get_or_create_shader_memoized(ctx, &req.vert_spirv, counters, pools)?;
-    let (frag_digest, frag_module) =
-        caches.get_or_create_shader_memoized(ctx, &req.frag_spirv, counters, pools)?;
+    let (frag_digest, fragment_shader) =
+        caches.get_or_create_shader_memoized(ctx, fragment_words, counters, pools)?;
+    let (vert_module, frag_module) = (vertex_shader.module, fragment_shader.module);
+    let storage_admission = StorageDescriptorAdmission::new(
+        &vertex_shader.declarations,
+        &fragment_shader.declarations,
+    );
+    pools.admit_storage_descriptors(&storage_admission);
     phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
     let layout = caches.get_or_create_layout(ctx, pools.layout_bindings(), None, counters)?;
     let (dsl, pipeline_layout) = (layout.dsl, layout.pipeline_layout);
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
+    let interlock_preserving_pass = if serial_interlock.is_some() {
+        Some(caches.get_or_create_pass(
+            ctx, super::serial_interlock::preserving_pass(pass_key), counters, pools,
+        )?)
+    } else { None };
     phase.enter(super::draw_phase::Phase::Pipeline);
     // How many viewport slots this draw rasterizes into, checked against the
     // host before it is baked into a pipeline. Refused rather than clamped:
@@ -3267,22 +3391,8 @@ pub(crate) unsafe fn execute_draw_inner(
     // Making a state dynamic does not make its capability free: `plan` still
     // refuses `MTLDepthClipModeClamp` without `depthClamp` and
     // `MTLTriangleFillModeLines` without `fillModeNonSolid`, on both paths.
-    let raster_cell = reims_vgpu_vulkan::raster::RasterCell {
-        depth_clamp: ctx.features.depth_clamp,
-        fill_mode_non_solid: ctx.features.fill_mode_non_solid,
-        dynamic_cull_and_winding: ctx.features.extended_dynamic_state,
-        dynamic_polygon_mode: ctx.features.dynamic_polygon_mode,
-        dynamic_depth_clamp: ctx.features.dynamic_depth_clamp,
-    };
-    let raster_plan = match reims_vgpu_vulkan::raster::plan(req.raster, raster_cell) {
-        Ok(plan) => plan,
-        Err(refusal) => {
-            let reason = super::reason::DrawReason::Raster(refusal);
-            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
-            return Err(DrawError::Unsupported(reason));
-        }
-    };
-    let fetch_primitives = reims_vgpu_vulkan::framebuffer_fetch::plan(
+    let fetch_primitives = if serial_interlock.is_some() { None } else {
+        reims_vgpu_vulkan::framebuffer_fetch::plan(
         reims_vgpu_vulkan::framebuffer_fetch::Cell {
             ordered_color_access: ctx.features.rasterization_order_color_access,
             dynamic_front_face: ctx.features.extended_dynamic_state,
@@ -3302,7 +3412,8 @@ pub(crate) unsafe fn execute_draw_inner(
         &req.frag_spirv,
     ).map_err(|reason| DrawError::Unsupported(
         super::reason::DrawReason::ColorInputOrderingUnsupported(reason),
-    ))?;
+    ))?
+    };
     // The primitive type, under the same split. `extendedDynamicState` is the
     // same feature bit the cull mode and winding above ride on — it reaches
     // `vkCmdSetPrimitiveTopology` too — and the unrestricted property says
@@ -3419,7 +3530,7 @@ pub(crate) unsafe fn execute_draw_inner(
         vert_module,
         &req.vert_spirv,
         frag_module,
-        &req.frag_spirv,
+        fragment_words,
         pipeline_layout,
         render_pass,
         counters,
@@ -3552,8 +3663,8 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // Target seed staging (CPU import only — not LoadFromTarget).
     //
-    // A seed is always eight bits per channel; the attachment need not be. A
-    // buffer→image copy converts nothing and reads the *image's* texel width
+    // A legacy seed is eight bits per channel; a native seed already carries
+    // the exact attachment texels. A buffer→image copy converts nothing and reads the *image's* texel width
     // per pixel, so staging an RGBA8 seed under a wider attachment would read
     // past the slot and seed the frame with whatever followed it. The wide arm
     // below restates the seed as the attachment's texels first; the four-byte
@@ -3573,7 +3684,18 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         Some((rgba8, layout))
     });
-    let seed_slot = if let Some((rgba8, layout)) = seed_wide {
+    let seed_slot = if let Some(bytes) = native_seed_bytes {
+        let slot = {
+            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+            pools.acquire_staging(ctx, bytes.len() as u64, counters)?
+        };
+        {
+            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, bytes.len() as u64);
+            pools.write_staging(ctx, &slot, bytes)?;
+        }
+        counters.note_seed_upload(bytes.len() as u64);
+        Some(slot)
+    } else if let Some((rgba8, layout)) = seed_wide {
         // The seed's own order first, because `expand_rgba8_to_texel` reads
         // semantic RGBA8 — the same normalization the four-byte arm folds into
         // its copy, done here as a step because a widening pass cannot also
@@ -3764,7 +3886,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 width: req.width,
                 height: req.height,
                 format: color0_format,
-                with_transfer_dst: seed_bytes.is_some()
+                with_transfer_dst: seed_bytes.is_some() || native_seed_bytes.is_some()
                     || req.target_guest_seed.is_some() || req.seed_from_target.is_some(),
             };
             // Acquire the pooled slot under the color-only `primary_pass` (same as
@@ -4299,6 +4421,19 @@ pub(crate) unsafe fn execute_draw_inner(
 
     phase.enter(super::draw_phase::Phase::Descriptors);
     let graphics_storage = super::graphics_storage::prepare(ctx, pools, counters, req)?;
+    if serial_interlock.is_some() {
+        let mut seen = std::collections::HashSet::new();
+        for texture in &graphics_storage {
+            let image = texture.image();
+            if image == target_image || mrt_secondaries.iter().any(|(_, attachment, _)| *attachment == image)
+                || !seen.insert(image)
+            {
+                return Err(super::graphics_storage::GraphicsStorageDecline::SerialInterlock(
+                    super::serial_interlock::Refusal::State("native_image_alias"),
+                ).into());
+            }
+        }
+    }
     // Push descriptors are the Vulkan spelling closest to Metal encoder
     // binding state: the writes become commands in this command buffer, with no
     // separately allocated object. The layout cache made the same decision.
@@ -4358,13 +4493,14 @@ pub(crate) unsafe fn execute_draw_inner(
     );
     descriptor_scratch.extend(secondary_inputs);
     super::graphics_storage::descriptors(req, &graphics_storage, descriptor_scratch);
+    storage_admission.filter_writes(descriptor_scratch);
     if let Some(dset) = dset {
         // An allocated set is fresh out of the pool and carries nothing, so
         // there is no unchanged case to elide: it is written every draw.
         with_descriptor_writes(pools.push_descriptor_scratch_ref(), dset, |writes| {
             #[cfg(test)]
             super::graphics_storage::assert_final_descriptor_writes(
-                req, &graphics_storage, writes, "allocated",
+                req, &graphics_storage, &storage_admission, writes, "allocated",
             );
             ctx.device.update_descriptor_sets(writes, &[]);
         });
@@ -4808,26 +4944,25 @@ pub(crate) unsafe fn execute_draw_inner(
         else {
             continue;
         };
-        if *initialized || !transitioned_guest_direct.insert(*image) {
-            continue;
+        if !*initialized && transitioned_guest_direct.insert(*image) {
+            unsafe { outside_pass.before_record(PassObstacle::SampledUpload, pools, &ctx.device, cb) };
+            let barrier = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::PREINITIALIZED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(*image)
+                .subresource_range(super::color_subresource_range())];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barrier,
+            );
         }
-        unsafe { outside_pass.before_record(PassObstacle::SampledUpload, pools, &ctx.device, cb) };
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::HOST_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::PREINITIALIZED)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(*image)
-            .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::HOST,
-            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barrier,
-        );
         pools.mark_guest_sampled_read(key);
     }
 
@@ -5407,7 +5542,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 |writes| {
                     #[cfg(test)]
                     super::graphics_storage::assert_final_descriptor_writes(
-                        req, &graphics_storage, writes, "push",
+                        req, &graphics_storage, &storage_admission, writes, "push",
                     );
                     push_entry.cmd_push_descriptor_set(
                         cb,
@@ -5435,7 +5570,49 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     phase.enter(super::draw_phase::Phase::RecordDraw);
     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters) };
-    if let Some(primitives) = fetch_primitives {
+    if let Some(plan) = &serial_interlock {
+        if let (Some(indexed), Some(ibuf)) = (&req.indexed, &index_slot) {
+            ctx.device.cmd_bind_index_buffer(
+                cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk(),
+            );
+        }
+        let (stages, dependency) = super::serial_interlock::dependency();
+        for (index, primitive) in plan.primitives().iter().enumerate() {
+            if index != 0 {
+                ctx.device.cmd_pipeline_barrier(
+                    cb, stages, stages, vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&dependency), &[], &[],
+                );
+                let continuation = vk::RenderPassBeginInfo::default()
+                    .render_pass(interlock_preserving_pass.expect("admitted serial pass"))
+                    .framebuffer(target_fb)
+                    .render_area(rp_begin.render_area);
+                ctx.device.cmd_begin_render_pass(cb, &continuation, vk::SubpassContents::INLINE);
+                pools.note_pass_opened(echo);
+            }
+            let mut dynamic = raster_plan.dynamic;
+            if primitive.reverse_winding {
+                dynamic.front_face = dynamic.front_face.map(|front| {
+                    if front == vk::FrontFace::CLOCKWISE {
+                        vk::FrontFace::COUNTER_CLOCKWISE
+                    } else { vk::FrontFace::CLOCKWISE }
+                });
+            }
+            pools.set_dynamic_raster(ctx, cb, counters, dynamic);
+            if let Some(indexed) = &req.indexed {
+                ctx.device.cmd_draw_indexed(cb, primitive.count, 1, primitive.first,
+                    indexed.vertex_offset, primitive.first_instance);
+            } else {
+                ctx.device.cmd_draw(cb, primitive.count, 1, primitive.first, primitive.first_instance);
+            }
+            pools.close_open_pass(&ctx.device, cb);
+            counters.serial_interlock_primitives.fetch_add(1, Ordering::Relaxed);
+        }
+        counters.serial_interlock_draws.fetch_add(1, Ordering::Relaxed);
+        if !req.sampled_images.is_empty() {
+            counters.serial_interlock_unused_sampled_draws.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if let Some(primitives) = fetch_primitives {
         if let (Some(indexed), Some(ibuf)) = (&req.indexed, &index_slot) {
             ctx.device.cmd_bind_index_buffer(
                 cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk(),
@@ -5502,6 +5679,10 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     let keep_pass_open = req.render_pass_continues
         && batch_eligible
+        && serial_interlock.is_none()
+        // MRT initially batches submissions, not render-pass instances.
+        // Every attachment keeps its existing explicit pass-exit/barrier path.
+        && !is_mrt
         && !pass_churn_probe_enabled()
         && !layout_churn_probe_enabled();
     if keep_pass_open {
@@ -5725,6 +5906,9 @@ pub(crate) unsafe fn execute_draw_inner(
     // Submission ends here. Everything below is CPU-side publication and
     // retention work, and needs its own bar: charging it to `submit_us` makes
     // a slow registry or Store-footprint update look like driver queue cost.
+    if defer_submit && is_mrt {
+        pools.begin_resident_journal();
+    }
     phase.enter(super::draw_phase::Phase::PostTarget);
     // CPU-side bookkeeping: the retained target's content is queue-ordered
     // (mark ready), resident sampled layouts advance to the recorded
@@ -5743,7 +5927,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // attachment first: a CLEAR clears the render area, which is the full
         // target, and both seed forms fill it.
         let rewrites_whole_attachment =
-            !load_uses_gpu_content || seed_bytes.is_some() || req.seed_from_target.is_some();
+            !load_uses_gpu_content || seed_bytes.is_some() || native_seed_bytes.is_some() || req.seed_from_target.is_some();
         // `any`, not the union: one scissor reaching the whole attachment is
         // enough for this draw to have written anywhere in it. A set of rects
         // that only covers the target *together* reads as partial here, which
@@ -5878,6 +6062,11 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_note_access(seed_identity, next_access);
         }
     }
+    let resident_states = if defer_submit && is_mrt {
+        pools.take_resident_journal()
+    } else {
+        Vec::new()
+    };
     // Deferred-submit draw: park the per-draw descriptor set on the open batch
     // (opening it if this is the first), hand the batch this draw's sampled
     // images for the content cache, and return. The CPU-side bookkeeping above
@@ -5890,13 +6079,20 @@ pub(crate) unsafe fn execute_draw_inner(
     if defer_submit {
         let target = batch_target.expect("batch_eligible requires target identity");
         pools.batch_append(
-            &ctx.device,
+            ctx,
             (cb, fence),
-            target,
+            BatchDrawAttachments { target, resident_states },
             dset.zip(dset_pool),
             sampled_retains,
             counters,
-        );
+        )?;
+        if is_mrt {
+            crate::runtime::drain::note_store_route(if joins {
+                "mrt_batch_joins"
+            } else {
+                "mrt_batch_opens"
+            });
+        }
         // After the append, never before: installing the open batch is what puts
         // this slot into `open_slot_mask`, so these handles wait for the batch's
         // own work instead of being freed under a command buffer still recording
@@ -6253,8 +6449,8 @@ fn clear_values(req: &DrawRequest) -> Result<ClearValues, DrawError> {
 /// is built, but relying on that is relying on a call order this type cannot
 /// see; refusing here makes the bound the array's own, under the same
 /// `SecondaryAttachmentCap` reason, so the two cannot disagree.
-/// Fill `out` with this draw's descriptor bindings, in the order Vulkan's write
-/// structures will be derived in.
+/// Fill `out` with candidate descriptor bindings. The shared admission plan
+/// finalizes them after the secondary-input and graphics-storage contributors.
 ///
 /// The list is this device's own vocabulary, not Vulkan's. That is what lets the
 /// two consumers below take it at different times: the push rail compares it
@@ -6268,16 +6464,17 @@ fn fill_descriptor_bindings(
     sampler_handles: &[(u32, vk::Sampler)],
     color_input: Option<(vk::ImageView, vk::ImageLayout)>,
 ) {
-    out.extend(storage_slots.iter().map(|(binding, bound, len)| {
-        super::pools::PushDescriptorBinding::Buffer {
-            binding: *binding,
-            array_element: 0,
-            ty: vk::DescriptorType::STORAGE_BUFFER,
-            buffer: bound.buffer,
-            offset: bound.offset,
-            range: descriptor_range(*len),
-        }
-    }));
+    out.extend(
+        storage_slots.iter()
+            .map(|(binding, bound, len)| super::pools::PushDescriptorBinding::Buffer {
+                binding: *binding,
+                array_element: 0,
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                buffer: bound.buffer,
+                offset: bound.offset,
+                range: descriptor_range(*len),
+            }),
+    );
     out.extend(
         sampled
             .iter()
@@ -6828,16 +7025,18 @@ mod tests {
         JoinTerms {
             force_loss: b(0),
             quirk: b(1),
-            is_mrt: b(2),
-            depth_barred: b(3),
-            reads_back: b(4),
-            has_query: b(5),
-            no_identity: b(6),
-            cpu_seed: b(7),
-            gpu_seed: b(8),
-            no_open_batch: b(9),
-            batch_full: b(10),
-            target_switch: b(11),
+            depth_barred: b(2),
+            reads_back: b(3),
+            has_query: b(4),
+            no_identity: b(5),
+            mrt_boundary: b(6),
+            mrt_sampled_attachment: b(7),
+            retired_attachment: b(8),
+            cpu_seed: b(9),
+            gpu_seed: b(10),
+            no_open_batch: b(11),
+            batch_full: b(12),
+            target_switch: b(13),
         }
     }
 
@@ -7453,6 +7652,35 @@ mod tests {
             Err(other) => panic!("expected typed draw validation, got {other}"),
             Ok(()) => panic!("expected draw validation failure"),
         }
+    }
+
+    #[test]
+    fn native_color_seed_validation_checks_layout_length_and_exclusive_source() {
+        let make = || DrawRequest {
+            width: 4, height: 2,
+            vert_spirv: std::sync::Arc::new(vec![0]), frag_spirv: std::sync::Arc::new(vec![0]),
+            color_attachment: Some(super::super::types::ColorAttachmentState::new(
+                vk::Format::R16G16B16A16_SFLOAT, super::super::types::ColorClearValue::Float([0.0; 4]),
+            )),
+            target_native_seed: Some(crate::runtime::draw::NativeColorSeed {
+                layout: crate::protocol::pixel_format::TexelLayout::Rgba16Float,
+                bytes: std::sync::Arc::new(vec![0; 64]),
+            }),
+            ..Default::default()
+        };
+        assert!(validate_v1(&make()).is_ok());
+        let mut wrong = make();
+        wrong.target_native_seed.as_mut().unwrap().layout = crate::protocol::pixel_format::TexelLayout::Rgba8;
+        assert_eq!(validation_slug(&wrong), "vk_draw_validate_target_guest_seed_format");
+        let mut short = make();
+        short.target_native_seed.as_mut().unwrap().bytes = std::sync::Arc::new(vec![0; 63]);
+        assert_eq!(validation_slug(&short), "vk_draw_validate_target_seed_length");
+        let mut both = make();
+        both.target_rgba8 = Some(std::sync::Arc::new(vec![0; 32]));
+        assert_eq!(validation_slug(&both), "vk_draw_validate_seed_conflicts_cpu_seed");
+        let mut resident = make();
+        resident.load_from_target = true;
+        assert_eq!(validation_slug(&resident), "vk_draw_validate_seed_conflicts_cpu_seed");
     }
 
     fn guest_run_req(w: u32, h: u32, total_len: u64, row_length_texels: u32) -> DrawRequest {

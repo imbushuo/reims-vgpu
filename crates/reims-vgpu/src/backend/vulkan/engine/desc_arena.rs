@@ -124,6 +124,17 @@ const DESC_BLOCK_PER_TYPE: u32 = MAX_SET_DESCRIPTORS_PER_TYPE;
 /// draw at runtime, which is the whole reason it is a `const` and not a comment.
 const _: () = assert!(DESC_BLOCK_PER_TYPE >= MAX_SET_DESCRIPTORS_PER_TYPE);
 
+fn block_pool_sizes() -> [vk::DescriptorPoolSize; 5] {
+    [
+        vk::DescriptorType::STORAGE_BUFFER,
+        vk::DescriptorType::SAMPLED_IMAGE,
+        vk::DescriptorType::STORAGE_IMAGE,
+        vk::DescriptorType::SAMPLER,
+        vk::DescriptorType::INPUT_ATTACHMENT,
+    ].map(|ty| vk::DescriptorPoolSize::default()
+        .ty(ty).descriptor_count(DESC_BLOCK_PER_TYPE))
+}
+
 /// A growable set of same-sized descriptor-pool blocks. `blocks[0]` is created
 /// eagerly at engine init; later blocks appear only on allocation exhaustion.
 pub(crate) struct DescriptorArena {
@@ -151,20 +162,7 @@ impl DescriptorArena {
     }
 
     unsafe fn create_block(device: &ash::Device) -> Result<vk::DescriptorPool, DrawError> {
-        let pool_sizes = [
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(DESC_BLOCK_PER_TYPE),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(DESC_BLOCK_PER_TYPE),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(DESC_BLOCK_PER_TYPE),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLER)
-                .descriptor_count(DESC_BLOCK_PER_TYPE),
-        ];
+        let pool_sizes = block_pool_sizes();
         device
             .create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -298,6 +296,23 @@ fn group_by_pool(
 mod tests {
     use super::*;
     use ash::vk::Handle;
+
+    #[test]
+    fn every_render_and_compute_descriptor_type_fits_an_empty_pool_block() {
+        let sizes = block_pool_sizes();
+        for ty in [
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::SAMPLED_IMAGE,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::SAMPLER,
+            vk::DescriptorType::INPUT_ATTACHMENT,
+        ] {
+            let entries: Vec<_> = sizes.iter().filter(|entry| entry.ty == ty).collect();
+            assert_eq!(entries.len(), 1, "{ty:?} must have exactly one pool budget");
+            assert!(entries[0].descriptor_count >= MAX_SET_DESCRIPTORS_PER_TYPE,
+                "{ty:?} must fit the largest admitted set without growing forever");
+        }
+    }
 
     fn pool(raw: u64) -> vk::DescriptorPool {
         vk::DescriptorPool::from_raw(raw)

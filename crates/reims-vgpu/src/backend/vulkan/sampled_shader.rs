@@ -424,7 +424,7 @@ pub(crate) fn specialize(
 
 #[cfg(test)]
 #[path = "sampled_shader/graphics_tests.rs"]
-mod graphics_tests;
+pub(crate) mod graphics_tests;
 
 #[cfg(test)]
 #[path = "sampled_shader/probe_tests.rs"]
@@ -732,7 +732,8 @@ mod tests {
                         sampled_images: vec![ComputeSampledImageResource {
                             binding: 32, array_element: 0, descriptor_count: 1,
                             format: image.engine_format(), width: image.width, height: image.height,
-                            mip_levels: 1, source: ComputeSampledSource::Bytes(image.bytes),
+                            mip_levels: 1,
+                            source: ComputeSampledSource::Bytes(std::sync::Arc::unwrap_or_clone(image.bytes)),
                         }],
                         samplers: vec![sampler], storage_images: vec![],
                     };

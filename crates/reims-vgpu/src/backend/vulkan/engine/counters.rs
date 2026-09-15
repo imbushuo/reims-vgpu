@@ -233,6 +233,11 @@ engine_counters! {
         /// handing the walking form an allocation it does not hold — which is a
         /// correctness-neutral regression that nothing else would report.
         shader_digest_hits,
+        /// Complete-or-unproven descriptor coverage built once per native module creation.
+        shader_descriptor_proofs,
+        serial_interlock_draws,
+        serial_interlock_primitives,
+        serial_interlock_unused_sampled_draws,
         layout_hits,
         layout_misses,
         pass_hits,
@@ -389,6 +394,9 @@ engine_counters! {
         /// what the copy names, which is what the CPU no longer moves.
         sampled_guest_imports,
         sampled_guest_import_bytes,
+        /// External host images refused because their initial contents cannot
+        /// be preserved by a legal Vulkan image birth/layout transition.
+        guest_image_initial_contents_refused,
         /// Why a `SampledSource::GuestRuns` bind moved bytes instead of binding
         /// a retained image, split at the only two things that can go wrong.
         ///

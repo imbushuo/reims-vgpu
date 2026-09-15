@@ -92,8 +92,9 @@ fn draw_once(
     });
     assert!(matches!(result.0, EncodeStatus::Ok), "pass admission: {:?}", result.0);
     assert_eq!(pixels.len(), 32 * 4);
+    engine::test_quiesce_ring();
     assert!(identities.iter().all(|identity| !engine::resident_content_ready(identity)),
-        "every completed single-request pass retires both native attachments");
+        "completed single-request cleanup retires both native attachments");
     pixels
 }
 

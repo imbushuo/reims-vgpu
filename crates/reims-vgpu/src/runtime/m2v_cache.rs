@@ -349,6 +349,11 @@ pub struct CachedShader {
 pub struct ShaderVariant {
     /// The module, in this variant's numbering.
     pub words: Arc<Vec<u32>>,
+    pub pixel_interlock: bool,
+    #[cfg(feature = "backend-vulkan")]
+    storage_offset: OnceLock<Arc<Vec<u32>>>,
+    #[cfg(feature = "backend-vulkan")]
+    storage_variants: Mutex<Vec<GraphicsStorageVariant>>,
     /// The typed sampler descriptors reflection declares, transformed into
     /// this variant's numbering. Constexpr state stays attached to its binding.
     ///
@@ -403,6 +408,11 @@ pub struct ShaderVariant {
 }
 
 impl ShaderVariant {
+    #[cfg(test)]
+    pub(crate) fn for_test(words: Arc<Vec<u32>>) -> Arc<Self> {
+        Self::of(words, Arc::from([]))
+    }
+
     fn of(
         words: Arc<Vec<u32>>,
         samplers: Arc<[crate::runtime::spirv_bind::ReflectedSamplerDescriptor]>,
@@ -415,10 +425,88 @@ impl ShaderVariant {
             .collect::<Vec<_>>()
             .into();
         Arc::new(Self {
+            pixel_interlock: crate::runtime::spirv_bind::requires_pixel_interlock(&words),
+            #[cfg(feature = "backend-vulkan")]
+            storage_offset: OnceLock::new(),
+            #[cfg(feature = "backend-vulkan")]
+            storage_variants: Mutex::new(Vec::new()),
             words,
             samplers,
             used_descriptor_bindings,
         })
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) struct GraphicsStorageVariantKey {
+    pub formats: Vec<(u32, crate::runtime::spirv_bind::ImageFormat)>,
+    pub normalized: Vec<u32>,
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Debug)]
+pub(crate) enum GraphicsStorageVariantError {
+    Format,
+    Rounding(String),
+}
+
+#[cfg(feature = "backend-vulkan")]
+struct GraphicsStorageVariant {
+    offset: bool,
+    key: GraphicsStorageVariantKey,
+    result: Result<Arc<Vec<u32>>, GraphicsStorageVariantError>,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl ShaderVariant {
+    pub(crate) fn storage_offset_words(&self) -> Arc<Vec<u32>> {
+        self.storage_offset.get_or_init(|| {
+            let mut words = (*self.words).clone();
+            crate::runtime::spirv_bind::offset_fragment_storage_bindings(&mut words);
+            Arc::new(words)
+        }).clone()
+    }
+
+    pub(crate) fn storage_words(
+        &self,
+        source: &Arc<Vec<u32>>,
+        mut key: GraphicsStorageVariantKey,
+    ) -> Result<Arc<Vec<u32>>, GraphicsStorageVariantError> {
+        key.formats.sort_unstable_by_key(|(binding, _)| *binding);
+        key.normalized.sort_unstable();
+        let build = || {
+            use metal2vulkan::texture_write_rounding::{
+                specialize_texture_write_rounding, TextureWriteFormat, TextureWriteTarget,
+            };
+            let mut words = (**source).clone();
+            if !key.formats.is_empty() {
+                crate::runtime::spirv_bind::specialize_image_formats(&mut words, &key.formats)
+                    .map_err(|_| GraphicsStorageVariantError::Format)?;
+            }
+            let targets: Vec<_> = key.normalized.iter().map(|&binding| TextureWriteTarget {
+                descriptor_set: 0, binding, format: TextureWriteFormat::Normalized,
+            }).collect();
+            specialize_texture_write_rounding(&words, NATIVE_TEXTURE_WRITE_ROUNDING, &targets)
+                .map(Arc::new).map_err(GraphicsStorageVariantError::Rounding)
+        };
+        let offset = self.storage_offset.get().is_some_and(|words| Arc::ptr_eq(words, source));
+        if !offset && !Arc::ptr_eq(&self.words, source) {
+            return build();
+        }
+        let mut variants = self.storage_variants.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(variant) = variants.iter().find(|variant|
+            variant.offset == offset && variant.key == key)
+        {
+            return variant.result.clone();
+        }
+        let result = build();
+        if variants.len() >= 32 {
+            crate::observe::off("storage_shader_variant_cache_reset entries=32");
+            variants.clear();
+        }
+        variants.push(GraphicsStorageVariant { offset, key, result: result.clone() });
+        result
     }
 }
 

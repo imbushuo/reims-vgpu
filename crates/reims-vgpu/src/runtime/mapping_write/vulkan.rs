@@ -287,8 +287,9 @@ fn plan_guest_window(
 /// # Errors
 ///
 /// Every decline is a routing answer: the caller still owes the frame and takes
-/// the copying rail. `Ok(())` means the pixels are in the guest's pages and the
-/// GPU has finished writing them.
+/// the copying rail. Success means the copy is queued and its byte extent is
+/// returned. The guest-write ledger retains its source through actual GPU
+/// completion; CPU readers and completion stamps must settle that ledger first.
 pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -662,7 +663,7 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
 /// What a landed mapper-ref-texture GPU write owes the rest of the device.
 ///
 /// Called once the copy is *issued*, not once it has completed, and by both
-/// rails that issue one — the render Store, which submits and waits, and the
+/// rails that issue one — the render Store, which submits without waiting, and the
 /// compute storage-image output, whose copy rides its dispatch's own command
 /// buffer and lands at the fence. Neither leaves a host copy of the frame, so
 /// nothing on the host may go on naming one, and that is true from the moment

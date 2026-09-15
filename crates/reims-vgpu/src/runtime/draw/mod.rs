@@ -505,6 +505,8 @@ pub struct ColorRtRequest {
     pub mapping_id: u32,
     /// Non-zero ⇒ normal-texture linear GVA target (mapping_id must be 0).
     pub target_gva: u64,
+    /// Resolved base-texture level, including any texture-view base.
+    pub guest_mip_level: u32,
     /// Bytes-per-row for GVA target (archive `bpr`).
     pub row_stride: u32,
     pub width: u32,
@@ -517,9 +519,35 @@ pub struct ColorRtRequest {
     pub store_action: u16,
     pub clear_color: [f64; 4],
     pub target_seed_rgba: Option<Vec<u8>>,
+    /// Exact attachment texels selected by the running rail. Mutually exclusive
+    /// with the legacy RGBA8 seed; later encoder records retain neither copy.
+    pub target_seed_native: Option<NativeColorSeed>,
     /// Multisample attachment discarded into this request's single-sample
     /// target at pass end. Zero for an ordinary colour attachment.
     pub multisample_source_ref: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeColorSeed {
+    pub layout: pixel_format::TexelLayout,
+    pub bytes: std::sync::Arc<Vec<u8>>,
+}
+
+pub enum ColorLoadSeed {
+    Rgba8(Vec<u8>),
+    Native(NativeColorSeed),
+}
+
+impl ColorRtRequest {
+    pub(crate) fn set_load_seed(&mut self, seed: Option<ColorLoadSeed>) {
+        self.target_seed_rgba = None;
+        self.target_seed_native = None;
+        match seed {
+            Some(ColorLoadSeed::Rgba8(bytes)) => self.target_seed_rgba = Some(bytes),
+            Some(ColorLoadSeed::Native(seed)) => self.target_seed_native = Some(seed),
+            None => {}
+        }
+    }
 }
 
 /// One `setVisibilityResultMode:offset:`, as the encoder state it is.
@@ -2282,6 +2310,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         row_stride: bpr,
         format: fmt,
         sample_count: _,
+        guest_mip_level: _,
     }) = lookup_render_target(state, host, task_id, *att)
     else {
         return lost("render_target_unresolved");
@@ -2509,6 +2538,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         texture_ref: color_texture_ref,
         mapping_id: rt.mapping_id,
         target_gva: rt.target_gva,
+        guest_mip_level: rt.guest_mip_level,
         row_stride: rt.row_stride,
         width: rt.width,
         height: rt.height,
@@ -2530,6 +2560,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
             [0.0; 4]
         },
         target_seed_rgba: None,
+        target_seed_native: None,
         multisample_source_ref: 0,
     };
     Some(DrawEncodeRequest {
@@ -2664,6 +2695,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             storage,
             mapping_id,
             target_gva: gva,
+            guest_mip_level,
             width: mw,
             height: mh,
             row_stride: bpr,
@@ -2737,6 +2769,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         let mut load_action = att.load_action;
         let mut clear_color = att.clear_color;
         let mut seed = None;
+        let mut native_seed = None;
         if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
             // Clear-only stream record for this attachment: real Metal Clear.
             load_action = MTL_LOAD_ACTION_CLEAR;
@@ -2914,8 +2947,17 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 let elided = elided && colors.is_empty();
                 gva_load_from_resident = elided;
                 if !elided {
-                    seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
-                    if seed.is_none() {
+                    match crate::backend::selected().gva_color_load_seed(
+                        state, host, task_id, GvaSpan {
+                            texture_ref: att.texture_ref, gva, row_stride: bpr,
+                            width: mw, height: mh, format: mfmt,
+                        }, guest_mip_level,
+                    ) {
+                        Some(ColorLoadSeed::Rgba8(bytes)) => seed = Some(bytes),
+                        Some(ColorLoadSeed::Native(bytes)) => native_seed = Some(bytes),
+                        None => {}
+                    }
+                    if seed.is_none() && native_seed.is_none() {
                         crate::observe::fail(format!(
                             "color LOAD seed miss ref={} {}x{} fmt={:#x} gva={:#x} (archive: still encode)",
                             att.texture_ref, mw, mh, mfmt, gva
@@ -2930,6 +2972,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             texture_ref: target_ref,
             mapping_id,
             target_gva: gva,
+            guest_mip_level,
             row_stride: bpr,
             width: mw,
             height: mh,
@@ -2939,6 +2982,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             store_action: att.store_action,
             clear_color,
             target_seed_rgba: seed,
+            target_seed_native: native_seed,
             multisample_source_ref,
         });
     }
@@ -3556,14 +3600,14 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
     true
 }
 
-/// Seed color RT LOAD from guest mapper-ref-texture (BGRA→RGBA) or normal-texture/view linear RGBA.
+/// Legacy RGBA8 color seed. Native Vulkan GVA loads use the typed backend seed.
 ///
 /// Every color RT is an ephemeral host RT now, so every `Load` needs this: the
 /// mapper-ref-texture guest-memory alias that let Metal Load read the surface bytes in
 /// place is deleted. This used to run only on the alias-reject fallback
 /// (unaligned offset or row stride, span out of range, no device), which is why
 /// it is already a complete path and not a new one.
-fn seed_color_load<M: HostMemory + HostOps>(
+pub(crate) fn seed_color_load<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,

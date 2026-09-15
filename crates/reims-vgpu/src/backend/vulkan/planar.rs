@@ -33,12 +33,12 @@ impl crate::observe::Refusal for Refusal {
     fn refusal(&self) -> Option<&'static str> { Some(self.slug()) }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Image {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) format: SampleFormat,
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) bytes: std::sync::Arc<Vec<u8>>,
 }
 
 impl Image {
@@ -111,6 +111,9 @@ impl Image {
                 }
             }
         }
-        Ok(Self { width: layout.width, height: layout.height, format: description.format, bytes })
+        Ok(Self {
+            width: layout.width, height: layout.height, format: description.format,
+            bytes: std::sync::Arc::new(bytes),
+        })
     }
 }

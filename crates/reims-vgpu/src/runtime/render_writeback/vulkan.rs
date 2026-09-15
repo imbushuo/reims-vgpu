@@ -21,6 +21,349 @@ use super::*;
 use crate::runtime::host::{HostMemory, HostOps};
 
 mod native;
+mod eager;
+pub(crate) use eager::NativeEagerStore;
+pub(crate) use native::required as requires_native_store;
+
+/// The mapped secondary's destination as it stood before draw submission.
+pub(crate) struct SecondaryMappingStore {
+    generation: u32,
+    entries: Vec<u32>,
+    window: crate::runtime::mapping_write::vulkan::MapperRefTextureSurfaceDestination,
+}
+
+impl SecondaryMappingStore {
+    pub(crate) fn capture(
+        state: &DeviceState,
+        color: &crate::runtime::draw::ColorRtRequest,
+    ) -> Option<Self> {
+        let mapping = state.mappings.get(&color.mapping_id)?;
+        if !mapping.mapped || mapping.page_entries.is_empty()
+            || mapping.width != color.width || mapping.height != color.height
+        {
+            return None;
+        }
+        let format = crate::runtime::mapping_write::mapping_store_format(mapping);
+        let (base_off, bpr, span_end) =
+            crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+                mapping, color.width, color.height, format,
+            )?;
+        Some(Self {
+            generation: mapping.map_generation,
+            entries: mapping.page_entries.clone(),
+            window: crate::runtime::mapping_write::vulkan::MapperRefTextureSurfaceDestination {
+                mapping_id: color.mapping_id, base_off, bpr, span_end,
+                width: color.width, height: color.height, format,
+            },
+        })
+    }
+
+    pub(crate) fn current(&self, state: &DeviceState) -> bool {
+        state.mappings.get(&self.window.mapping_id).is_some_and(|mapping| {
+            mapping.mapped && mapping.map_generation == self.generation
+                && mapping.page_entries == self.entries
+                && mapping.width == self.window.width && mapping.height == self.window.height
+                && crate::runtime::mapping_write::mapping_store_format(mapping) == self.window.format
+                && crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+                    mapping, self.window.width, self.window.height, self.window.format,
+                ) == Some((self.window.base_off, self.window.bpr, self.window.span_end))
+        })
+    }
+
+    pub(crate) fn publish<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        identity: &crate::backend::vulkan::engine::TargetIdentity,
+    ) -> bool {
+        use crate::runtime::mapping_write::vulkan::{
+            licence_mapper_ref_texture_surface, note_mapper_ref_texture_landed, GpuWritebackDecline,
+        };
+        let started = std::time::Instant::now();
+        let mapping_id = self.window.mapping_id;
+        let direct = licence_mapper_ref_texture_surface(
+            state, host, identity.resident_format(), &self.window,
+        ).and_then(|licence| {
+            // Licensing can resolve a replacement alias; it may not retarget
+            // a Store whose draw was authorized against the captured allocation.
+            if !self.current(state) {
+                return Err(GpuWritebackDecline::PagesNotOurs);
+            }
+            crate::backend::vulkan::engine::copy_target_to_guest_pages(
+                identity, &licence.target, &licence.gpas,
+            ).map_err(|inner| GpuWritebackDecline::Engine { inner })?;
+            note_mapper_ref_texture_landed(state, mapping_id, licence.base_off, licence.span_end);
+            Ok((licence.span_end - licence.base_off) as usize)
+        });
+        let bytes = match direct {
+            Ok(bytes) => bytes,
+            Err(refusal) => {
+                crate::observe::Emit::decline("mrt_mapping_copy_fallback", &refusal)
+                    .field("mapping", mapping_id).fail_once(u64::from(mapping_id));
+                let source = match crate::backend::vulkan::engine::read_target_native(identity) {
+                    Ok(source) => source,
+                    Err(refusal) => {
+                        crate::observe::Emit::decline("mrt_mapping_read_failed", &refusal)
+                            .field("mapping", mapping_id).fail();
+                        return false;
+                    }
+                };
+                if !self.land_native(state, host, &source) {
+                    return false;
+                }
+                source.pixels.len()
+            }
+        };
+        finish(state, mapping_id, identity, bytes, started, false);
+        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        true
+    }
+
+    fn land_native<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        source: &crate::backend::vulkan::engine::NativeTargetReadback,
+    ) -> bool {
+        use crate::runtime::mapping_write::vulkan::GpuWritebackDecline;
+        let mapping_id = self.window.mapping_id;
+        let result = if !crate::runtime::mapper::revalidate_mapping_pages(state, host, mapping_id)
+            || !self.current(state)
+        {
+            Err(GpuWritebackDecline::PagesNotOurs)
+        } else if (source.width, source.height) != (self.window.width, self.window.height) {
+            Err(GpuWritebackDecline::GeometryMoved {
+                latched_width: self.window.width, latched_height: self.window.height,
+                frame_width: source.width, frame_height: source.height,
+            })
+        } else {
+            let wanted = crate::backend::vulkan::translate::pixel::verbatim_texel(self.window.format);
+            match wanted {
+                Some((format, bpp))
+                    if crate::backend::vulkan::translate::pixel::stored_bytes_agree(source.format, format)
+                        && bpp == source.layout.bytes_per_texel() => Ok(bpp),
+                Some((want, _)) => Err(GpuWritebackDecline::ResidentFormatMismatch {
+                    held: source.format, want,
+                }),
+                None => Err(GpuWritebackDecline::FormatNeedsConversion { format: self.window.format }),
+            }
+        };
+        let bpp = match result {
+            Ok(bpp) => bpp,
+            Err(refusal) => {
+                crate::observe::Emit::decline("mrt_mapping_store_refused", &refusal)
+                    .field("mapping", mapping_id).fail();
+                return false;
+            }
+        };
+        crate::runtime::mapping_write::write_native_image(
+            state, host, mapping_id, &source.pixels, self.window.width * bpp,
+            self.window.width, self.window.height, self.window.format,
+        )
+    }
+}
+
+/// The imported attachment's Store, already owned by the engine transaction.
+pub(crate) struct SharedStorePublication {
+    pub recorded: bool,
+    pub footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
+}
+
+/// Publish a mapped attachment before returning to guest command completion.
+///
+/// A mapper-ref-texture names CPU-addressable IOSurface pages. Its decoded
+/// descriptor has no storage-mode field licensing a GPU-only Store, and Shared
+/// storage permits CPU access immediately after command completion without a
+/// separate synchronize command. Host-pointer import cannot change that rule.
+///
+/// Imported attachments publish their existing write; copied attachments must
+/// issue the transfer now. The GPU copy joins the render queue and its ledger
+/// delays guest completion, not submission. Without import, the native/byte
+/// readback fallback writes the pages before returning. Neither arm creates an
+/// unpaid resource debt that could overwrite a later guest CPU update.
+pub(crate) fn store_mapped_frame<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+    shared: Option<SharedStorePublication>,
+) -> bool {
+    store_mapped_frame_with(
+        state,
+        host,
+        shared,
+        |state, shared| {
+            match store_guest_backed_frame(
+                state, mapping_id, identity, width, height, shared.recorded, shared.footprint,
+            ) {
+                Ok(()) => true,
+                Err(decline) => {
+                    crate::observe::Emit::decline("target_store_shared_declined", &decline)
+                        .field("mapping", mapping_id)
+                        .field("geom", format!("{width}x{height}"))
+                        .fail_once(u64::from(mapping_id));
+                    crate::runtime::drain::note_store_route("target_store_shared_declined");
+                    false
+                }
+            }
+        },
+        |state, host| {
+            let stored = store_render_frame(state, host, mapping_id, identity, width, height);
+            if stored {
+                crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+            }
+            stored
+        },
+    )
+}
+
+fn store_mapped_frame_with<M>(
+    state: &mut DeviceState,
+    host: &mut M,
+    shared: Option<SharedStorePublication>,
+    publish_shared: impl FnOnce(&mut DeviceState, SharedStorePublication) -> bool,
+    transfer: impl FnOnce(&mut DeviceState, &mut M) -> bool,
+) -> bool {
+    if shared.is_some_and(|shared| publish_shared(state, shared)) {
+        true
+    } else {
+        transfer(state, host)
+    }
+}
+
+#[cfg(test)]
+mod mapped_store_publication_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
+    use crate::runtime::host::FakeHost;
+
+    const MAPPING: u32 = 4;
+    const WIDTH: u32 = 16;
+    const HEIGHT: u32 = 8;
+    const PFN: u32 = 0x40;
+
+    fn fixture(page_shift: u32, format: u16) -> (DeviceState, FakeHost, u64, u32) {
+        let mut state = DeviceState::new(DeviceId(1), page_shift);
+        let mut host = FakeHost::new();
+        host.map_range(u64::from(PFN) << page_shift, 1usize << page_shift, 0);
+        state.map_surface(MAPPING);
+        state.attach_mapping_internal(MAPPING, 0);
+        let mapping = state.mappings.get_mut(&MAPPING).unwrap();
+        mapping.mapping_internal = 1;
+        mapping.page_entries = vec![(PFN << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        assert!(state.set_mapping_geom(MAPPING, WIDTH, HEIGHT, format));
+        let (base, pitch, _) = crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+            &state.mappings[&MAPPING], WIDTH, HEIGHT, format,
+        ).unwrap();
+        (state, host, (u64::from(PFN) << page_shift) + base, pitch)
+    }
+
+    fn assert_rows(host: &FakeHost, base: u64, pitch: u32, pixel: &[u8]) {
+        let row = pixel.repeat(WIDTH as usize);
+        let mut actual = vec![0; row.len()];
+        for y in 0..HEIGHT {
+            host.read_gpa(base + u64::from(y * pitch), &mut actual).unwrap();
+            assert_eq!(actual, row, "row {y} must hold the completed Store");
+        }
+    }
+
+    #[test]
+    fn copied_mapped_store_publishes_bytes_before_success_without_resource_debt() {
+        for page_shift in [PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+            let (mut state, mut host, base, pitch) = fixture(page_shift, MTL_FORMAT_BGRA8_UNORM);
+            assert_rows(&host, base, pitch, &[0; 4]);
+            for red in 0..=255u8 {
+                let pixel = [red.wrapping_mul(13), 255 - red, red, 255];
+                let frame = pixel.repeat((WIDTH * HEIGHT) as usize);
+                assert!(store_mapped_frame_with(
+                    &mut state,
+                    &mut host,
+                    None,
+                    |_, _| panic!("a copied allocation cannot publish an imported attachment"),
+                    |state, host| crate::runtime::mapping_write::write_bgra8(
+                        state, host, MAPPING, &frame, WIDTH * 4, WIDTH, HEIGHT,
+                    ),
+                ));
+                assert_rows(&host, base, pitch, &pixel);
+                assert!(
+                    state.pending_writebacks.get(MAPPING).is_none(),
+                    "success cannot mean a transfer postponed until a later CPU access"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completed_mapped_store_cannot_overwrite_a_later_cpu_update() {
+        for (format, old, update) in [
+            (MTL_FORMAT_BGRA8_UNORM, vec![191, 128, 64, 255], vec![0, 255, 0, 255]),
+            (
+                MTL_FORMAT_RGBA16_FLOAT,
+                vec![0x00, 0x34, 0x00, 0x38, 0x00, 0x3a, 0x00, 0x3c],
+                vec![0x00, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x3c],
+            ),
+        ] {
+            let (mut state, mut host, base, pitch) = fixture(PAGE_SHIFT_ARM64E, format);
+            let frame = old.repeat((WIDTH * HEIGHT) as usize);
+            assert!(store_mapped_frame_with(
+                &mut state,
+                &mut host,
+                None,
+                |_, _| panic!("copy-backed Store"),
+                |state, host| crate::runtime::mapping_write::write_native_image(
+                    state, host, MAPPING, &frame, WIDTH * old.len() as u32, WIDTH, HEIGHT, format,
+                ),
+            ));
+            assert_rows(&host, base, pitch, &old);
+            let row = update.repeat(WIDTH as usize);
+            for y in 0..HEIGHT {
+                host.write_gpa(base + u64::from(y * pitch), &row).unwrap();
+            }
+            assert!(state.pending_writebacks.get(MAPPING).is_none());
+            crate::runtime::writeback_debt::pay_for_mapping(&mut state, &mut host, MAPPING);
+            assert_rows(&host, base, pitch, &update);
+        }
+    }
+
+    #[test]
+    fn imported_mapped_store_publication_avoids_an_unneeded_copy() {
+        let (mut state, mut host, _, _) = fixture(PAGE_SHIFT_X86, MTL_FORMAT_BGRA8_UNORM);
+        assert!(store_mapped_frame_with(
+            &mut state,
+            &mut host,
+            Some(SharedStorePublication { recorded: true, footprint: None }),
+            |_, publication| publication.recorded,
+            |_, _| panic!("the imported attachment already owns its submitted Store"),
+        ));
+        assert!(state.pending_writebacks.is_empty());
+    }
+
+    #[test]
+    fn refused_mapped_store_publication_requires_a_real_transfer() {
+        let (mut state, mut host, base, pitch) = fixture(PAGE_SHIFT_X86, MTL_FORMAT_BGRA8_UNORM);
+        let pixel = [0, 255, 0, 255];
+        let frame = pixel.repeat((WIDTH * HEIGHT) as usize);
+        assert!(store_mapped_frame_with(
+            &mut state,
+            &mut host,
+            Some(SharedStorePublication { recorded: false, footprint: None }),
+            |_, _| false,
+            |state, host| crate::runtime::mapping_write::write_bgra8(
+                state, host, MAPPING, &frame, WIDTH * 4, WIDTH, HEIGHT,
+            ),
+        ));
+        assert_rows(&host, base, pitch, &pixel);
+        assert!(!store_mapped_frame_with(
+            &mut state, &mut host, None,
+            |_, _| panic!("copy-backed Store"),
+            |_, _| false,
+        ), "a refused transfer must not report completion");
+    }
+}
 
 /// Merge native storage without converting either the GPU's texels or the
 /// bytes the guest owns. Canonical scanout retains its existing merging rail.
@@ -50,9 +393,11 @@ pub(crate) fn merge_native_surface<M: HostMemory + HostOps>(
 
 /// Copy `identity`'s pixels into `mapping_id`'s guest pages.
 ///
-/// `true` when the guest's pages hold the frame. `false` is a real loss and is
-/// reported on the failure channel by the arm that refused — the caller has no
-/// second copy to fall back to, because this rail never made one.
+/// `true` when the frame was copied or queued into the guest's pages. Queued GPU
+/// writes remain in the guest-write ledger until a CPU reader or completion
+/// stamp settles them. `false` is a real loss and is reported on the failure
+/// channel by the arm that refused — the caller has no second copy to fall back
+/// to, because this rail never made one.
 pub fn store_render_frame<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -388,6 +733,10 @@ pub enum GvaWritebackDecline {
     /// [`crate::runtime::draw::StoreTargetPages::ordered_complete`] states what
     /// a short list would land.
     SpanIncomplete,
+    DestinationRetired,
+    DestinationBackingUnknown,
+    DestinationBackingChanged,
+    DestinationPagesChanged,
     /// The destination span did not become a guest-RAM reference; the inner
     /// refusal names the check, restated here for the reason
     /// `GpuWritebackDecline::GuestRefRefused` restates its own.
@@ -419,6 +768,10 @@ impl crate::observe::Decline for GvaWritebackDecline {
             Self::OffsetNotTexelAligned { .. } => "gvawb_offset_not_texel_aligned",
             Self::Unlicensed => "gvawb_unlicensed",
             Self::SpanIncomplete => "gvawb_span_incomplete",
+            Self::DestinationRetired => "gvawb_destination_retired",
+            Self::DestinationBackingUnknown => "gvawb_destination_backing_unknown",
+            Self::DestinationBackingChanged => "gvawb_destination_backing_changed",
+            Self::DestinationPagesChanged => "gvawb_destination_pages_changed",
             Self::GuestRefRefused { .. } => "gvawb_guest_ref_refused",
             Self::Engine { inner } => crate::observe::Decline::slug(inner),
             Self::CopiedReadRefused { .. } => "gvawb_copied_read_refused",
@@ -428,7 +781,9 @@ impl crate::observe::Decline for GvaWritebackDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::Unlicensed | Self::SpanIncomplete => Vec::new(),
+            Self::Unlicensed | Self::SpanIncomplete | Self::DestinationRetired
+            | Self::DestinationBackingUnknown | Self::DestinationBackingChanged
+            | Self::DestinationPagesChanged => Vec::new(),
             Self::FormatNeedsConversion { format } => vec![("fmt", format!("{format:#x}"))],
             Self::ResidentFormatMismatch { held, want } => vec![
                 ("resident", format!("{held:?}")),
@@ -487,9 +842,11 @@ crate::observe::decline::decline_display!(GvaWritebackDecline);
 ///
 /// A mapping carries its own page list and a page-table vouch licenses it; a
 /// GVA carries neither, so the licence is the exact page list supplied in
-/// `pages`, which **neither** arm may widen. The eager fallback captures it
-/// before draw submission; deferred payment gets it from the live resource's
-/// transfer backing. `pages == None` is therefore still `Unlicensed` on both
+/// `pages`, which **neither** arm may widen. Deferred payment gets it from the
+/// live resource's transfer backing. A pre-render GVA walk alone does not
+/// license GPU-direct publication: eager primary Stores use [`NativeEagerStore`]
+/// and its synchronous, freshly resolved destination instead.
+/// `pages == None` is therefore still `Unlicensed` on both
 /// arms: there is no authorisation to write anywhere, and a copy is not a
 /// second opinion about that.
 /// # What `skip` is
@@ -552,6 +909,16 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     let Some(pages) = pages else {
         return Err(GvaWritebackDecline::Unlicensed);
     };
+    if native::required(c0.format) {
+        let source = crate::backend::vulkan::engine::read_target_native(identity)
+            .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?;
+        let extent = land_native_gva_frame(
+            state, host, task_id, c0, texture_ref, &source, pages, skip,
+        )?;
+        crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+        crate::runtime::drain::note_store_route("gva_flush_copied_native");
+        return Ok(extent);
+    }
     // The blocking readback the direct arm exists to avoid. `into_rgba8` is the
     // order every GVA guest writer takes, and it exchanges or not according to
     // the order the engine reports for the image it copied — which for a target
@@ -659,6 +1026,123 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
     .map_err(|err| GvaWritebackDecline::CopiedWriteRefused { err })?;
     crate::runtime::surface_cache::forget_gva_copies(state, task_id, c0.target_gva, texture_ref);
     Ok(extent)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn land_native_gva_frame<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    color: &crate::runtime::draw::ColorRtRequest,
+    texture_ref: u32,
+    source: &crate::backend::vulkan::engine::NativeTargetReadback,
+    pages: &crate::runtime::draw::StoreTargetPages,
+    skip: crate::runtime::mapping_write::SkipRanges<'_>,
+) -> Result<u64, GvaWritebackDecline> {
+    let (want, _) = crate::backend::vulkan::translate::pixel::verbatim_texel(color.format)
+        .ok_or(GvaWritebackDecline::FormatNeedsConversion { format: color.format })?;
+    if !crate::backend::vulkan::translate::pixel::stored_bytes_agree(source.format, want) {
+        return Err(GvaWritebackDecline::ResidentFormatMismatch { held: source.format, want });
+    }
+    if (source.width, source.height) != (color.width, color.height) {
+        return Err(GvaWritebackDecline::Engine {
+            inner: crate::backend::vulkan::engine::DrawError::GuestPageWrite(
+                crate::backend::vulkan::engine::GuestWriteDecline::GeometryMoved {
+                    resident_width: source.width, resident_height: source.height,
+                    want_width: color.width, want_height: color.height,
+                },
+            ),
+        });
+    }
+    land_gva_frame_bytes(
+        state, host, task_id, color, texture_ref,
+        crate::runtime::draw::FrameRows::Native(&source.pixels), pages, skip,
+    )
+}
+
+#[cfg(test)]
+mod secondary_native_store_tests {
+    use super::*;
+    use crate::backend::vulkan::engine::NativeTargetReadback;
+    use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::{TexelLayout, MTL_FORMAT_RGBA16_FLOAT};
+    use crate::runtime::draw::{ColorRtRequest, StoreTargetPages};
+    use crate::runtime::gva_mem::{define_task_pages_arm64e, read_task_gva, write_task_gva_arm64e};
+    use crate::runtime::host::FakeHost;
+
+    const PAGE: u64 = 1 << PAGE_SHIFT_ARM64E;
+
+    fn source() -> NativeTargetReadback {
+        let words: [u16; 8] = [0xbc00, 0x4000, 0x3555, 0x3c00, 0x8000, 0x7bff, 0x0400, 0x3a00];
+        let row: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        NativeTargetReadback {
+            pixels: row.repeat(2), layout: TexelLayout::Rgba16Float,
+            format: ash::vk::Format::R16G16B16A16_SFLOAT, width: 2, height: 2,
+        }
+    }
+
+    #[test]
+    fn secondary_gva_native_store_preserves_half_bits_padding_and_page_authority() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], PAGE, &[0xee; 48]);
+        let color = ColorRtRequest {
+            slot: 1, texture_ref: 7, target_gva: PAGE, width: 2, height: 2,
+            row_stride: 24, format: MTL_FORMAT_RGBA16_FLOAT, ..Default::default()
+        };
+        let source = source();
+        let denied = StoreTargetPages::from_ordered(&[6 * PAGE], 48);
+        assert!(land_native_gva_frame(
+            &mut state, &mut host, 1, &color, 7, &source, &denied, &[],
+        ).is_err());
+        let mut actual = [0; 48];
+        read_task_gva(&host, &state.tasks[1], PAGE, &mut actual, PAGE_SHIFT_ARM64E).unwrap();
+        assert_eq!(actual, [0xee; 48]);
+        let pages = StoreTargetPages::from_ordered(&[5 * PAGE], 48);
+        assert_eq!(land_native_gva_frame(
+            &mut state, &mut host, 1, &color, 7, &source, &pages, &[],
+        ).unwrap(), 40);
+        read_task_gva(&host, &state.tasks[1], PAGE, &mut actual, PAGE_SHIFT_ARM64E).unwrap();
+        assert_eq!(&actual[..16], &source.pixels[..16]);
+        assert_eq!(&actual[24..40], &source.pixels[16..]);
+        assert_eq!(&actual[16..24], &[0xee; 8]);
+        assert_eq!(&actual[40..], &[0xee; 8]);
+    }
+
+    #[test]
+    fn secondary_mapping_native_store_preserves_half_bits_and_refuses_replacement() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let gpa = 0x30 * PAGE;
+        host.map_range(gpa, PAGE as usize, 0xee);
+        state.map_surface(42);
+        state.attach_mapping_internal(42, 0);
+        let mapping = state.mappings.get_mut(&42).unwrap();
+        mapping.mapping_internal = 1;
+        mapping.page_entries = vec![(0x30 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        assert!(state.set_mapping_geom(42, 2, 2, MTL_FORMAT_RGBA16_FLOAT));
+        let color = ColorRtRequest {
+            slot: 1, texture_ref: 8, mapping_id: 42, width: 2, height: 2,
+            format: MTL_FORMAT_RGBA16_FLOAT, ..Default::default()
+        };
+        let destination = SecondaryMappingStore::capture(&state, &color).unwrap();
+        let source = source();
+        assert!(destination.land_native(&mut state, &mut host, &source));
+        let mut actual = vec![0; destination.window.span_end as usize];
+        host.read_gpa(gpa, &mut actual).unwrap();
+        let mut expected = vec![0xee; actual.len()];
+        for y in 0..2 {
+            let at = destination.window.base_off as usize + y * destination.window.bpr as usize;
+            expected[at..at + 16].copy_from_slice(&source.pixels[y * 16..y * 16 + 16]);
+        }
+        assert_eq!(actual, expected);
+        DeviceState::bump_map_generation(state.mappings.get_mut(&42).unwrap());
+        assert!(!destination.land_native(&mut state, &mut host, &source));
+        host.read_gpa(gpa, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
 }
 
 /// Copy `identity`'s pixels into the guest pages behind a normal-texture render

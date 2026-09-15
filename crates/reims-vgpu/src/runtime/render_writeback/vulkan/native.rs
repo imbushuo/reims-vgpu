@@ -4,7 +4,7 @@ use crate::backend::vulkan::{engine::NativeTargetReadback, translate::pixel};
 use crate::model::DeviceState;
 use crate::runtime::{host::{HostMemory, HostOps}, mapping_write};
 
-pub(super) fn required(format: u16) -> bool {
+pub(crate) fn required(format: u16) -> bool {
     pixel::verbatim_texel(format)
         .and_then(|(format, _)| pixel::texel_layout_of(format))
         .is_some_and(|layout| !layout.is_four_byte_color())

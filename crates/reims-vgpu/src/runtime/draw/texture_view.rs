@@ -610,6 +610,9 @@ pub(crate) enum LinearLoadRefusal {
     /// One padded row did not resolve in the task's page table. `row` is the
     /// first that failed, which says whether the allocation is partly mapped.
     PaddedRowUnreadable { row: u32 },
+    NativeSeedGeometry { width: u32, height: u32, planes: u32, expected_width: u32, expected_height: u32 },
+    NativeSeedLayout { source: u16, expected: TexelLayout },
+    NativeSeedAddress { source: u64, expected: u64, stride: u64, expected_stride: u64 },
     /// The format has a bytes-per-pixel but no row conversion to RGBA8.
     RowConvertUnsupported { format: u16 },
     /// Two faces of one cube texture read back in different layouts.
@@ -645,6 +648,9 @@ impl crate::observe::Decline for LinearLoadRefusal {
             Self::SpanExceedsAllocation { .. } => "linear_load_span_exceeds_alloc",
             Self::TightImageUnreadable => "linear_load_tight_image_unreadable",
             Self::PaddedRowUnreadable { .. } => "linear_load_padded_row_unreadable",
+            Self::NativeSeedGeometry { .. } => "linear_load_native_seed_geometry",
+            Self::NativeSeedLayout { .. } => "linear_load_native_seed_layout",
+            Self::NativeSeedAddress { .. } => "linear_load_native_seed_address",
             Self::RowConvertUnsupported { .. } => "linear_load_row_convert_unsupported",
             #[cfg(feature = "backend-vulkan")]
             Self::CubeFaceLayoutMismatch { .. } => "linear_load_cube_face_layout_mismatch",
@@ -670,6 +676,17 @@ impl crate::observe::Decline for LinearLoadRefusal {
                 vec![("end", end.to_string()), ("alloc", allocation.to_string())]
             }
             Self::PaddedRowUnreadable { row } => vec![("row", row.to_string())],
+            Self::NativeSeedGeometry { width, height, planes, expected_width, expected_height } => vec![
+                ("source", format!("{width}x{height}x{planes}")),
+                ("expected", format!("{expected_width}x{expected_height}")),
+            ],
+            Self::NativeSeedLayout { source, expected } => vec![
+                ("source", format!("{source:#x}")), ("expected", format!("{expected:?}")),
+            ],
+            Self::NativeSeedAddress { source, expected, stride, expected_stride } => vec![
+                ("source", format!("{source:#x}")), ("expected", format!("{expected:#x}")),
+                ("stride", stride.to_string()), ("expected_stride", expected_stride.to_string()),
+            ],
             #[cfg(feature = "backend-vulkan")]
             Self::CubeFaceLayoutMismatch { face } => vec![("face", face.to_string())],
             _ => Vec::new(),
@@ -709,8 +726,35 @@ pub(crate) fn load_linear_texture_host<M: HostMemory + HostOps>(
         format_override,
         native,
         site,
+        None,
     )
     .ok()
+}
+
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn load_linear_color_native<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    level: u32,
+    format_override: Option<u16>,
+    expected: (TexelLayout, u32, u32, u64, u64),
+) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal> {
+    load_linear_texture_impl(state, host, task_id, texture_ref, level, 0, format_override,
+        NativeUploads::NONE, crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
+        Some(expected))
+}
+
+pub(crate) fn native_color_layout(format: u16) -> Option<TexelLayout> {
+    pixel_format::store_texel_order(format).or_else(|| {
+        Some(match pixel_format::sampled_class(format)? {
+            pixel_format::SampledClass::R16Float => TexelLayout::R16Float,
+            pixel_format::SampledClass::Rg16Float => TexelLayout::Rg16Float,
+            pixel_format::SampledClass::Rgba32Float => TexelLayout::Rgba32Float,
+            _ => return None,
+        })
+    })
 }
 
 /// Load all six faces of a cube texture, tightly packed face after face — the
@@ -747,7 +791,7 @@ pub(crate) fn load_cube_faces<M: HostMemory + HostOps>(
     // before the loop, which is what lets the six faces pack with one
     // allocation and leaves no "no face was read" case to invent a refusal for.
     let (first_bytes, format) =
-        load_linear_texture_impl(state, host, task_id, texture_ref, 0, 0, None, native, site)?;
+        load_linear_texture_impl(state, host, task_id, texture_ref, 0, 0, None, native, site, None)?;
     let mut packed: Vec<u8> = Vec::with_capacity(first_bytes.len() * CUBE_FACES as usize);
     packed.extend_from_slice(&first_bytes);
     drop(first_bytes);
@@ -762,6 +806,7 @@ pub(crate) fn load_cube_faces<M: HostMemory + HostOps>(
             None,
             native,
             site,
+            None,
         )?;
         // One descriptor, one format — a disagreement here is this loader's own
         // bug, not the guest's, so it is a named refusal rather than a debug
@@ -778,10 +823,11 @@ pub(crate) fn load_cube_faces<M: HostMemory + HostOps>(
 ///
 /// A loader that hands back the guest's own bytes hands back a layout whose
 /// bytes-per-texel need not be four, and not every caller can take one: the
-/// colour-LOAD seed rail discards the layout entirely and reads the bytes as
-/// RGBA8, so it must be able to say it takes none of them. That is what
+/// legacy colour-LOAD seed rail discards the layout and reads bytes as RGBA8,
+/// so it must be able to say it takes none of them. That is what
 /// [`Self::NONE`] is for, and it is why this is a parameter rather than a fact
 /// this module could work out for itself.
+/// Exact native attachment loads use a separate checked layout requirement.
 ///
 /// Two independent questions decide each field, and both belong to the caller:
 /// whether it can carry the layout at all, and whether this host can sample and
@@ -976,6 +1022,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     format_override: Option<u16>,
     native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
+    exact_color: Option<(TexelLayout, u32, u32, u64, u64)>,
 ) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal> {
     use LinearLoadRefusal as R;
     let (_entry, desc_bytes) = objects::resolve_descriptor(
@@ -1008,6 +1055,14 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     let h = layout.height;
     let planes = layout.planes();
     let bpr = layout.row_stride;
+    if let Some((expected, expected_width, expected_height, _, _)) = exact_color {
+        if w != expected_width || h != expected_height || planes != 1 {
+            return Err(R::NativeSeedGeometry { width: w, height: h, planes, expected_width, expected_height });
+        }
+        if native_color_layout(sample_fmt) != Some(expected) {
+            return Err(R::NativeSeedLayout { source: sample_fmt, expected });
+        }
+    }
     if bpr > u32::MAX as u64 {
         return Err(R::SizeOverflow);
     }
@@ -1050,6 +1105,11 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             .ok_or(R::SizeOverflow)?
     };
     let gva = gva.checked_add(face_off).ok_or(R::SizeOverflow)?;
+    if let Some((_, _, _, expected, expected_stride)) = exact_color {
+        if gva != expected || bpr != expected_stride {
+            return Err(R::NativeSeedAddress { source: gva, expected, stride: bpr, expected_stride });
+        }
+    }
     let span = layout
         .slice_read_span_rows(storage_rows, tight)
         .ok_or(R::SizeOverflow)?;
@@ -1079,6 +1139,33 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         span,
         site,
     );
+    if let Some(fmt) = exact_color.map(|(layout, ..)| layout)
+        .or_else(|| linear_native_upload_format(sample_fmt, native))
+        .filter(|fmt| fmt.tight_row_bytes(w) == Some(tight))
+    {
+        let row_bytes = tight as usize;
+        let rows = (fmt.tight_row_count(h) as usize)
+            .checked_mul(planes as usize).ok_or(R::SizeOverflow)?;
+        let out_len = u64::from(tight).checked_mul(rows as u64)
+            .and_then(host_alloc_len).ok_or(R::SizeOverflow)?;
+        let mut bytes = vec![0u8; out_len];
+        if bpr_u32 == tight {
+            gva_mem::read_task_gva_by_id(host, &state.tasks, task_id, gva, &mut bytes, state.page_shift)
+                .map_err(|_| R::TightImageUnreadable)?;
+        } else {
+            for row in 0..rows {
+                let address = (row as u64).checked_mul(bpr)
+                    .and_then(|offset| gva.checked_add(offset)).ok_or(R::SizeOverflow)?;
+                gva_mem::read_task_gva_by_id(host, &state.tasks, task_id, address,
+                    &mut bytes[row * row_bytes..(row + 1) * row_bytes], state.page_shift)
+                    .map_err(|_| R::PaddedRowUnreadable { row: u32::try_from(row).unwrap_or(u32::MAX) })?;
+            }
+        }
+        return Ok((bytes, SampledByteFormat::from_source(fmt, sample_fmt)));
+    }
+    if let Some((expected, ..)) = exact_color {
+        return Err(R::NativeSeedLayout { source: sample_fmt, expected });
+    }
     // Tight display textures are the common compositor source. Read the whole
     // image with one task-root/cache lifetime: the row loop below otherwise
     // rebuilds the GVA walker cache once per row (1,080 times for the live
@@ -1111,38 +1198,6 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // `need_rgba` is the RGBA8 figure. The tight-row check is the same
     // agreement one step earlier — a source row that is not exactly one tight
     // row of the upload layout cannot be copied straight through.
-    if let Some(fmt) = linear_native_upload_format(sample_fmt, native)
-        .filter(|fmt| fmt.tight_row_bytes(w) == Some(tight))
-    {
-        let row_bytes = tight as usize;
-        let rows = (fmt.tight_row_count(h) as usize)
-            .checked_mul(planes as usize)
-            .ok_or(R::SizeOverflow)?;
-        let out_len = row_bytes.checked_mul(rows).ok_or(R::SizeOverflow)?;
-        let mut rgba = vec![0u8; out_len];
-        for row_index in 0..rows {
-            let row_gva = (row_index as u64)
-                .checked_mul(bpr)
-                .and_then(|off| gva.checked_add(off))
-                .ok_or(R::SizeOverflow)?;
-            let dst_off = row_index.checked_mul(row_bytes).ok_or(R::SizeOverflow)?;
-            let dst = rgba
-                .get_mut(dst_off..dst_off + row_bytes)
-                .ok_or(R::SizeOverflow)?;
-            gva_mem::read_task_gva_by_id(
-                host,
-                &state.tasks,
-                task_id,
-                row_gva,
-                dst,
-                state.page_shift,
-            )
-            .map_err(|_| R::PaddedRowUnreadable {
-                row: u32::try_from(row_index).unwrap_or(u32::MAX),
-            })?;
-        }
-        return Ok((rgba, SampledByteFormat::from_source(fmt, sample_fmt)));
-    }
     // The ordinal is parsed once, above the row loop, and the parse *is* the
     // format refusal — a format with no CPU arm declines here rather than after
     // the allocation and the first guest read. See `pixel_format::RowToRgba8`.

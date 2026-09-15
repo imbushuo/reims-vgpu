@@ -332,6 +332,8 @@ impl ResourcePools {
             graveyard: Vec::new(),
             target_free: FreePool::new(TARGET_FREE_CAP_PER_KEY, TARGET_FREE_CAP_TOTAL),
             open_batch: None,
+            resident_journal: None,
+            released_resident_allocations: Vec::new(),
             batch_max_draws: BATCH_MAX_DRAWS,
             last_pass: None,
             open_pass: None,
@@ -526,7 +528,9 @@ impl ResourcePools {
     fn dead_guest_sampled_keys(&self, max: usize) -> Vec<GuestSampledKey> {
         self.guest_sampled
             .iter()
-            .filter_map(|(key, slot)| (!slot.owner.is_live()).then_some(key.clone()))
+            .filter_map(|(key, slot)| {
+                (!slot.owner.is_live() || slot._import.is_retired()).then_some(key.clone())
+            })
             .take(max)
             .collect()
     }
@@ -603,6 +607,7 @@ impl ResourcePools {
         counters: &EngineCounters,
         now_ms: u64,
     ) {
+        self.retire_ready_residents(ctx, counters);
         if !self.plan_idle_maintenance(now_ms) {
             return;
         }
@@ -1520,7 +1525,7 @@ impl ResourcePools {
         // Its fence has signalled, so this submission is no longer a candidate
         // for a wedge. Paired with the `note_submit` in `finish_entry_async`.
         crate::runtime::gpu_hang_trail::note_retired(index);
-        self.drain_cleanup(&ctx.device, pending);
+        self.drain_cleanup(ctx, counters, pending);
         self.release_graveyard(&ctx.device, 1 << index);
         Ok(())
     }
@@ -1661,6 +1666,7 @@ impl ResourcePools {
                 attachment_snapshots: std::mem::take(&mut self.attachment_snapshot_live),
                 storage_images: std::mem::take(&mut self.storage_image_live),
                 unpin_residents: std::mem::take(&mut self.guest_write_pins_live),
+                batch_attachment_pins: Vec::new(),
                 unpin_compute_residents: std::mem::take(&mut self.compute_write_pins_live),
             },
             admissions,
@@ -1825,13 +1831,14 @@ impl ResourcePools {
     /// amortizing the per-draw submit+fence cost N-fold.
     ///
     /// `narrow_to_target` is [`crate::config::BATCH_MIXED_TARGETS`] switched off.
-    /// The default is that the batch's own target does not decide this: a draw
+    /// Single-color batches may mix targets by default: a draw
     /// from another Metal encoder closes any retained pass before beginning its
     /// own, while the flush itself reads only the CB, fence, and accumulated
     /// descriptor sets. The readback rail likewise appends a copy of *some
     /// other* target's image to whatever batch is recording. Passing the
     /// parameter rather than reading the environment here keeps this function
-    /// pure and testable.
+    /// pure and testable. MRT batches always require the same complete live
+    /// attachment set, including view formats, extents, depth and render area.
     pub(crate) fn batch_fit(&self, target: &BatchTarget, narrow_to_target: bool) -> BatchFit {
         let Some(b) = self.open_batch.as_ref() else {
             return BatchFit::None;
@@ -1839,8 +1846,18 @@ impl ResourcePools {
         if b.draws >= self.batch_max_draws {
             return BatchFit::Full;
         }
-        if narrow_to_target && b.target != *target {
+        if (narrow_to_target || b.target.is_mrt() || target.is_mrt()) && b.target != *target {
             return BatchFit::OtherTarget;
+        }
+        if b.target.is_mrt() && (
+            b.target.identities().any(|identity| {
+                self.registry.get(identity)
+                    .is_none_or(|slot| slot.resource_released || !slot.content_ready)
+            }) || b.attachment_pins.iter().any(|pin| {
+                self.registry.get(&pin.identity).is_none_or(|slot| slot.image != pin.image)
+            })
+        ) {
+            return BatchFit::RetiredAttachment;
         }
         BatchFit::Open(b.cb, b.fence)
     }
@@ -1994,8 +2011,51 @@ impl ResourcePools {
     }
 
     pub(super) fn discard_open_batch(&mut self) {
-        self.open_batch = None;
+        if let Some(batch) = self.open_batch.take() {
+            self.release_batch_attachment_pins(batch.attachment_pins);
+        }
         super::super::publish_batch_open(false);
+    }
+
+    fn retain_batch_attachments(&mut self, target: &BatchTarget) -> Result<Vec<ResidentAllocationRef>, DrawError> {
+        let mut pins = Vec::new();
+        if target.is_mrt() {
+            for identity in target.identities() {
+                if pins.iter().any(|pin: &ResidentAllocationRef| &pin.identity == identity) { continue; }
+                if !self.pin_resident_target(identity, true) {
+                    self.release_batch_attachment_pins(pins);
+                    return Err(DrawError::DrawExecution(
+                        super::super::draw_execution::DrawExecutionDecline::BatchAttachmentNotRetainable {
+                            identity: identity.clone(),
+                        },
+                    ));
+                }
+                pins.push(ResidentAllocationRef {
+                    identity: identity.clone(),
+                    image: self.registry[identity].image,
+                });
+            }
+        }
+        Ok(pins)
+    }
+
+    fn release_batch_attachment_pins(&mut self, pins: Vec<ResidentAllocationRef>) {
+        for pin in pins {
+            if self.registry.get(&pin.identity).is_some_and(|slot| slot.image == pin.image) {
+                self.pin_resident_target(&pin.identity, false);
+            }
+        }
+    }
+
+    fn seal_batch_entry(&mut self, batch: &mut OpenBatch) -> SealedEntry {
+        let mut sealed = self.seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
+        sealed.cleanup.batch_attachment_pins.append(&mut batch.attachment_pins);
+        sealed
+    }
+
+    fn reject_recorded_batch(&mut self, batch: &mut OpenBatch) {
+        self.restore_batch_residents(std::mem::take(&mut batch.resident_states));
+        self.release_batch_attachment_pins(std::mem::take(&mut batch.attachment_pins));
     }
 
     /// Record a batch-deferred draw's completion: open the batch on its ring
@@ -2029,24 +2089,62 @@ impl ResourcePools {
     /// `device` must be the device the retained images belong to.
     pub(crate) unsafe fn batch_append(
         &mut self,
-        device: &ash::Device,
+        ctx: &DeviceContext,
         // The pair [`Self::batch_slot`] and [`Self::begin_entry`] both hand
         // back, passed through as one value because it only ever travels as one.
         slot: (vk::CommandBuffer, vk::Fence),
-        target: BatchTarget,
+        attachments: BatchDrawAttachments,
         dset: Option<(vk::DescriptorSet, vk::DescriptorPool)>,
         sampled_retains: Vec<SampledRetain>,
         counters: &EngineCounters,
-    ) {
+    ) -> Result<(), DrawError> {
+        let appended = self.append_batch_record(slot, attachments, dset, counters, |pools, pair| {
+            unsafe { pools.free_descriptor_sets(&ctx.device, &[pair]) };
+        });
+        if let Err(error) = appended {
+            self.retire_ready_residents(ctx, counters);
+            return Err(error);
+        }
+        let admissions = take_retained_slots(&mut self.sampled_live, sampled_retains);
+        self.admit_recorded_sampled(&ctx.device, admissions);
+        Ok(())
+    }
+
+    fn append_batch_record(
+        &mut self,
+        slot: (vk::CommandBuffer, vk::Fence),
+        attachments: BatchDrawAttachments,
+        dset: Option<(vk::DescriptorSet, vk::DescriptorPool)>,
+        counters: &EngineCounters,
+        free_dset: impl FnOnce(&Self, (vk::DescriptorSet, vk::DescriptorPool)),
+    ) -> Result<(), DrawError> {
+        let BatchDrawAttachments { target, resident_states } = attachments;
         let (cb, fence) = slot;
         match self.open_batch.as_mut() {
             Some(b) => {
                 debug_assert!(b.cb == cb, "joiner recorded into a foreign CB");
                 b.draws += 1;
                 b.dsets.extend(dset);
+                for state in resident_states {
+                    if !b.resident_states.iter().any(|before| {
+                        before.identity == state.identity && before.image == state.image
+                    }) {
+                        b.resident_states.push(state);
+                    }
+                }
                 counters.batch_joins.fetch_add(1, Ordering::Relaxed);
             }
             None => {
+                let attachment_pins = match self.retain_batch_attachments(&target) {
+                    Ok(pins) => pins,
+                    Err(error) => {
+                        self.restore_batch_residents(resident_states);
+                        if let Some(pair) = dset {
+                            free_dset(self, pair);
+                        }
+                        return Err(error);
+                    }
+                };
                 super::super::note_batch_open_after_tail(counters);
                 debug_assert!(
                     self.slots[self.cur].pending.is_none(),
@@ -2056,14 +2154,15 @@ impl ResourcePools {
                     cb,
                     fence,
                     target,
+                    attachment_pins,
+                    resident_states,
                     draws: 1,
                     dsets: dset.into_iter().collect(),
                 });
                 counters.batch_opens.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let admissions = take_retained_slots(&mut self.sampled_live, sampled_retains);
-        self.admit_recorded_sampled(device, admissions);
+        Ok(())
     }
 
     /// Submit the open batch (if any): end its CB, queue it on the batch
@@ -2135,7 +2234,7 @@ impl ResourcePools {
         match submit {
             Ok(receipt) => {
                 let finish_started = std::time::Instant::now();
-                let sealed = self.seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
+                let sealed = self.seal_batch_entry(&mut batch);
                 self.finish_entry_after_handoff(&ctx.device, sealed, receipt);
                 counters.batch_flush_finish_us.fetch_add(
                     finish_started.elapsed().as_micros() as u64,
@@ -2144,6 +2243,8 @@ impl ResourcePools {
                 Ok(())
             }
             Err(e) => {
+                self.reject_recorded_batch(&mut batch);
+                self.retire_ready_residents(ctx, counters);
                 self.desc_arena.free(&ctx.device, &batch.dsets);
                 // This batch's draws published sampled images to the content
                 // cache on the promise that this command buffer would fill
@@ -2218,10 +2319,15 @@ impl ResourcePools {
     /// [`Self::note_cb_bound_buffer`], which still takes the `CbBind` by value.
     /// So the invariant is unchanged and only the miss path pays for it.
     pub(in crate::backend::vulkan::engine) fn cb_bound_buffer(
-        &self,
+        &mut self,
         key: (usize, u64, u64),
     ) -> Option<super::super::exec::BoundBuffer> {
-        self.cb_bound_buffers.get(&key).map(|(b, _)| *b)
+        let (bound, guest_read) = self.cb_bound_buffers.get(&key)
+            .map(|(bound, retained)| (*bound, retained.guest_read))?;
+        if guest_read {
+            self.note_guest_read_recorded();
+        }
+        Some(bound)
     }
 
     /// Remember that `bind`'s bytes are in `bound` for the rest of this command
@@ -2581,6 +2687,13 @@ impl ResourcePools {
         &self,
     ) -> &[super::super::caches::BindingSig] {
         &self.cb_graphics.layout_bindings
+    }
+
+    pub(in crate::backend::vulkan::engine) fn admit_storage_descriptors(
+        &mut self,
+        admission: &super::super::caches::storage_descriptors::StorageDescriptorAdmission<'_>,
+    ) {
+        admission.filter_layout(&mut self.cb_graphics.layout_bindings);
     }
 
     /// Begin a draw's storage-bind list, discarding the previous draw's.
@@ -2996,6 +3109,12 @@ impl ResourcePools {
     /// on its behalf. A pin that cannot be taken — no slot, or content not ready
     /// — records the debt and nothing else, because there is then no image for
     /// the reclaim to take.
+    ///
+    /// A draw or dispatch records before sealing, but a standalone render Store
+    /// records after its copy submits. In the latter case the current slot
+    /// already owns the submission's cleanup: leaving its pin in the live list
+    /// would release it at an unrelated later submission, or never if work ends
+    /// here. The current slot's state selects the retirement owner.
     pub(crate) fn note_guest_write_recorded(&mut self, source: super::super::GuestWriteSource<'_>) {
         // A bind recorded after this must not reuse a copy taken before it: the
         // Store lands in guest pages a later bind may name. True of every
@@ -3009,7 +3128,13 @@ impl ResourcePools {
         match source {
             super::super::GuestWriteSource::ResidentTarget(identity) => {
                 if self.pin_resident_target(identity, true) {
-                    self.guest_write_pins_live.push(identity.clone());
+                    if let Some(pending) = self.slots.get_mut(self.cur)
+                        .and_then(|slot| slot.pending.as_mut())
+                    {
+                        pending.unpin_residents.push(identity.clone());
+                    } else {
+                        self.guest_write_pins_live.push(identity.clone());
+                    }
                 }
             }
             // Same ledger discipline, the other registry. Recorded separately
@@ -3017,7 +3142,13 @@ impl ResourcePools {
             // the registry that holds the image.
             super::super::GuestWriteSource::ResidentStorage(identity) => {
                 if self.pin_resident_storage(identity, true) {
-                    self.compute_write_pins_live.push(*identity);
+                    if let Some(pending) = self.slots.get_mut(self.cur)
+                        .and_then(|slot| slot.pending.as_mut())
+                    {
+                        pending.unpin_compute_residents.push(*identity);
+                    } else {
+                        self.compute_write_pins_live.push(*identity);
+                    }
                 }
             }
             // Nothing to pin: the ring entry this submission sealed already owns
@@ -3127,13 +3258,21 @@ impl ResourcePools {
     ///
     /// # Safety
     /// The CB that referenced these resources must have retired.
-    unsafe fn drain_cleanup(&mut self, device: &ash::Device, mut pending: PendingGpuCleanup) {
+    unsafe fn drain_cleanup(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        mut pending: PendingGpuCleanup,
+    ) {
+        let device = &ctx.device;
+        self.release_batch_attachment_pins(std::mem::take(&mut pending.batch_attachment_pins));
         for identity in pending.unpin_residents.drain(..) {
             self.pin_resident_target(&identity, false);
         }
         for identity in pending.unpin_compute_residents.drain(..) {
             self.pin_resident_storage(&identity, false);
         }
+        self.retire_ready_residents(ctx, counters);
         self.desc_arena.free(device, &pending.dsets);
         // The fence this entry waited on is exactly what makes a rewrite of
         // these safe, so the free list is fed from here and nowhere else.
@@ -4111,6 +4250,13 @@ impl ResourcePools {
         owner: crate::model::TaskResourceLifetimeRef,
         counters: &EngineCounters,
     ) -> Result<Option<GuestSampledUse>, DrawError> {
+        if import.is_retired() {
+            crate::observe::Emit::decline(
+                "vk_guest_sampled",
+                &host_ram::HostRamDecline::Retired { import_id: import.id().get() },
+            ).fail_once(import.id().get());
+            return Ok(None);
+        }
         let key = GuestSampledKey {
             image,
             backing,
@@ -4120,6 +4266,13 @@ impl ResourcePools {
             key.image.format, &key.image.swizzle, ctx.features.image_view_format_swizzle,
         )?;
         if let Some(slot) = self.guest_sampled.get_mut(&key) {
+            // Equal virtual addresses do not identify one import lifetime.
+            // Keep the old child for fence-safe retirement; this bind gathers
+            // through its own retained parent instead of resurrecting it.
+            if slot._import.is_retired() || slot._import.id() != import.id() {
+                crate::runtime::drain::note_store_route("sampled_direct_parent_changed");
+                return Ok(None);
+            }
             return Ok(Some(GuestSampledUse {
                 key,
                 image: slot.image,
@@ -4138,6 +4291,7 @@ impl ResourcePools {
             super::super::linear_target_import::create(
                 ctx,
                 &mut self.host_ram_imports,
+                counters,
                 &import,
                 key.backing,
                 key.image.width,
@@ -4209,6 +4363,7 @@ impl ResourcePools {
     pub(crate) fn mark_guest_sampled_read(&mut self, key: &GuestSampledKey) {
         if let Some(slot) = self.guest_sampled.get_mut(key) {
             slot.initialized = true;
+            self.note_guest_read_recorded();
         }
     }
 
@@ -4466,9 +4621,20 @@ impl ResourcePools {
     pub(crate) fn find_cached_sampled(
         &mut self,
         key: SampledKey,
-        content: &[u8],
+        content: &std::sync::Arc<Vec<u8>>,
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
         counters: &EngineCounters,
+    ) -> Option<SampledSlot> {
+        self.find_cached_sampled_with_hash(key, content, identity, counters, sampled_content_hash)
+    }
+
+    fn find_cached_sampled_with_hash(
+        &mut self,
+        key: SampledKey,
+        content: &std::sync::Arc<Vec<u8>>,
+        identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
+        counters: &EngineCounters,
+        hash: impl FnOnce(&[u8]) -> u128,
     ) -> Option<SampledSlot> {
         // Before any cache is consulted, so the set is what the workload *asked
         // for* rather than what this cache happened to keep. That is the whole
@@ -4482,14 +4648,19 @@ impl ResourcePools {
                 .fetch_add(1, Ordering::Relaxed);
             return Some(handles);
         }
-        let content_hash = sampled_content_hash(content);
-        // The digest narrows the walk to one candidate; the retained bytes are
-        // what decide the hit. `ResidentSampledSlot::content` carries why the
-        // digest is not allowed to answer on its own.
-        let found = self.sampled_cache.iter().position(|entry| {
+        let same_allocation = self.sampled_cache.iter().position(|entry| {
             entry.slot.key() == key
-                && entry.fingerprint == SampledFingerprint::Content(content_hash)
-                && entry.content.as_deref().is_some_and(|b| b == content)
+                && entry.content.as_ref().is_some_and(|held| std::sync::Arc::ptr_eq(held, content))
+        });
+        let found = same_allocation.or_else(|| {
+            let content_hash = hash(content);
+            // Hash equality only selects a candidate. Different allocations
+            // must still have exactly equal bytes.
+            self.sampled_cache.iter().position(|entry| {
+                entry.slot.key() == key
+                    && entry.fingerprint == SampledFingerprint::Content(content_hash)
+                    && entry.content.as_ref().is_some_and(|held| held.as_slice() == content.as_slice())
+            })
         });
         let Some(index) = found else {
             counters
@@ -4503,6 +4674,12 @@ impl ResourcePools {
         if identity.is_some() {
             entry.identity = identity;
         }
+        if same_allocation.is_none() {
+            // Bytes were copied into submission-owned staging before upload.
+            // This Arc is only the cache witness; exact equality permits adoption.
+            entry.content = Some(std::sync::Arc::clone(content));
+            crate::runtime::drain::note_store_route("sampled_bytes_arc_adoptions");
+        }
         entry.last_touch_ms = self.idle_clock_ms;
         let handles = entry.slot.handles();
         self.sampled_cache.push(entry);
@@ -4510,6 +4687,12 @@ impl ResourcePools {
         counters
             .sampled_cache_hit_bytes
             .fetch_add(content.len() as u64, Ordering::Relaxed);
+        if same_allocation.is_some() {
+            crate::runtime::drain::note_store_route("sampled_bytes_arc_reuses");
+            crate::runtime::drain::note_store_route_n(
+                "sampled_bytes_arc_reuse_bytes", content.len() as u64,
+            );
+        }
         Some(handles)
     }
 
@@ -5189,6 +5372,36 @@ mod recycle_tests {
         assert!(dead.contains(&live_key));
     }
 
+    #[test]
+    fn a_retired_sampled_parent_releases_old_children_even_while_the_texture_lives() {
+        let mut pools = ResourcePools::new();
+        let resource = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
+        let (key, slot) = direct_sampled(resource.lifetime_ref(), 0x1000_0000);
+        slot._import.retire();
+        pools.guest_sampled.insert(key.clone(), slot);
+        assert!(resource.lifetime_ref().is_live());
+        assert_eq!(pools.dead_guest_sampled_keys(8), vec![key]);
+    }
+
+    #[test]
+    fn every_direct_sampled_read_owes_completion_even_after_its_first_transition() {
+        let mut pools = ResourcePools::new();
+        let resource = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
+        let (key, slot) = direct_sampled(resource.lifetime_ref(), 0x1000_0000);
+        pools.guest_sampled.insert(key.clone(), slot);
+        assert!(!pools.take_guest_read_debt());
+
+        for _ in 0..2 {
+            pools.mark_guest_sampled_read(&key);
+            assert!(pools.guest_sampled[&key].initialized);
+            assert!(
+                pools.take_guest_read_debt(),
+                "warm layout reuse must not let the guest reuse pages before sampling completes"
+            );
+            assert!(!pools.take_guest_read_debt());
+        }
+    }
+
     /// [`GatheredName`] decides when two gathers are one window, and this is the
     /// only test of that equality.
     ///
@@ -5482,8 +5695,8 @@ mod recycle_tests {
         let mut pools = ResourcePools::new();
         let counters = EngineCounters::default();
 
-        let retained: Vec<u8> = (0..64u8).collect();
-        let incoming: Vec<u8> = (0..64u8).map(|b| b ^ 0x5a).collect();
+        let retained = std::sync::Arc::new((0..64u8).collect::<Vec<u8>>());
+        let incoming = std::sync::Arc::new((0..64u8).map(|b| b ^ 0x5a).collect::<Vec<u8>>());
         assert_ne!(retained, incoming, "the two blobs must differ");
 
         let slot = null_slot(8, 8);
@@ -5493,7 +5706,7 @@ mod recycle_tests {
         pools.sampled_cache.push(ResidentSampledSlot {
             slot,
             fingerprint: SampledFingerprint::Content(sampled_content_hash(&incoming)),
-            content: Some(std::sync::Arc::new(retained.clone())),
+            content: Some(std::sync::Arc::new(retained.as_ref().clone())),
             content_len: retained.len(),
             identity: None,
             last_touch_ms: 0,
@@ -5522,25 +5735,132 @@ mod recycle_tests {
         let mut pools = ResourcePools::new();
         let counters = EngineCounters::default();
 
-        let content: Vec<u8> = (0..64u8).map(|b| b.wrapping_mul(7)).collect();
+        let content = std::sync::Arc::new((0..64u8).map(|b| b.wrapping_mul(7)).collect::<Vec<u8>>());
         let slot = null_slot(8, 8);
         let key = slot.key();
         pools.sampled_cache.push(ResidentSampledSlot {
             slot,
             fingerprint: SampledFingerprint::Content(sampled_content_hash(&content)),
-            content: Some(std::sync::Arc::new(content.clone())),
+            content: Some(std::sync::Arc::clone(&content)),
             content_len: content.len(),
             identity: None,
             last_touch_ms: 0,
         });
 
-        let copy = content.clone();
+        let copy = std::sync::Arc::new(content.as_ref().clone());
         assert!(
             pools
                 .find_cached_sampled(key, &copy, None, &counters)
                 .is_some(),
             "identical content must still hit, or the compare has cost a real reuse"
         );
+    }
+
+    #[test]
+    fn immutable_sampled_allocation_reuses_without_hashing_and_keeps_the_full_key() {
+        let mut pools = ResourcePools::new();
+        let counters = EngineCounters::default();
+        let content = std::sync::Arc::new(vec![0x51; 8 * 8 * 4]);
+        let slot = null_slot(8, 8);
+        let key = slot.key();
+        pools.sampled_cache.push(ResidentSampledSlot {
+            slot,
+            fingerprint: SampledFingerprint::Content(sampled_content_hash(&content)),
+            content: Some(std::sync::Arc::clone(&content)),
+            content_len: content.len(),
+            identity: None,
+            last_touch_ms: 0,
+        });
+        for _ in 0..128 {
+            assert!(pools.find_cached_sampled_with_hash(
+                key, &content, None, &counters,
+                |_| panic!("an immutable allocation hit must not hash its pixels"),
+            ).is_some());
+        }
+        assert_eq!(counters.sampled_cache_hits.load(Ordering::Relaxed), 128);
+        assert_eq!(counters.sampled_cache_hit_bytes.load(Ordering::Relaxed), 128 * 256);
+        let different = null_slot(4, 16).key();
+        assert!(pools.find_cached_sampled(different, &content, None, &counters).is_none());
+    }
+
+    #[test]
+    fn sampled_copy_on_write_cannot_reuse_the_old_uploaded_allocation() {
+        let mut pools = ResourcePools::new();
+        let counters = EngineCounters::default();
+        let mut content = std::sync::Arc::new(vec![0x51; 8 * 8 * 4]);
+        let slot = null_slot(8, 8);
+        let key = slot.key();
+        let original = std::sync::Arc::clone(&content);
+        pools.sampled_cache.push(ResidentSampledSlot {
+            slot,
+            fingerprint: SampledFingerprint::Content(sampled_content_hash(&content)),
+            content: Some(std::sync::Arc::clone(&content)),
+            content_len: content.len(),
+            identity: None,
+            last_touch_ms: 0,
+        });
+        std::sync::Arc::make_mut(&mut content)[0] = 0x62;
+        assert!(!std::sync::Arc::ptr_eq(&content, &original));
+        assert!(pools.find_cached_sampled(key, &content, None, &counters).is_none());
+        assert!(pools.find_cached_sampled_with_hash(
+            key, &original, None, &counters,
+            |_| panic!("the original allocation is still a valid immutable hit"),
+        ).is_some());
+        assert_eq!(original[0], 0x51);
+    }
+
+    #[test]
+    fn equal_sampled_bytes_adopt_the_new_arc_without_retiring_inflight_uploads() {
+        let mut pools = ResourcePools::new();
+        let counters = EngineCounters::default();
+        let original = std::sync::Arc::new(vec![0x51; 8 * 8 * 4]);
+        let original_weak = std::sync::Arc::downgrade(&original);
+        let replacement = std::sync::Arc::new(original.as_ref().clone());
+        let image = null_slot(8, 8);
+        let key = image.key();
+        let image_handle = image.image;
+        pools.sampled_live.push(image);
+        let staging_handle = vk::Buffer::from_raw(91);
+        pools.staging_live.push(BufferSlot {
+            buffer: staging_handle,
+            memory: vk::DeviceMemory::from_raw(92),
+            size: original.len() as u64,
+            mapped: 0,
+            backing: BufferBacking::Dedicated,
+            coherent: true,
+            cached: true,
+        });
+        let sealed = pools.seal_entry(Vec::new(), vec![SampledRetain {
+            image: image_handle,
+            content: SampledRetainContent::Bytes(std::sync::Arc::clone(&original)),
+            identity: None,
+        }]);
+        pools.slots = vec![idle_slot()];
+        pools.slots[0].pending = Some(sealed.cleanup);
+        let (image, in_flight_source) = sealed.admissions.into_iter().next().unwrap();
+        assert!(pools.admit_sampled_entry(image, &in_flight_source.content, None).is_empty());
+        drop(original);
+
+        let mut hashes = 0;
+        assert!(pools.find_cached_sampled_with_hash(
+            key, &replacement, None, &counters,
+            |bytes| { hashes += 1; sampled_content_hash(bytes) },
+        ).is_some());
+        assert_eq!(hashes, 1, "a distinct allocation still requires the exact-content path");
+        assert!(std::sync::Arc::ptr_eq(
+            pools.sampled_cache[0].content.as_ref().unwrap(), &replacement,
+        ));
+        assert!(pools.find_cached_sampled_with_hash(
+            key, &replacement, None, &counters,
+            |_| panic!("the adopted immutable allocation must not be hashed again"),
+        ).is_some());
+        assert_eq!(original_weak.upgrade().unwrap().as_slice(), replacement.as_slice());
+        assert_eq!(pools.slots[0].pending.as_ref().unwrap().staging[0].buffer, staging_handle);
+        assert!(pools.staging_live.is_empty());
+        assert!(pools.staging_free.is_empty(), "cache adoption cannot recycle an in-flight upload");
+        drop(in_flight_source);
+        assert!(original_weak.upgrade().is_none());
+        assert_eq!(pools.slots[0].pending.as_ref().unwrap().staging[0].buffer, staging_handle);
     }
 
     /// A *diverse* burst — many distinct geometries, each ≤ the per-key cap —
@@ -6284,6 +6604,7 @@ mod recycle_tests {
                 attachment_snapshots: Vec::new(),
                 storage_images: Vec::new(),
                 unpin_residents: Vec::new(),
+                batch_attachment_pins: Vec::new(),
                 unpin_compute_residents: Vec::new(),
             }),
             span: super::gpu_span::SlotSpan::Idle,
@@ -6458,6 +6779,32 @@ mod recycle_tests {
         );
     }
 
+    #[test]
+    fn every_warm_guest_buffer_bind_renews_read_debt_but_cpu_snapshots_do_not() {
+        use crate::backend::vulkan::engine::{BufferContent, GuestRun, GuestRunSource};
+        for reads_guest in [false, true] {
+            let mut pools = ResourcePools::new();
+            let content = BufferContent::GuestRuns(GuestRunSource {
+                runs: std::sync::Arc::new(vec![GuestRun::whole(0x1000, 64).unwrap()]),
+                source_offset: 0, total_len: 64, row_length_texels: 0,
+                pages: None, direct_image: None,
+            });
+            let mut bind = super::super::CbBind::of(&content);
+            if reads_guest {
+                bind.note_guest_read();
+            }
+            let key = bind.key();
+            pools.note_cb_bound_buffer(bind, super::super::super::exec::BoundBuffer {
+                buffer: vk::Buffer::null(), offset: 0,
+            });
+            pools.take_guest_read_debt();
+            for _ in 0..2 {
+                assert!(pools.cb_bound_buffer(key).is_some());
+                assert_eq!(pools.take_guest_read_debt(), reads_guest);
+            }
+        }
+    }
+
     /// The write ledger's own half, and the reason it is a ledger rather than a
     /// blocking call: several windows landed in one fence pass settle together.
     /// A rail that took the debt per window would be the per-window fence this
@@ -6546,6 +6893,75 @@ mod recycle_tests {
             cleanup.unpin_residents.is_empty(),
             "a retired pin must not be released a second time"
         );
+    }
+
+    #[test]
+    fn a_post_submit_render_writeback_pin_retires_with_its_copy() {
+        let mut pools = ResourcePools::new();
+        pools.slots = vec![pending_slot(), idle_slot()];
+        pools.cur = 0;
+        let identity = TargetIdentity::Surface {
+            id: 7,
+            width: 16,
+            height: 16,
+            generation: 3,
+            format: translate::pixel::SCANOUT_FORMAT,
+        };
+        pools.registry.insert(
+            identity.clone(),
+            super::images_and_registry::pin_count_tests::ready_slot(),
+        );
+        assert!(pools.pin_resident_target(&identity, true));
+
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
+        assert_eq!(pools.registry[&identity].pin_count, 2);
+        assert!(pools.guest_write_pins_live.is_empty());
+        assert_eq!(
+            pools.slots[0].pending.as_ref().unwrap().unpin_residents,
+            vec![identity.clone()],
+            "the copy already submitted, so its own slot must release its pin"
+        );
+
+        pools.cur = 1;
+        let later = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        assert!(later.unpin_residents.is_empty());
+        assert_eq!(pools.registry[&identity].pin_count, 2);
+
+        let mut retired = pools.slots[0].pending.take().unwrap();
+        for held in retired.unpin_residents.drain(..) {
+            pools.pin_resident_target(&held, false);
+        }
+        assert_eq!(
+            pools.registry[&identity].pin_count, 1,
+            "copy retirement releases its pin, not the other holder's"
+        );
+    }
+
+    #[test]
+    fn a_post_submit_compute_writeback_pin_retires_with_its_copy() {
+        let mut pools = ResourcePools::new();
+        pools.slots = vec![pending_slot(), idle_slot()];
+        pools.cur = 0;
+        let identity = admit_compute_resident(&mut pools, 1, 1_000, false);
+
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentStorage(&identity));
+        assert!(pools.compute_storage_registry[&identity].pinned);
+        assert!(pools.compute_write_pins_live.is_empty());
+        assert_eq!(
+            pools.slots[0].pending.as_ref().unwrap().unpin_compute_residents,
+            vec![identity],
+        );
+
+        pools.cur = 1;
+        let later = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        assert!(later.unpin_compute_residents.is_empty());
+        assert!(pools.compute_storage_registry[&identity].pinned);
+
+        let mut retired = pools.slots[0].pending.take().unwrap();
+        for held in retired.unpin_compute_residents.drain(..) {
+            pools.pin_resident_storage(&held, false);
+        }
+        assert!(!pools.compute_storage_registry[&identity].pinned);
     }
 
     /// A ring-owned source records the same debt and takes no pin.
@@ -6786,6 +7202,366 @@ mod recycle_tests {
         assert!(pools.graveyard.is_empty());
     }
 
+    fn mrt_attachment_set() -> BatchTarget {
+        let identity = |id| TargetIdentity::Surface {
+            id, width: 16, height: 16, generation: 1, format: vk::Format::B8G8R8A8_UNORM,
+        };
+        let mut target = BatchTarget::single(identity(7), 16, 16, vk::Format::B8G8R8A8_UNORM);
+        target.secondaries.push(BatchAttachment {
+            identity: identity(8), width: 16, height: 16, format: vk::Format::B8G8R8A8_UNORM,
+        });
+        target.depth = Some(BatchAttachment {
+            identity: identity(9), width: 16, height: 16, format: vk::Format::D32_SFLOAT,
+        });
+        target
+    }
+
+    fn insert_mrt_attachments(pools: &mut ResourcePools, target: &BatchTarget) {
+        for (index, identity) in target.identities().enumerate() {
+            let mut slot = super::images_and_registry::pin_count_tests::ready_slot();
+            slot.image = vk::Image::from_raw(100 + index as u64);
+            slot.content_epoch = Some(7);
+            pools.registry.insert(identity.clone(), slot);
+        }
+    }
+
+    fn retained_mrt_batch(pools: &mut ResourcePools, target: BatchTarget) -> OpenBatch {
+        OpenBatch {
+            cb: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            resident_states: pools.batch_attachment_states(&target).unwrap(),
+            attachment_pins: pools.retain_batch_attachments(&target).unwrap(),
+            target,
+            draws: 1,
+            dsets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mrt_batch_changed_secondary_format_extent_area_or_depth_never_joins() {
+        let mut pools = ResourcePools::new();
+        let target = mrt_attachment_set();
+        insert_mrt_attachments(&mut pools, &target);
+        pools.open_batch = Some(retained_mrt_batch(&mut pools, target.clone()));
+        assert!(matches!(pools.batch_fit(&target, false), BatchFit::Open(..)));
+        for change in 0..6 {
+            let mut next = target.clone();
+            match change {
+                0 => next.secondaries[0].identity = TargetIdentity::Anonymous { slot: 91 },
+                1 => next.secondaries[0] = BatchAttachment {
+                    format: vk::Format::R16G16B16A16_SFLOAT,
+                    ..next.secondaries[0].clone()
+                },
+                2 => next.secondaries[0].width = 8,
+                3 => next.render_area = (8, 16),
+                4 => next.depth = None,
+                _ => next.samples = 4,
+            }
+            assert!(matches!(pools.batch_fit(&next, false), BatchFit::OtherTarget),
+                "MRT set changes cannot use the single-color mixed-target policy");
+        }
+        pools.discard_open_batch();
+    }
+
+    #[test]
+    fn mrt_batch_retired_or_replaced_secondary_never_joins() {
+        let mut pools = ResourcePools::new();
+        let target = mrt_attachment_set();
+        insert_mrt_attachments(&mut pools, &target);
+        pools.open_batch = Some(retained_mrt_batch(&mut pools, target.clone()));
+        let secondary = &target.secondaries[0].identity;
+        pools.registry.get_mut(secondary).unwrap().resource_released = true;
+        assert!(matches!(pools.batch_fit(&target, false), BatchFit::RetiredAttachment));
+        pools.registry.get_mut(secondary).unwrap().resource_released = false;
+        pools.registry.get_mut(secondary).unwrap().image = vk::Image::from_raw(999);
+        assert!(matches!(pools.batch_fit(&target, false), BatchFit::RetiredAttachment));
+        pools.discard_open_batch();
+        assert_eq!(pools.registry[secondary].pin_count, 1,
+            "a stale native-image pin cannot unpin a replacement allocation");
+    }
+
+    #[test]
+    fn mrt_batch_all_attachment_pins_transfer_to_only_their_submission() {
+        let mut pools = ResourcePools::new();
+        let target = mrt_attachment_set();
+        insert_mrt_attachments(&mut pools, &target);
+        let mut batch = retained_mrt_batch(&mut pools, target.clone());
+        for identity in target.identities() {
+            assert_eq!(pools.registry[identity].pin_count, 1);
+        }
+        let mut old = pools.seal_batch_entry(&mut batch).cleanup;
+        assert!(batch.attachment_pins.is_empty());
+        assert_eq!(old.batch_attachment_pins.len(), 3, "primary, secondary and depth");
+        let later = pools.seal_entry(Vec::new(), Vec::new());
+        assert!(later.cleanup.batch_attachment_pins.is_empty());
+        for identity in target.identities() {
+            assert_eq!(pools.registry[identity].pin_count, 1, "seal is not fence completion");
+        }
+        pools.release_batch_attachment_pins(std::mem::take(&mut old.batch_attachment_pins));
+        for identity in target.identities() {
+            assert_eq!(pools.registry[identity].pin_count, 0);
+        }
+    }
+
+    #[test]
+    fn mrt_batch_partial_retention_failure_rolls_back_earlier_pins() {
+        let mut pools = ResourcePools::new();
+        let target = mrt_attachment_set();
+        insert_mrt_attachments(&mut pools, &target);
+        pools.registry.get_mut(&target.secondaries[0].identity).unwrap().resource_released = true;
+        assert!(matches!(pools.retain_batch_attachments(&target),
+            Err(DrawError::DrawExecution(
+                super::super::super::draw_execution::DrawExecutionDecline::BatchAttachmentNotRetainable { .. },
+            ))));
+        assert_eq!(pools.registry[&target.primary.identity].pin_count, 0);
+    }
+
+    #[test]
+    fn mrt_batch_rollback_journals_sampled_seed_and_later_draw_sources() {
+        let mut pools = ResourcePools::new();
+        pools.slots = vec![idle_slot()];
+        let counters = EngineCounters::default();
+        let target = mrt_attachment_set();
+        insert_mrt_attachments(&mut pools, &target);
+        let sources: Vec<_> = (91..94).map(|slot| TargetIdentity::Anonymous { slot }).collect();
+        for (index, source) in sources.iter().enumerate() {
+            let entry = ResidentTargetSlot {
+                image: vk::Image::from_raw(200 + index as u64),
+                access: ResidentAccess::TransferRead(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+                ..super::images_and_registry::pin_count_tests::ready_slot()
+            };
+            pools.registry.insert(source.clone(), entry);
+        }
+        for draw in 0..2 {
+            pools.begin_resident_journal();
+            for identity in target.identities() {
+                pools.registry_mark_ready_at(identity, vk::ImageLayout::GENERAL);
+            }
+            pools.registry_note_access(&sources[0], ResidentAccess::ShaderRead(vk::ImageLayout::GENERAL));
+            pools.registry_note_access(&sources[draw + 1], ResidentAccess::TransferRead(vk::ImageLayout::GENERAL));
+            let resident_states = pools.take_resident_journal();
+            pools.append_batch_record(
+                (vk::CommandBuffer::null(), vk::Fence::null()),
+                BatchDrawAttachments { target: target.clone(), resident_states },
+                None, &counters, |_, _| panic!("a successful append owns its descriptors"),
+            ).unwrap();
+        }
+        let mut batch = pools.take_open_batch().unwrap();
+        assert_eq!(batch.resident_states.len(), 6, "three attachments and three source residents");
+        pools.reject_recorded_batch(&mut batch);
+        for source in sources {
+            assert_eq!(pools.registry[&source].access,
+                ResidentAccess::TransferRead(vk::ImageLayout::TRANSFER_SRC_OPTIMAL));
+        }
+        for identity in target.identities() {
+            assert_eq!(pools.registry[identity].pin_count, 0);
+        }
+    }
+
+    #[test]
+    fn mrt_failed_opener_restores_sources_and_returns_every_descriptor_to_its_pool() {
+        let mut pools = ResourcePools::new();
+        let counters = EngineCounters::default();
+        let target = mrt_attachment_set();
+        insert_mrt_attachments(&mut pools, &target);
+        pools.registry.get_mut(&target.secondaries[0].identity).unwrap().resource_released = true;
+        let source = TargetIdentity::Anonymous { slot: 95 };
+        let entry = ResidentTargetSlot {
+            access: ResidentAccess::TransferRead(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+            ..super::images_and_registry::pin_count_tests::ready_slot()
+        };
+        pools.registry.insert(source.clone(), entry);
+        let pool = vk::DescriptorPool::from_raw(77);
+        let mut freed = Vec::new();
+        for raw in 1..=u64::from(crate::backend::vulkan::engine::desc_arena::DESC_BLOCK_MAX_SETS) + 1 {
+            pools.begin_resident_journal();
+            pools.registry_note_access(&source, ResidentAccess::ShaderRead(vk::ImageLayout::GENERAL));
+            let resident_states = pools.take_resident_journal();
+            let pair = (vk::DescriptorSet::from_raw(raw), pool);
+            assert!(pools.append_batch_record(
+                (vk::CommandBuffer::null(), vk::Fence::null()),
+                BatchDrawAttachments { target: target.clone(), resident_states },
+                Some(pair), &counters, |_, returned| freed.push(returned),
+            ).is_err());
+            assert_eq!(freed.last(), Some(&pair));
+            assert_eq!(freed.len(), raw as usize);
+            assert!(pools.open_batch.is_none());
+            assert_eq!(pools.registry[&target.primary.identity].pin_count, 0);
+            assert_eq!(pools.registry[&source].access,
+                ResidentAccess::TransferRead(vk::ImageLayout::TRANSFER_SRC_OPTIMAL));
+        }
+    }
+
+    #[test]
+    fn mrt_batch_record_retire_reject_keeps_pass_local_discard_reclaimable() {
+        let mut pools = ResourcePools::new();
+        pools.slots = vec![idle_slot()];
+        let counters = EngineCounters::default();
+        let owner = crate::backend::vulkan::engine::pass_local::PassLocalTarget::new(
+            16, 16, vk::Format::B8G8R8A8_UNORM,
+        ).unwrap();
+        let discarded = owner.identity().clone();
+        let mut target = mrt_attachment_set();
+        target.depth = None;
+        target.secondaries[0].identity = discarded.clone();
+        insert_mrt_attachments(&mut pools, &target);
+        for identity in target.identities() {
+            pools.registry_order.push_back(identity.clone());
+            let slot = pools.registry.get_mut(identity).unwrap();
+            slot.resource_owner_count = 1;
+            slot.pin_count = 1;
+            pools.registry_mark_ready_at(identity, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        }
+        pools.begin_resident_journal();
+        for identity in target.identities() {
+            pools.registry_mark_ready_at(identity, vk::ImageLayout::GENERAL);
+        }
+        let resident_states = pools.take_resident_journal();
+        pools.append_batch_record(
+            (vk::CommandBuffer::null(), vk::Fence::null()),
+            BatchDrawAttachments { target: target.clone(), resident_states },
+            None, &counters, |_, _| panic!("no descriptor was allocated"),
+        ).unwrap();
+        for identity in target.identities() {
+            assert_eq!(pools.release_resident_ownership(identity), Some(false),
+                "the batch still retains the native allocation");
+        }
+        assert!(!pools.registry[&discarded].gpu_only_content);
+        let mut batch = pools.take_open_batch().unwrap();
+        pools.reject_recorded_batch(&mut batch);
+        assert!(pools.registry[&discarded].resource_released);
+        assert_eq!(pools.registry[&discarded].pin_count, 0);
+        assert!(!pools.registry[&discarded].gpu_only_content);
+        assert!(pools.registry[&target.primary.identity].gpu_only_content,
+            "rollback must not discard backed authoritative content");
+        assert_eq!(pools.released_resident_keys(2), vec![discarded]);
+    }
+
+    fn released_pass_local_batch_pins(
+        pools: &mut ResourcePools,
+        count: usize,
+    ) -> (Vec<crate::backend::vulkan::engine::pass_local::PassLocalTarget>, Vec<ResidentAllocationRef>) {
+        let mut owners = Vec::new();
+        let mut pins = Vec::new();
+        for index in 0..count {
+            let owner = crate::backend::vulkan::engine::pass_local::PassLocalTarget::new(
+                16, 16, vk::Format::B8G8R8A8_UNORM,
+            ).unwrap();
+            let identity = owner.identity().clone();
+            let mut slot = super::images_and_registry::pin_count_tests::ready_slot();
+            slot.image = vk::Image::from_raw(2000 + index as u64);
+            slot.resource_owner_count = 1;
+            slot.pin_count = 2; // Encoder ownership and the recorded batch.
+            slot.gpu_only_content = true;
+            pins.push(ResidentAllocationRef { identity: identity.clone(), image: slot.image });
+            pools.registry_order.push_back(identity.clone());
+            pools.registry.insert(identity.clone(), slot);
+            assert_eq!(pools.release_resident_ownership(&identity), Some(false));
+            assert_eq!(pools.registry[&identity].pin_count, 1);
+            owners.push(owner);
+        }
+        (owners, pins)
+    }
+
+    #[test]
+    fn mrt_last_pin_fence_retirement_drains_more_than_the_idle_budget() {
+        let mut pools = ResourcePools::new();
+        let (_owners, pins) = released_pass_local_batch_pins(&mut pools, 24);
+        assert!(pools.take_ready_resident_retirements().is_empty(),
+            "a recorded or in-flight batch still pins every allocation");
+        pools.release_batch_attachment_pins(pins);
+        let ready = pools.take_ready_resident_retirements();
+        assert_eq!(ready.len(), 24, "lifetime completion is not capped at eight idle trims");
+        for identity in ready {
+            let slot = pools.unregister_resident(&identity, ResidentReclaim::ResourceReleased).unwrap();
+            assert_eq!(slot.pin_count, 0);
+            assert!(!slot.gpu_only_content);
+        }
+        assert!(pools.registry.is_empty(), "no maintenance tick was needed");
+        assert!(pools.take_ready_resident_retirements().is_empty());
+    }
+
+    #[test]
+    fn mrt_last_pin_abort_retirement_drains_every_released_allocation() {
+        let mut pools = ResourcePools::new();
+        let (_owners, pins) = released_pass_local_batch_pins(&mut pools, 24);
+        let mut pins = pins.into_iter();
+        while let Some(first) = pins.next() {
+            let second = pins.next().unwrap();
+            let mut target = BatchTarget::single(
+                first.identity.clone(), 16, 16, vk::Format::B8G8R8A8_UNORM,
+            );
+            target.secondaries.push(BatchAttachment {
+                identity: second.identity.clone(), width: 16, height: 16,
+                format: vk::Format::B8G8R8A8_UNORM,
+            });
+            let mut batch = OpenBatch {
+                cb: vk::CommandBuffer::null(), fence: vk::Fence::null(),
+                resident_states: pools.batch_attachment_states(&target).unwrap(),
+                target, attachment_pins: vec![first, second], draws: 1, dsets: Vec::new(),
+            };
+            pools.reject_recorded_batch(&mut batch);
+        }
+        let ready = pools.take_ready_resident_retirements();
+        assert_eq!(ready.len(), 24);
+        for identity in ready {
+            assert!(pools.unregister_resident(&identity, ResidentReclaim::ResourceReleased).is_some());
+        }
+        assert!(pools.registry.is_empty());
+    }
+
+    #[test]
+    fn mrt_last_pin_retirement_preserves_live_pinned_sole_copy_and_replacement_images() {
+        let mut pools = ResourcePools::new();
+        let mut pins = Vec::new();
+        let ids: Vec<_> = (0..5).map(|id| TargetIdentity::Surface {
+            id: 6000 + id, width: 16, height: 16, generation: 1,
+            format: vk::Format::B8G8R8A8_UNORM,
+        }).collect();
+        for (index, identity) in ids.iter().enumerate() {
+            let mut entry = super::images_and_registry::pin_count_tests::ready_slot();
+            entry.image = vk::Image::from_raw(3000 + index as u64);
+            entry.resource_released = index != 0;
+            entry.pin_count = if index == 1 { 2 } else { 1 };
+            entry.gpu_only_content = index == 2;
+            pins.push(ResidentAllocationRef { identity: identity.clone(), image: entry.image });
+            pools.registry.insert(identity.clone(), entry);
+        }
+        pools.registry.get_mut(&ids[3]).unwrap().image = vk::Image::from_raw(4003);
+        pools.release_batch_attachment_pins(pins);
+        pools.registry.get_mut(&ids[4]).unwrap().image = vk::Image::from_raw(4004);
+        assert!(pools.take_ready_resident_retirements().is_empty(),
+            "both last-pin release and retirement must match the native allocation");
+        assert_eq!(pools.registry[&ids[0]].pin_count, 0);
+        assert!(!pools.registry[&ids[0]].resource_released);
+        assert_eq!(pools.registry[&ids[1]].pin_count, 1);
+        assert!(pools.registry[&ids[2]].gpu_only_content);
+        assert_eq!(pools.registry[&ids[3]].pin_count, 1);
+    }
+
+    #[test]
+    fn mrt_batch_failed_submission_restores_every_attachment_publication() {
+        let mut pools = ResourcePools::new();
+        let target = mrt_attachment_set();
+        insert_mrt_attachments(&mut pools, &target);
+        let before: Vec<_> = target.identities().map(|identity| {
+            let slot = &pools.registry[identity];
+            (slot.access, slot.content_ready, slot.content_epoch, slot.gpu_only_content)
+        }).collect();
+        let mut batch = retained_mrt_batch(&mut pools, target.clone());
+        for identity in target.identities() {
+            pools.registry_mark_ready_at(identity, vk::ImageLayout::GENERAL);
+        }
+        pools.reject_recorded_batch(&mut batch);
+        for (identity, expected) in target.identities().zip(before) {
+            let slot = &pools.registry[identity];
+            assert_eq!((slot.access, slot.content_ready, slot.content_epoch, slot.gpu_only_content), expected);
+            assert_eq!(slot.pin_count, 0);
+        }
+        assert!(batch.resident_states.is_empty());
+        assert!(batch.attachment_pins.is_empty());
+    }
+
     /// Installing and taking the owned batch publish the exact state the drain
     /// tail uses to decide whether it has submission work.
     #[test]
@@ -6795,12 +7571,11 @@ mod recycle_tests {
         pools.install_open_batch(OpenBatch {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
-            target: BatchTarget {
-                identity: TargetIdentity::Anonymous { slot: 0 },
-                width: 16,
-                height: 16,
-                bgra: false,
-            },
+            target: BatchTarget::single(
+                TargetIdentity::Anonymous { slot: 0 }, 16, 16, vk::Format::R8G8B8A8_UNORM,
+            ),
+            attachment_pins: Vec::new(),
+            resident_states: Vec::new(),
             draws: 1,
             dsets: Vec::new(),
         });
@@ -6822,12 +7597,11 @@ mod recycle_tests {
         pools.open_batch = Some(OpenBatch {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
-            target: BatchTarget {
-                identity: TargetIdentity::Anonymous { slot: 0 },
-                width: 16,
-                height: 16,
-                bgra: false,
-            },
+            target: BatchTarget::single(
+                TargetIdentity::Anonymous { slot: 0 }, 16, 16, vk::Format::R8G8B8A8_UNORM,
+            ),
+            attachment_pins: Vec::new(),
+            resident_states: Vec::new(),
             draws: 1,
             dsets: Vec::new(),
         });
@@ -6865,12 +7639,9 @@ mod recycle_tests {
     /// would be reachable only through the environment.
     #[test]
     fn only_the_narrowed_arm_asks_what_the_open_batch_was_drawing_into() {
-        let target = |slot: u64| BatchTarget {
-            identity: TargetIdentity::Anonymous { slot },
-            width: 16,
-            height: 16,
-            bgra: false,
-        };
+        let target = |slot: u64| BatchTarget::single(
+            TargetIdentity::Anonymous { slot }, 16, 16, vk::Format::R8G8B8A8_UNORM,
+        );
         let mut pools = ResourcePools::new();
         pools.slots = (0..4).map(|_| idle_slot()).collect();
 
@@ -6883,6 +7654,8 @@ mod recycle_tests {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             target: target(0),
+            attachment_pins: Vec::new(),
+            resident_states: Vec::new(),
             draws: 1,
             dsets: Vec::new(),
         });
@@ -7357,18 +8130,16 @@ mod scatter_descriptor_sets_do_not_alias {
     }
 
     fn batch_target() -> super::BatchTarget {
-        super::BatchTarget {
-            identity: crate::backend::vulkan::engine::types::TargetIdentity::Surface {
+        super::BatchTarget::single(
+            crate::backend::vulkan::engine::types::TargetIdentity::Surface {
                 id: 56,
                 width: 1024,
                 height: 768,
                 generation: 1,
                 format: vk::Format::B8G8R8A8_UNORM,
             },
-            width: 1024,
-            height: 768,
-            bgra: true,
-        }
+            1024, 768, vk::Format::B8G8R8A8_UNORM,
+        )
     }
 
     /// A batch fills at the pool's own cap, not at the compiled constant.
@@ -7388,6 +8159,8 @@ mod scatter_descriptor_sets_do_not_alias {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             target: target.clone(),
+            attachment_pins: Vec::new(),
+            resident_states: Vec::new(),
             draws: 3,
             dsets: Vec::new(),
         });

@@ -24,6 +24,7 @@ mod driver_breadcrumb;
 mod exec;
 mod exec_compute;
 pub mod graphics_storage;
+mod serial_interlock;
 mod facade_decline;
 mod guest_scatter;
 mod host_ram;
@@ -431,6 +432,9 @@ fn release_host_alias(alias: (usize, usize)) {
 }
 
 pub fn take_released_host_aliases() -> Vec<(usize, usize)> {
+    for import in crate::runtime::guest_ram::take_owned_import_retirements() {
+        let _ = retire_guest_import(import);
+    }
     std::mem::take(&mut *RELEASED_HOST_ALIASES.lock())
 }
 
@@ -3747,13 +3751,11 @@ impl GuestPageTarget {
 /// * The bytes are not in guest RAM yet. Anything about to *read* them —
 ///   including the guest, via the stamp — must call [`quiesce_guest_writes`]
 ///   first.
-/// * On `Ok`, `identity`'s registry pin is now held by the entry carrying the
+/// * On `Ok`, the ledger's own registry pin is held by the entry carrying the
 ///   copy and released when its fence retires. **The caller must not unpin it**;
-///   unpinning here is what would let the reclaim take an image the GPU has not
-///   finished reading. An `Err` is a routing answer taken before anything was
-///   recorded, so the pin is untouched and the caller still owns it — which is
-///   what lets the copying arms below the decline unpin exactly as they always
-///   did.
+///   unpinning here would let reclaim take an image the GPU has not finished
+///   reading. The pin is recorded after successful submission and attached to
+///   that slot's already-sealed cleanup. An `Err` takes no ledger pin.
 ///
 /// # Errors
 ///

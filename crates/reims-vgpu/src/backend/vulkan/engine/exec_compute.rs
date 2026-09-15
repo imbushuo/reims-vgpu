@@ -469,11 +469,11 @@ pub(crate) unsafe fn execute_compute_inner(
 
     let push_constant = req.dispatch.push_constant_range();
 
-    let (spirv_digest, module) = caches.get_or_create_shader(ctx, &req.spirv, counters, pools)?;
+    let (spirv_digest, shader) = caches.get_or_create_shader(ctx, &req.spirv, counters, pools)?;
     let layout = caches.get_or_create_layout(ctx, &layout_bindings, push_constant, counters)?;
     let (dsl, pipeline_layout) = (layout.dsl, layout.pipeline_layout);
     let shader_source = super::caches::ShaderModuleSource {
-        module,
+        module: shader.module,
         spirv: &req.spirv,
     };
     // One pipeline per region workgroup size. A whole-workgroup module baked

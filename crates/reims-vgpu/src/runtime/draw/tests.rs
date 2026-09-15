@@ -3857,7 +3857,7 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
     // from a cache entry is what used to happen.
     let mut host = crate::runtime::host::FakeHost::new();
     assert!(
-        resolve_sampled_source(&mut state, &mut host, 0, tex_ref, None, true).is_none(),
+        resolve_sampled_source(&mut state, &mut host, 0, tex_ref, None, true, None).is_none(),
         "a ref with no object-list entry must resolve to no sampled source"
     );
 }
@@ -4597,9 +4597,10 @@ fn ref_texture_sample_uses_descriptor_surface_id_not_ref_collision() {
         3,
         [255u8, 0, 0, 255].repeat(4 * 3),
     );
+    mapper::stamp_guest_write_gen(&mut state, &mut host, surface_id);
 
     let (width, height, sampled_mid, sampled) =
-        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true)
+        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true, None)
             .expect("ref-texture descriptor surface must sample");
     assert_eq!((width, height, sampled_mid), (4, 3, surface_id));
     let SampledSourceRequest::Bytes(sampled, _, layout, _) = sampled else {
@@ -4628,6 +4629,7 @@ fn ref_texture_sample_uses_descriptor_surface_id_not_ref_collision() {
         texture_ref,
         threaded_resource,
         true,
+        None,
     )
     .expect("threaded-resource sample must resolve");
     assert_eq!(
@@ -4735,9 +4737,10 @@ fn mapper_ref_texture_host_cache_rung_identity_tracks_the_cached_frame() {
         3,
         [255u8, 0, 0, 255].repeat(4 * 3),
     );
+    mapper::stamp_guest_write_gen(&mut state, &mut host, surface_id);
 
     let resolve = |state: &mut DeviceState, host: &mut FakeHost| {
-        let (_, _, _, src) = resolve_sampled_source(state, host, 1, texture_ref, None, true)
+        let (_, _, _, src) = resolve_sampled_source(state, host, 1, texture_ref, None, true, None)
             .expect("host-cache rung must serve the stored frame");
         let SampledSourceRequest::Bytes(bytes, identity, layout, _) = src else {
             panic!("cache-backed fixture unexpectedly resolved a resident target");
@@ -4804,6 +4807,7 @@ fn mapper_ref_texture_host_cache_rung_identity_tracks_the_cached_frame() {
         3,
         [0u8, 0, 255, 255].repeat(4 * 3),
     );
+    mapper::stamp_guest_write_gen(&mut state, &mut host, surface_id);
     let (second_bytes, second_id) = resolve(&mut state, &mut host);
     let second_id = second_id.expect("a rewritten cache entry is still identifiable");
     assert_ne!(
@@ -4936,7 +4940,7 @@ fn ref_texture_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     assert!(state.set_mapping_device_desc(surface_id, &device_desc));
 
     let (sample_w, sample_h, sample_mid, sampled) =
-        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true)
+        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true, None)
             .expect("serialized RG8 view must sample the 2-byte surface");
     assert_eq!(
         (sample_w, sample_h, sample_mid),
@@ -5076,7 +5080,7 @@ fn ref_texture_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn ref_texture_view_materializes_only_when_base_identity_differs() {
+fn ref_texture_view_materializes_when_rgba8_fallback_cannot_preserve_the_view() {
     use crate::protocol::pixel_format::MTL_FORMAT_RG8_UNORM;
 
     let exact = objects::RefTextureView {
@@ -5095,6 +5099,13 @@ fn ref_texture_view_materializes_only_when_base_identity_differs() {
     ));
     assert!(ref_texture_view_requires_materialization(
         true, 1920, 1080, 0, exact
+    ));
+    let native_half = objects::RefTextureView {
+        pixel_format: pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+        ..exact
+    };
+    assert!(ref_texture_view_requires_materialization(
+        true, 1920, 1080, native_half.pixel_format, native_half,
     ));
 
     let rg8_view = objects::RefTextureView {
@@ -6364,6 +6375,8 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
         store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
+        target_seed_native: None,
+        guest_mip_level: 0,
         multisample_source_ref: 0,
     };
 
@@ -6573,6 +6586,8 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
         store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
+        target_seed_native: None,
+        guest_mip_level: 0,
         multisample_source_ref: 0,
     };
     // Full height, left half only: the partial store the Load seed forces, and

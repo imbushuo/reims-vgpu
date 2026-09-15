@@ -5,7 +5,7 @@
 use ash::vk;
 use ash::vk::Handle;
 use std::collections::{HashMap, VecDeque};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -326,7 +326,7 @@ pub(crate) struct ResourcePools {
     /// pages** ([`ResourcePools::note_guest_write_recorded`]). That last one is
     /// the correctness edge: a bind after a Store into the same pages must see
     /// what the Store wrote, and reusing a copy taken before it would not.
-    cb_bound_buffers: HashMap<(usize, u64, u64), (super::exec::BoundBuffer, CbBindOwner)>,
+    cb_bound_buffers: HashMap<(usize, u64, u64), (super::exec::BoundBuffer, CbBindRetention)>,
     /// Keys in `cb_bound_buffers` whose slot is **not yet filled**: a GPU gather
     /// was planned for them and the copy or dispatch that lands it has not been
     /// recorded into the command buffer.
@@ -627,6 +627,8 @@ pub(crate) struct ResourcePools {
     /// treat it as in flight; every path that claims a slot or quiesces the
     /// ring flushes it first ([`Self::batch_flush`]).
     open_batch: Option<OpenBatch>,
+    resident_journal: Option<Vec<BatchResidentState>>,
+    released_resident_allocations: Vec<ResidentAllocationRef>,
     /// How many draws one command buffer may carry: the topology policy from
     /// [`batch_default_draws`] unless [`crate::config::BATCH_DRAWS`] narrowed it.
     ///
@@ -695,7 +697,8 @@ pub(crate) struct ResourcePools {
     guest_writes_in_flight: bool,
     /// Residents pinned by guest-page copies in the command buffer currently
     /// being recorded. [`ResourcePools::seal_entry`] transfers them to that
-    /// submission's [`PendingGpuCleanup`].
+    /// submission's [`PendingGpuCleanup`]. A copy that records its pin after
+    /// submission attaches it directly to the current slot's cleanup instead.
     ///
     /// A window's flush used to unpin its resident as soon as the copy returned,
     /// which was safe only because the copy had already executed by then. With
@@ -715,30 +718,66 @@ pub(crate) struct ResourcePools {
     initialized: bool,
 }
 
-/// State of the deferred-submit draw batch (draw-batching increment 1): the
-/// opener's ring slot CB stays in recording state across joinable same-target
-/// draws; per-draw descriptor sets and sampled-cache admissions accumulate
-/// here and seal as ONE entry at flush.
-/// What a deferred-submit batch is a batch *of*.
-///
-/// One value rather than four parameters, because these four decide two
-/// different things in two places — whether a draw may join the open batch
-/// (`batch_fit`) and what the batch records when one opens (`batch_append`) —
-/// and they were spelled out at both. Two of them are adjacent `u32`s, so a
-/// `width`/`height` transposition between the question and the answer compiles
-/// and produces a batch that admits draws of the wrong shape.
-///
-/// Derived `PartialEq` is the *narrowed* join test — the arm
-/// [`crate::config::BATCH_MIXED_TARGETS`]`=off` selects — so the fields it turns on
-/// cannot drift from the fields the batch carries: adding one here makes it
-/// decide joins without a second edit. The default arm does not compare it at
-/// all; see [`BatchFit`].
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct BatchTarget {
+/// One attachment's allocation and the exact view used by the draw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BatchAttachment {
     pub identity: TargetIdentity,
     pub width: u32,
     pub height: u32,
-    pub bgra: bool,
+    pub format: vk::Format,
+}
+
+pub(crate) struct BatchResidentState {
+    identity: TargetIdentity,
+    image: vk::Image,
+    access: ResidentAccess,
+    content_ready: bool,
+    content_epoch: Option<u32>,
+    sole_copy: bool,
+}
+
+pub(crate) struct BatchDrawAttachments {
+    pub target: BatchTarget,
+    pub resident_states: Vec<BatchResidentState>,
+}
+
+struct ResidentAllocationRef {
+    identity: TargetIdentity,
+    image: vk::Image,
+}
+
+/// MRT batches retain one complete attachment set. Single-color batches keep
+/// their existing optional mixed-target policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BatchTarget {
+    pub primary: BatchAttachment,
+    pub secondaries: Vec<BatchAttachment>,
+    pub depth: Option<BatchAttachment>,
+    pub render_area: (u32, u32),
+    pub samples: u32,
+}
+
+impl BatchTarget {
+    pub(crate) fn single(identity: TargetIdentity, width: u32, height: u32, format: vk::Format) -> Self {
+        Self {
+            primary: BatchAttachment { identity, width, height, format },
+            secondaries: Vec::new(),
+            depth: None,
+            render_area: (width, height),
+            samples: 1,
+        }
+    }
+
+    pub(crate) fn is_mrt(&self) -> bool {
+        !self.secondaries.is_empty()
+    }
+
+    fn identities(&self) -> impl Iterator<Item = &TargetIdentity> {
+        std::iter::once(&self.primary)
+            .chain(self.secondaries.iter())
+            .chain(self.depth.iter())
+            .map(|attachment| &attachment.identity)
+    }
 }
 
 /// Whether a draw can append to the open batch, and when it cannot, why.
@@ -759,6 +798,8 @@ pub(crate) enum BatchFit {
     /// A batch is recording on a different [`BatchTarget`], and
     /// [`crate::config::BATCH_MIXED_TARGETS`] is off.
     OtherTarget,
+    /// An attachment of the open MRT batch was retired or lost its contents.
+    RetiredAttachment,
     /// Room in the recording batch: its command buffer and the fence its flush
     /// will submit with.
     Open(vk::CommandBuffer, vk::Fence),
@@ -1187,8 +1228,11 @@ fn scissors_match(a: &[vk::Rect2D], b: &[vk::Rect2D]) -> bool {
 pub(crate) struct OpenBatch {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
-    /// Only the narrowed arm reads this; see [`BatchFit::OtherTarget`].
+    /// Full MRT attachment identity, or the single-color mixed-target baseline.
     target: BatchTarget,
+    /// Registry retention transferred to this submission's fence cleanup.
+    attachment_pins: Vec<ResidentAllocationRef>,
+    resident_states: Vec<BatchResidentState>,
     draws: u64,
     /// Per-draw descriptor sets paired with the arena block they were allocated
     /// from, so the flush-time free routes each set to its owning pool.
@@ -1532,6 +1576,7 @@ pub(crate) struct PendingGpuCleanup {
     /// Resident pins held by guest-page copies in this submission. The slot's
     /// fence is their lifetime boundary.
     unpin_residents: Vec<TargetIdentity>,
+    batch_attachment_pins: Vec<ResidentAllocationRef>,
     /// The same, in the compute-storage registry.
     unpin_compute_residents: Vec<crate::model::ComputeStorageResidencyKey>,
 }
@@ -3372,6 +3417,12 @@ pub(crate) enum CbBindOwner {
     Runs(std::sync::Arc<Vec<super::types::GuestRun>>),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CbBindRetention {
+    _owner: CbBindOwner,
+    guest_read: bool,
+}
+
 /// One bind's identity, inseparable from the allocation that identity names.
 ///
 /// The point of the type is that [`ResourcePools::note_cb_bound_buffer`] takes
@@ -3386,7 +3437,7 @@ pub(crate) enum CbBindOwner {
 #[derive(Clone, Debug)]
 pub(crate) struct CbBind {
     key: (usize, u64, u64),
-    owner: CbBindOwner,
+    retention: CbBindRetention,
 }
 
 impl CbBind {
@@ -3396,11 +3447,15 @@ impl CbBind {
         match content {
             super::types::BufferContent::Bytes(b) => Self {
                 key: Self::key_of(content),
-                owner: CbBindOwner::Bytes(std::sync::Arc::clone(b)),
+                retention: CbBindRetention {
+                    _owner: CbBindOwner::Bytes(std::sync::Arc::clone(b)), guest_read: false,
+                },
             },
             super::types::BufferContent::GuestRuns(src) => Self {
                 key: Self::key_of(content),
-                owner: CbBindOwner::Runs(std::sync::Arc::clone(&src.runs)),
+                retention: CbBindRetention {
+                    _owner: CbBindOwner::Runs(std::sync::Arc::clone(&src.runs)), guest_read: false,
+                },
             },
         }
     }
@@ -3440,31 +3495,19 @@ impl CbBind {
     }
 
     /// Split into what the map stores under it.
-    fn into_parts(self) -> ((usize, u64, u64), CbBindOwner) {
-        (self.key, self.owner)
+    pub(crate) fn note_guest_read(&mut self) {
+        self.retention.guest_read = true;
+    }
+
+    fn into_parts(self) -> ((usize, u64, u64), CbBindRetention) {
+        (self.key, self.retention)
     }
 }
 
-/// 128-bit content fingerprint for the sampled cache.
-///
-/// The sampled cache matches an incoming blob to a retained VkImage by this
-/// fingerprint alone — it no longer keeps a byte copy to `memcmp` against, so
-/// the width must make an accidental collision (different content, identical
-/// digest, identical geometry/format key) astronomically unlikely: at 128 bits
-/// the birthday bound across the 64-entry cache is ~2^-116, far below the host
-/// GPU's own soft-error rate. Two independently salted `DefaultHasher`
-/// (SipHash-1-3) passes over the *warm* source bytes are still strictly cheaper
-/// than the old one-hash-plus-cold-full-frame-`memcmp` (which pulled the
-/// retained 8 MiB copy back through DRAM on every hit).
+/// Process-local sampled-cache bucket. Retained byte equality decides a hit;
+/// identical immutable allocations bypass both hashing and comparison.
 fn sampled_content_hash(bytes: &[u8]) -> u128 {
-    let mut lo = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut lo);
-    let mut hi = std::collections::hash_map::DefaultHasher::new();
-    // Distinct salt so the two digests are independent (else both hashers see
-    // the same input and finish() to correlated values, collapsing to 64 bits).
-    hi.write_u64(0x9e37_79b9_7f4a_7c15);
-    bytes.hash(&mut hi);
-    ((hi.finish() as u128) << 64) | lo.finish() as u128
+    xxhash_rust::xxh3::xxh3_128(bytes)
 }
 
 /// Which pool asked for a `vkAllocateMemory`.
@@ -3787,8 +3830,7 @@ mod sampled_key_tests {
 mod content_hash_tests {
     use super::sampled_content_hash;
 
-    /// Identical bytes must fingerprint identically — this is what lets a repeat
-    /// bind hit the retained image without the (now removed) full-frame memcmp.
+    /// Equal bytes from different allocations reach the same candidate bucket.
     #[test]
     fn identical_content_hashes_equal() {
         let a = vec![0x11u8; 4096];
@@ -3796,9 +3838,7 @@ mod content_hash_tests {
         assert_eq!(sampled_content_hash(&a), sampled_content_hash(&b));
     }
 
-    /// A single differing byte must change the digest — a stale bind is the
-    /// regression this guards (dropping the memcmp made the digest the sole
-    /// arbiter of "same content").
+    /// Changed content should avoid an unnecessary exact-byte comparison.
     #[test]
     fn single_byte_change_flips_digest() {
         let mut a = vec![0x11u8; 4096];
@@ -3807,10 +3847,7 @@ mod content_hash_tests {
         assert_ne!(base, sampled_content_hash(&a));
     }
 
-    /// The two 64-bit halves must be independent: if the high half were just a
-    /// copy of the low half the fingerprint would collapse to 64 bits and the
-    /// birthday bound the memcmp removal relies on would not hold. Distinct
-    /// content that happened to collide on 64 bits must still differ on 128.
+    /// Retain the whole fingerprint rather than duplicating its low half.
     #[test]
     fn halves_are_independent() {
         // Different lengths and contents: high and low halves must not mirror.

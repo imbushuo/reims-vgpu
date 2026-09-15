@@ -103,11 +103,14 @@ use std::sync::Arc;
 use crate::runtime::guest_ram::GuestRun;
 use crate::runtime::guest_ram_map::GuestWindowRun;
 
-/// One task buffer reconstructed as a stable, contiguous host allocation.
+/// One task buffer reconstructed as a retained contiguous host allocation.
 ///
 /// The allocation follows the buffer's task-virtual byte order even when its
 /// guest-physical pages are scattered. Every offset bind can therefore slice
 /// this one checked import instead of gathering the same pages into scratch.
+/// Owned aliases retain their footprint and physical lease through every run;
+/// retiring the resource revokes the import without releasing a live CPU/GPU
+/// reference to the mapping.
 #[derive(Clone, Debug)]
 pub struct PackedBuffer {
     pub gva: u64,
@@ -135,6 +138,14 @@ pub enum PackedBufferResolution {
 }
 
 impl PackedBufferResolution {
+    fn retire_owned_import(&self) {
+        if let Self::Available(buffer) = self {
+            if buffer.import.owned_host_allocation().is_some() {
+                buffer.import.retire();
+            }
+        }
+    }
+
     fn overlaps(&self, gva: u64, len: u64) -> bool {
         let (base, span) = match self {
             Self::Available(buffer) => (buffer.gva, buffer.size),
@@ -363,7 +374,9 @@ impl BoundBuffers {
     }
 
     pub fn insert_packed(&mut self, task_id: u32, buffer_ref: u32, packed: PackedBufferResolution) {
-        self.packed.insert((task_id, buffer_ref), packed);
+        if let Some(old) = self.packed.insert((task_id, buffer_ref), packed) {
+            old.retire_owned_import();
+        }
     }
 
     /// Drop everything held for one task.
@@ -373,7 +386,11 @@ impl BoundBuffers {
     pub fn retire_task(&mut self, task_id: u32) -> usize {
         let before = self.held.len();
         self.held.retain(|k, _| k.task != task_id);
-        self.packed.retain(|(task, _), _| *task != task_id);
+        self.packed.retain(|(task, _), buffer| {
+            let keep = *task != task_id;
+            if !keep { buffer.retire_owned_import(); }
+            keep
+        });
         before - self.held.len()
     }
 
@@ -406,7 +423,9 @@ impl BoundBuffers {
         let before = self.held.len();
         self.held
             .retain(|k, _| k.task != task_id || k.buffer_ref != buffer_ref);
-        self.packed.remove(&(task_id, buffer_ref));
+        if let Some(old) = self.packed.remove(&(task_id, buffer_ref)) {
+            old.retire_owned_import();
+        }
         before - self.held.len()
     }
 
@@ -417,13 +436,19 @@ impl BoundBuffers {
         let before = self.held.len();
         self.held
             .retain(|k, b| k.task != task_id || !b.overlaps(gva, len));
-        self.packed
-            .retain(|(task, _), b| *task != task_id || !b.overlaps(gva, len));
+        self.packed.retain(|(task, _), buffer| {
+            let keep = *task != task_id || !buffer.overlaps(gva, len);
+            if !keep { buffer.retire_owned_import(); }
+            keep
+        });
         before - self.held.len()
     }
 
     /// Drop everything. Device reset, where no guest state survives.
     pub fn clear(&mut self) {
+        for buffer in self.packed.values() {
+            buffer.retire_owned_import();
+        }
         self.held.clear();
         self.packed.clear();
     }

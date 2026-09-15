@@ -5616,6 +5616,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
             texture_ref: c.texture_ref,
             mapping_id: c.mapping_id,
             target_gva: c.target_gva,
+            guest_mip_level: c.guest_mip_level,
             row_stride: c.row_stride,
             width: c.width,
             height: c.height,
@@ -5625,6 +5626,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
             store_action: c.store_action,
             clear_color: c.clear_color,
             target_seed_rgba: None,
+            target_seed_native: None,
             multisample_source_ref: c.multisample_source_ref,
         })
         .collect();

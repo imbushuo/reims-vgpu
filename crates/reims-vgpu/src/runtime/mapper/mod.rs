@@ -1495,6 +1495,9 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     for (ptr, len) in released {
         host.unmap_pages(ptr, len);
     }
+    for (ptr, len) in crate::runtime::guest_ram::take_released_owned_host_allocations() {
+        host.unmap_pages(ptr, len);
+    }
     // Same shape and the same reason: a guest-write token is host-side state
     // for a page list that no longer exists, and only the host can free it.
     for token in state.retired_guest_write_tokens.drain(..) {
@@ -1502,14 +1505,15 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     }
 }
 
-/// Return backend aliases whose terminal fence-safe destruction has completed
-/// to the host. Called from the device heartbeat so release does not depend on
-/// another guest mapping event arriving.
+/// Return terminal native aliases and physical leases whose last CPU/native
+/// holder is gone. Called from the device heartbeat so release does not depend
+/// on another guest mapping event arriving.
 ///
 /// A rail that holds no alias of guest RAM releases none and this returns zero,
 /// which is what the heartbeat did on that arm before it was gated.
 pub fn drain_deferred_unmaps<H: HostOps>(host: &mut H) -> usize {
-    let released = crate::backend::selected().take_released_host_aliases();
+    let mut released = crate::backend::selected().take_released_host_aliases();
+    released.extend(crate::runtime::guest_ram::take_released_owned_host_allocations());
     let count = released.len();
     for (ptr, len) in released {
         host.unmap_pages(ptr, len);
@@ -1682,6 +1686,34 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     host: &M,
     mapping_id: u32,
 ) -> GuestWriteVerdict {
+    mapping_guest_write_verdict_with(state, mapping_id, |token| host.guest_write_gen(token))
+}
+
+/// A delayed harvest cannot establish currency for a new command's CPU-visible
+/// surface. Hosts without either current observation keep the checked read path.
+#[cfg(any(test, feature = "backend-vulkan"))]
+pub(crate) fn mapping_current_guest_write_verdict<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+) -> GuestWriteVerdict {
+    use crate::runtime::host::CurrentGuestWrite;
+    mapping_guest_write_verdict_with(state, mapping_id, |token| {
+        match host.guest_write_gen_current(token) {
+            CurrentGuestWrite::Current(generation) => Some(generation).filter(|&gen| gen != 0),
+            CurrentGuestWrite::Unsupported if host.guest_write_gen_is_current() => {
+                host.guest_write_gen(token)
+            }
+            CurrentGuestWrite::Unsupported | CurrentGuestWrite::Unavailable => None,
+        }
+    })
+}
+
+fn mapping_guest_write_verdict_with(
+    state: &DeviceState,
+    mapping_id: u32,
+    observe: impl FnOnce(u64) -> Option<u64>,
+) -> GuestWriteVerdict {
     let Some(m) = state.mappings.get(&mapping_id) else {
         return GuestWriteVerdict::NoMapping;
     };
@@ -1727,7 +1759,7 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     {
         return GuestWriteVerdict::NoStamp;
     }
-    match host.guest_write_gen(m.guest_write_token) {
+    match observe(m.guest_write_token) {
         Some(gen_) if gen_ == m.guest_write_gen_at_store => GuestWriteVerdict::Clean,
         Some(_) => GuestWriteVerdict::Wrote,
         None => GuestWriteVerdict::Unreadable,
@@ -2030,10 +2062,11 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
 
 /// The owning counterpart to the legacy stable-view import entry point.
 ///
-/// `MappingEntry` retains the view and import identity, and its retirement path
-/// retires that import before unmapping. Metal's import deallocator completes
-/// the release handshake; generic borrowed-run consumers do not use this door.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+/// `MappingEntry` retains the view and import identity. Vulkan-owned aliases
+/// carry a physical lease through CPU runs and native retirement; Metal retains
+/// its existing import-deallocator handshake. Generic borrowed-run consumers
+/// do not use this door.
+#[cfg(any(feature = "backend-vulkan", feature = "backend-metal"))]
 pub(crate) fn ensure_owned_contig_import_with_footprint<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2073,9 +2106,27 @@ fn checked_contig_import_with_footprint<H: HostMemory + HostOps>(
             return Some((std::sync::Arc::clone(import), footprint));
         }
     }
-    let import = std::sync::Arc::new(
-        crate::runtime::guest_ram::GuestRamImport::new_host_allocation(ptr, len, align).ok()?,
-    );
+    let old = state.mappings.get(&mapping_id)?.contig_import.clone();
+    let owned = crate::backend::selected().rail() == crate::backend::Rail::Vulkan
+        && !host.map_pages_stable() && host.map_pages_owned();
+    let import = if owned {
+        if let Some(owner) = old.as_ref().and_then(|import| import.owned_host_allocation())
+            .filter(|owner| owner.host_base() == ptr && owner.len() as u64 == len)
+        {
+            crate::runtime::guest_ram::GuestRamImport::from_owned_allocation(owner, align).ok()?
+        } else {
+            // MappingEntry transfers this acquisition to the lease on success.
+            unsafe { crate::runtime::guest_ram::GuestRamImport::new_owned_host_allocation(
+                ptr, len, align, footprint.clone(),
+            ) }.ok()?
+        }
+    } else {
+        crate::runtime::guest_ram::GuestRamImport::new_host_allocation(ptr, len, align).ok()?
+    };
+    if let Some(old) = old.filter(|old| old.owned_host_allocation().is_some()) {
+        old.retire();
+    }
+    let import = std::sync::Arc::new(import);
     state.mappings.get_mut(&mapping_id)?.contig_import = Some(std::sync::Arc::clone(&import));
     Some((import, footprint))
 }

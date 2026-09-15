@@ -182,6 +182,32 @@ pub fn surface_currency<M: HostOps>(
     height: u32,
 ) -> SurfaceCurrency {
     let verdict = mapper::mapping_guest_write_verdict(state, host, mapping_id);
+    currency_from_verdict(state, host, mapping_id, width, height, verdict)
+}
+
+/// Current observation for copies whose Store has already been published to
+/// guest backing. Callers require `WatchedAndUnwritten`; unavailable observation
+/// is a cache miss, not evidence authorizing a late merge over guest bytes.
+#[cfg(any(test, feature = "backend-vulkan"))]
+pub(crate) fn current_surface_currency<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> SurfaceCurrency {
+    let verdict = mapper::mapping_current_guest_write_verdict(state, host, mapping_id);
+    currency_from_verdict(state, host, mapping_id, width, height, verdict)
+}
+
+fn currency_from_verdict<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    verdict: GuestWriteVerdict,
+) -> SurfaceCurrency {
     if !matches!(verdict, GuestWriteVerdict::Wrote) {
         return SurfaceCurrency::Unwritten(verdict);
     }
@@ -240,6 +266,35 @@ fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delayed_generation_never_proves_current_surface_pixels() {
+        use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::runtime::host::FakeHost;
+        for shift in [PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
+            let mut state = DeviceState::new(DeviceId(1), shift);
+            let mut host = FakeHost::new();
+            host.guest_write_deferred = true;
+            assert!(state.map_surface(5));
+            assert!(state.set_mapping_geom(5, 4, 4, pixel_format::MTL_FORMAT_BGRA8_UNORM));
+            state.mappings.get_mut(&5).unwrap().page_entries =
+                vec![(0x20 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            mapper::stamp_guest_write_gen(&mut state, &mut host, 5);
+            assert_eq!(mapper::mapping_guest_write_verdict(&state, &host, 5), GuestWriteVerdict::Clean);
+            let current = |host: &FakeHost| current_surface_currency(&state, host, 5, 4, 4)
+                .serves(CurrencyStandard::WatchedAndUnwritten);
+            assert!(!current(&host), "delayed/KVM observation is not a freshness proof");
+            host.guest_write_current_supported = true;
+            assert!(current(&host));
+            host.guest_write_current_unavailable = true;
+            assert!(!current(&host), "dirty/reprotecting pages cannot license reuse");
+            assert_eq!(mapper::mapping_guest_write_verdict(&state, &host, 5), GuestWriteVerdict::Clean);
+            host.guest_write_current_unavailable = false;
+            host.guest_wrote_page(state.pfn_gpa(0x20));
+            assert!(!current(&host), "an advanced current generation invalidates the copy");
+        }
+    }
 
     /// The coarse stage admits everything that is not positive evidence.
     ///

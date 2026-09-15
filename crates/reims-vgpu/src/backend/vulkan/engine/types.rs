@@ -519,6 +519,10 @@ pub struct DrawRequest {
     pub sampled_images: Vec<SampledImageResource>,
     /// Unique native writable images and every sampled/storage alias of them.
     pub storage_textures: Vec<super::graphics_storage::GraphicsStorageTexture>,
+    pub interlock_isolation: Option<Result<
+        crate::runtime::draw::vulkan::InterlockIsolation,
+        crate::runtime::draw::vulkan::InterlockIsolationRefusal,
+    >>,
     pub samplers: Vec<SamplerResource>,
     /// CPU Load seed for the color target, in the order
     /// [`DrawRequest::target_seed_order`] names.
@@ -527,6 +531,7 @@ pub struct DrawRequest {
     /// `surface_cache` does — can seed a draw with a refcount instead of a
     /// whole-framebuffer copy.
     pub target_rgba8: Option<std::sync::Arc<Vec<u8>>>,
+    pub target_native_seed: Option<crate::runtime::draw::NativeColorSeed>,
     /// Guest-page form of the same LOAD seed. Mutually exclusive with
     /// [`Self::target_rgba8`], [`Self::load_from_target`] and
     /// [`Self::seed_from_target`]. The engine imports/gathers these bytes in
@@ -2251,8 +2256,8 @@ pub enum SampledSource {
     GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherVouch),
 }
 
-/// One packed-contiguous guest-RAM span (a direct RAMBlock alias from
-/// `HostOps::map_pages`; stable for the VM lifetime, unmap is a no-op).
+/// One packed-contiguous guest-RAM span: either a stable borrowed alias or a
+/// checked reference retaining its import and any owned host-allocation lease.
 ///
 /// Owned by [`crate::runtime::guest_ram`] and re-exported here, because a host
 /// span over guest memory is the memory layer's vocabulary and not the
@@ -2266,10 +2271,10 @@ pub use crate::runtime::guest_ram::GuestRun;
 /// tight (`total_len == tight_row_bytes * height`); a nonzero value gives
 /// the guest row stride in texels for padded layouts, and the window then
 /// spans `(height-1) * stride_bytes + tight_row_bytes` (the final row needs
-/// only its texels — padding past the last row may not be mapped). Every run's
-/// [`GuestRun::host_ptr`]`..+`[`len`](GuestRun::len) must already be a live
-/// `HostOps::map_pages` alias when the source is built: the gather reads it
-/// directly and has nothing to check it against.
+/// only its texels — padding past the last row may not be mapped). Borrowed
+/// runs require a stable host alias; owned runs retain the checked allocation
+/// themselves. Native buffer imports retain that allocation's physical lease
+/// independently through fence-safe destruction.
 #[derive(Clone, Debug)]
 pub struct GuestRunSource {
     pub runs: std::sync::Arc<Vec<GuestRun>>,

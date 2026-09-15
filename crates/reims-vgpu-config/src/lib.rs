@@ -257,6 +257,11 @@ pub const SWAPCHAIN_FIFO: &str = "REIMS_VGPU_SWAPCHAIN_FIFO";
 /// Verbose per-draw logging on top of the always-on fail sink.
 pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 
+/// Opt-in Vulkan native-graphics creation diagnostics. Reports canonical PSO
+/// components and legally available creation feedback only on creation misses;
+/// it does not change lookup keys, synchronization or renderer defaults.
+pub const PIPELINE_DIAGNOSTICS: &str = "REIMS_VGPU_PIPELINE_DIAGNOSTICS";
+
 /// Write every AIR blob this device translates to `/tmp/reims-vgpu-air/`,
 /// named by the SPIR-V its translation produced.
 ///

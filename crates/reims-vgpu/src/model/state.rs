@@ -3689,18 +3689,21 @@ impl DeviceState {
     }
 
     /// Detach `e`'s contiguous view for later unmap (page table changed).
-    /// Returns the retired (ptr, len) to push into `retired_views`.
+    /// Legacy views return an unmap record. An owned import's physical lease
+    /// instead releases through the guest-memory return queue after all holders.
     fn take_mapping_view(
         e: &mut MappingEntry,
     ) -> (
         Option<(usize, usize)>,
         Option<crate::runtime::guest_ram::ImportId>,
     ) {
-        let import = e.contig_import.take().map(|import| {
+        let owned = e.contig_import.as_ref()
+            .is_some_and(|import| import.owned_host_allocation().is_some());
+        let import = e.contig_import.take().and_then(|import| {
             import.retire();
-            import.id()
+            (!owned).then_some(import.id())
         });
-        let view = (e.contig_ptr != 0).then_some((e.contig_ptr, e.contig_len));
+        let view = (e.contig_ptr != 0 && !owned).then_some((e.contig_ptr, e.contig_len));
         e.contig_ptr = 0;
         e.contig_len = 0;
         e.contig_footprint = None;
@@ -3727,6 +3730,7 @@ impl DeviceState {
     /// Returning the views lets the runtime invalidate backend aliases first,
     /// then release them through the bound HostOps implementation.
     pub fn take_all_host_views(&mut self) -> Vec<(usize, usize)> {
+        self.bound_buffers.clear();
         let mut views = std::mem::take(&mut self.retired_views);
         let mut tokens = std::mem::take(&mut self.retired_guest_write_tokens);
         for mapping in self.mappings.values_mut() {

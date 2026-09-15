@@ -275,17 +275,15 @@ declare void @air.write_texture_2d{suffix}.v4f32(ptr addrspace(1), <2 x i32>, <4
                 (F::Rgba32Float, spirv_bind::ImageFormat::Rgba32Float, 0),
                 (F::Bgra8Unorm, spirv_bind::ImageFormat::Unknown, 0),
             ] {
-                let resources = [GraphicsStorageTexture {
-                    format, width: 1, height: 1, bytes: vec![0; format.bytes_per_texel()],
-                    bindings: vec![GraphicsTextureBinding {
-                        binding, access: GraphicsTextureAccess::Storage, stage,
-                    }],
-                }];
-                let mut words = std::sync::Arc::new(original.clone());
-                spirv_bind::specialize_image_formats(
-                    std::sync::Arc::make_mut(&mut words), &[(binding, image_format)],
-                ).unwrap();
-                specialize_write_rounding(&resources, &mut words, stage).unwrap();
+                let original = std::sync::Arc::new(original.clone());
+                let variant = crate::runtime::m2v_cache::ShaderVariant::for_test(original.clone());
+                let key = crate::runtime::m2v_cache::GraphicsStorageVariantKey {
+                    formats: vec![(binding, image_format)],
+                    normalized: if format == F::Bgra8Unorm { vec![binding] } else { vec![] },
+                };
+                let words = variant.storage_words(&original, key.clone()).unwrap();
+                let repeated = variant.storage_words(&original, key).unwrap();
+                assert!(std::sync::Arc::ptr_eq(&words, &repeated));
                 let values = rounding_spec_values(&words);
                 assert_eq!(values[&NATIVE_TEXTURE_WRITE_ROUNDING_SPEC_ID], 1);
                 assert_eq!(values[&TEXTURE_WRITE_FORMAT_SPEC_ID_BASE], precision,
@@ -298,15 +296,83 @@ declare void @air.write_texture_2d{suffix}.v4f32(ptr addrspace(1), <2 x i32>, <4
 
 #[test]
 fn graphics_storage_rounding_specialization_failure_is_typed() {
-    let stage = ash::vk::ShaderStageFlags::FRAGMENT;
-    let resources = [GraphicsStorageTexture {
-        format: crate::backend::vulkan::engine::StorageImageFormat::Rgba16Float,
-        width: 1, height: 1, bytes: vec![0; 8],
-        bindings: vec![GraphicsTextureBinding {
-            binding: 1152, access: GraphicsTextureAccess::Storage, stage,
-        }],
-    }];
-    let mut words = std::sync::Arc::new(Vec::new());
-    assert!(matches!(specialize_write_rounding(&resources, &mut words, stage),
-        Err(Refused::WriteRounding { stage: failed, .. }) if failed == stage));
+    let words = std::sync::Arc::new(Vec::new());
+    let variant = crate::runtime::m2v_cache::ShaderVariant::for_test(words.clone());
+    assert!(matches!(variant.storage_words(&words, Default::default()),
+        Err(crate::runtime::m2v_cache::GraphicsStorageVariantError::Rounding(_))));
+}
+
+#[test]
+fn serial_interlock_isolation_uses_live_owners_and_guest_bytes_not_reference_inequality() {
+    use ash::vk;
+    use crate::backend::vulkan::engine::{DrawRequest, TargetIdentity, StorageImageFormat};
+    use crate::runtime::draw::vulkan::InterlockIsolationRefusal as E;
+    for source_page in [6u32, 5, 1000] {
+        let (mut state, mut host, mut req, _) = fixture(1);
+        let owner = objects::resolve_resource(&state, &host, 1, 7).unwrap();
+        let lifetime = owner.lifetime_ref();
+        let mut descriptor = owner.descriptor.to_vec();
+        st32(&mut descriptor[LINEAR_DESC_HANDLE..], source_page);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], 0x500, &descriptor);
+        let mut entry = [0; OBJECT_LIST_ENTRY_LEN];
+        st32(&mut entry, u32::from(OBJECT_TYPE_TEXTURE) | ((descriptor.len() as u32) << 8));
+        st64(&mut entry[4..], 0x500);
+        write_task_gva_arm64e(&mut host, &state.tasks[1],
+            list_object_entry_offset(8, 32).unwrap(), &entry);
+        objects::resolve_resource(&state, &host, 1, 8).unwrap();
+        let scope = crate::runtime::draw::BufferSnapshotScope::new();
+        req.input_snapshot_scope = Some(scope.reference());
+        req.fragment_textures = vec![TextureBind {
+            index: 3, texture_ref: 7, resource: Some(owner.clone()),
+        }].into();
+        req.colors = vec![ColorRtRequest {
+            texture_ref: 8, target_gva: u64::from(source_page) << PAGE_SHIFT_ARM64E,
+            width: 4, height: 2, row_stride: 48, sample_count: 1,
+            format: pixel_format::MTL_FORMAT_RGBA16_FLOAT, ..Default::default()
+        }];
+        let mut storage = StorageTextures::stage(&mut state, &mut host, &req,
+            &reflection(ShaderStage::Vertex, &[]),
+            &reflection(ShaderStage::Fragment, &[(3, true)])).unwrap();
+        let native = DrawRequest {
+            width: 4, height: 2,
+            target_identity: Some(TargetIdentity::Gva {
+                gva: req.colors[0].target_gva, width: 4, height: 2, generation: 1,
+                format: vk::Format::R16G16B16A16_SFLOAT,
+            }),
+            storage_textures: vec![GraphicsStorageTexture {
+                format: StorageImageFormat::Rgba16Float, width: 4, height: 2,
+                bytes: storage.textures[&7].staged.bytes.clone(),
+                bindings: vec![GraphicsTextureBinding {
+                    binding: 1155, access: GraphicsTextureAccess::Storage, stage: vk::ShaderStageFlags::FRAGMENT,
+                }],
+            }],
+            ..Default::default()
+        };
+        if source_page == 6 {
+            storage.textures.get_mut(&7).unwrap().staged.rail.serve =
+                Some(crate::runtime::compute_exec::ResidentServe::Seed(0));
+            assert!(matches!(storage.isolate_interlock(&state, &host, &req, &native),
+                Err(E::ResidentSeedUnavailable { reference: 7 })));
+            storage.textures.get_mut(&7).unwrap().staged.rail.serve = None;
+        }
+        let result = storage.isolate_interlock(&state, &host, &req, &native);
+        match source_page {
+            5 => assert!(matches!(result, Err(E::GuestAlias { source: 8, destination: 7 }))),
+            1000 => assert!(matches!(result, Err(E::BackingUnavailable { reference: 8 }))),
+            _ => {
+                let isolation = result.unwrap();
+                assert!(isolation.matches(&native).is_ok());
+                let name = state.object_name(1, 7).unwrap();
+                assert!(state.task_resources.delete(1, name));
+                drop(owner);
+                drop(storage);
+                drop(req);
+                assert!(lifetime.is_live(), "admission retains the serialized destination owner");
+                drop(scope);
+                assert_eq!(isolation.matches(&native), Err(E::ScopeExpired));
+                drop(isolation);
+                assert!(!lifetime.is_live(), "the draw does not leak its resource owner");
+            }
+        }
+    }
 }

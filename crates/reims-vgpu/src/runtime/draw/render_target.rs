@@ -350,6 +350,8 @@ pub(super) struct ResolvedRenderTarget {
     /// [`ColorRtRequest::target_gva`] documents.
     pub(super) mapping_id: u32,
     pub(super) target_gva: u64,
+    /// Base-texture mip after combining the view range and attachment level.
+    pub(super) guest_mip_level: u32,
     pub(super) width: u32,
     pub(super) height: u32,
     /// Bytes per row of the target (archive `bpr`).
@@ -919,6 +921,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             storage: ColorStorage::GuestBacked,
             mapping_id,
             target_gva: 0,
+            guest_mip_level: level,
             width: m.width,
             height: m.height,
             row_stride: 0,
@@ -1000,6 +1003,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             storage: ColorStorage::GuestBacked,
             mapping_id: surface_id,
             target_gva: 0,
+            guest_mip_level: level,
             width: m.width,
             height: m.height,
             row_stride: 0,
@@ -1040,6 +1044,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             storage: ColorStorage::Memoryless,
             mapping_id: 0,
             target_gva: 0,
+            guest_mip_level: level,
             width: texture.width,
             height: texture.height,
             row_stride: 0,
@@ -1191,6 +1196,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         storage: ColorStorage::GuestBacked,
         mapping_id: 0,
         target_gva: gva,
+        guest_mip_level: level,
         width: w,
         height: h,
         row_stride: bpr,

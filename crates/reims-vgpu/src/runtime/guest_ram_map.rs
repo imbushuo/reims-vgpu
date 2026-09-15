@@ -848,6 +848,11 @@ fn report_once(refusal: MapRefusal) -> MapRefusal {
 }
 
 #[cfg(test)]
+pub(crate) fn with_test_import_limits<R>(align: Option<u64>, body: impl FnOnce() -> R) -> R {
+    tests::with_granularity(align, body)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::guest_ram::{forget_import_limits, latch_import_limits, GuestRamRegion};
@@ -914,7 +919,7 @@ mod tests {
         ])
     }
 
-    fn with_granularity<R>(align: Option<u64>, body: impl FnOnce() -> R) -> R {
+    pub(super) fn with_granularity<R>(align: Option<u64>, body: impl FnOnce() -> R) -> R {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         reset();
         match align {

@@ -3,7 +3,7 @@ use crate::backend::vulkan::{engine::*, planar, translate};
 use crate::protocol::planar::{BackingFormat, SampleFormat};
 use std::sync::Arc;
 
-fn shader(vertex: bool, sample: bool, binding: u32, sampler: u32, scale: f32) -> Vec<u32> {
+pub(crate) fn shader(vertex: bool, sample: bool, binding: u32, sampler: u32, scale: f32) -> Vec<u32> {
     let (entry, execution, decorations, variables, position) = if vertex {
         ("Vertex", "", "OpDecorate %index BuiltIn VertexIndex\nOpDecorate %position BuiltIn Position",
          "%index = OpVariable %input_uint Input\n%position = OpVariable %output_vec Output",
@@ -68,6 +68,10 @@ OpDecorate %color Location 0
 OpReturn
 OpFunctionEnd
 "#);
+    assemble(&source)
+}
+
+pub(crate) fn assemble(source: &str) -> Vec<u32> {
     let scratch = std::path::PathBuf::from(format!("target/planar-graphics-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
     let input = scratch.join("shader.spvasm");
@@ -99,10 +103,10 @@ fn vulkan_gpu_planar_vertex_fragment_oracles_and_q11_ties() {
             let mut image = planar::tests::image(format, backing);
             let expected = if case == 4 {
                 image.width = 2; image.height = 2;
-                image.bytes = [0u16, 1, 2, 3].into_iter().flat_map(|q|
+                image.bytes = Arc::new([0u16, 1, 2, 3].into_iter().flat_map(|q|
                     [q, q, q, 2048].into_iter().flat_map(|q|
                         crate::protocol::planar::sampling::q11_half(q).to_le_bytes())
-                ).collect();
+                ).collect());
                 [0.5f32, 0.5, 0.5, 1.0]
             } else if format == SampleFormat::Rgb10_420TwoPlane {
                 [768.0 / 1023.0, 512.0 / 1023.0, 640.0 / 1023.0, 1.0]
@@ -125,7 +129,7 @@ fn vulkan_gpu_planar_vertex_fragment_oracles_and_q11_ties() {
                         binding, array_element: 0, descriptor_count: 1,
                         width: image.width, height: image.height, layers: 1,
                         kind: reims_vgpu_core::texture_shape::TextureKind::D2, multisampled: false,
-                        source: SampledSource::Bytes(Arc::new(image.bytes.clone())),
+                        source: SampledSource::Bytes(Arc::clone(&image.bytes)),
                         format: translate::pixel::vk_sampled_bytes(image.byte_format()),
                         byte_origin: Default::default(), identity: None, swizzle: Default::default(),
                     }],

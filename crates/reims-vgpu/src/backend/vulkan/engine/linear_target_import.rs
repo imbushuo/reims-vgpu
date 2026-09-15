@@ -8,6 +8,12 @@
 //! child view alias-bound at its checked plane offset. Those facts belong
 //! together because every one participates in the same `vkBindImageMemory`
 //! equation.
+//!
+//! A host-byte lease does not establish an external image's layout ownership.
+//! External images must start UNDEFINED, which cannot preserve live guest
+//! contents. Such requests are refused before creation; callers retain their
+//! native-format buffer-to-image and Store fallbacks. Unbound layout probes
+//! still report geometry, not permission to discard guest memory.
 
 use ash::vk;
 
@@ -26,6 +32,27 @@ struct WindowPlan {
 enum LayoutMode {
     DriverLinear,
     ExplicitLinear,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitialContents {
+    UnboundProbe,
+    GuestHostBytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExternalImageBirth(vk::ImageLayout);
+
+impl ExternalImageBirth {
+    fn for_contents(contents: InitialContents) -> Result<Self, WindowRefusal> {
+        match contents {
+            InitialContents::UnboundProbe => Ok(Self(vk::ImageLayout::UNDEFINED)),
+            // 01443 requires UNDEFINED for external images; 02989 requires
+            // declaring the imported handle. A host-byte lease supplies no
+            // existing image/layout ownership transfer that preserves contents.
+            InitialContents::GuestHostBytes => Err(WindowRefusal::HostContentsNeedCopy),
+        }
+    }
 }
 
 // The linear DRM modifier is the API value zero. Unlike vendor modifiers, it
@@ -48,6 +75,7 @@ pub(super) enum WindowRefusal {
     DisabledByEnv,
     UnsupportedTopology,
     HostImportUnavailable,
+    HostContentsNeedCopy,
     ParentAllocationMismatch,
     ParentImport(super::host_ram::HostRamDecline),
     HostPointerMisaligned,
@@ -68,6 +96,7 @@ impl WindowRefusal {
             Self::DisabledByEnv => "disabled_by_env",
             Self::UnsupportedTopology => "discrete_topology",
             Self::HostImportUnavailable => "no_host_import",
+            Self::HostContentsNeedCopy => "host_image_initial_contents_need_copy",
             Self::ParentAllocationMismatch => "parent_allocation_mismatch",
             Self::ParentImport(inner) => Decline::slug(&inner),
             Self::HostPointerMisaligned => "host_pointer_misaligned",
@@ -350,6 +379,7 @@ fn shared_target_from(switch: crate::config::Switch) -> bool {
 pub(super) unsafe fn create(
     ctx: &DeviceContext,
     imports: &mut super::host_ram::HostRamImports,
+    counters: &super::counters::EngineCounters,
     import: &crate::runtime::guest_ram::GuestRamImport,
     backing: GuestTargetBacking,
     width: u32,
@@ -371,6 +401,10 @@ pub(super) unsafe fn create(
     if !parent_allocation_matches(import, backing) {
         return Err(WindowRefusal::ParentAllocationMismatch);
     }
+    let birth = ExternalImageBirth::for_contents(InitialContents::GuestHostBytes).inspect_err(|_| {
+        counters.guest_image_initial_contents_refused
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    })?;
     let allocation =
         unsafe { imports.allocation(ctx, import) }.map_err(WindowRefusal::ParentImport)?;
     let alignment = ctx.caps.host_pointer.min_alignment;
@@ -389,13 +423,14 @@ pub(super) unsafe fn create(
         let explicit = unsafe {
             create_with_layout(
                 ctx,
-                allocation,
+                allocation.clone(),
                 backing,
                 width,
                 height,
                 format,
                 usage,
                 LayoutMode::ExplicitLinear,
+                birth,
             )
         };
         if explicit.is_ok() {
@@ -415,6 +450,7 @@ pub(super) unsafe fn create(
                 format,
                 usage,
                 LayoutMode::DriverLinear,
+                birth,
             )
         };
         let result = ordinary.or(explicit);
@@ -433,6 +469,7 @@ pub(super) unsafe fn create(
             format,
             usage,
             LayoutMode::DriverLinear,
+            birth,
         )
     };
     if result.is_ok() {
@@ -451,6 +488,7 @@ unsafe fn create_with_layout(
     format: vk::Format,
     usage: vk::ImageUsageFlags,
     mode: LayoutMode,
+    birth: ExternalImageBirth,
 ) -> Result<ImportedTarget, WindowRefusal> {
     let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
     let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle);
@@ -467,7 +505,7 @@ unsafe fn create_with_layout(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .usage(usage)
-        .initial_layout(vk::ImageLayout::PREINITIALIZED);
+        .initial_layout(birth.0);
     let image = match mode {
         LayoutMode::DriverLinear => {
             let create = base
@@ -598,6 +636,8 @@ pub(super) unsafe fn probe_window(
     }
     let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
     let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle);
+    let birth = ExternalImageBirth::for_contents(InitialContents::UnboundProbe)
+        .expect("an unbound layout probe has no contents to preserve");
     let create = vk::ImageCreateInfo::default()
         .flags(vk::ImageCreateFlags::ALIAS)
         .image_type(vk::ImageType::TYPE_2D)
@@ -612,7 +652,7 @@ pub(super) unsafe fn probe_window(
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::LINEAR)
         .usage(usage)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .initial_layout(birth.0)
         .push_next(&mut external);
     let image = match unsafe { ctx.device.create_image(&create, None) } {
         Ok(image) => image,
@@ -688,6 +728,17 @@ pub(super) unsafe fn probe_window(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn external_host_image_birth_refuses_discarding_existing_guest_bytes() {
+        assert_eq!(
+            super::ExternalImageBirth::for_contents(super::InitialContents::GuestHostBytes),
+            Err(super::WindowRefusal::HostContentsNeedCopy),
+        );
+        assert_eq!(
+            super::ExternalImageBirth::for_contents(super::InitialContents::UnboundProbe),
+            Ok(super::ExternalImageBirth(ash::vk::ImageLayout::UNDEFINED)),
+        );
+    }
     use super::*;
 
     fn layout(offset: u64, row_pitch: u64) -> vk::SubresourceLayout {

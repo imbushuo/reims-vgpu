@@ -40,6 +40,38 @@ pixels. No input buffers or synthetic frame stamps participate. On mismatch,
 sampling from source bytes overwritten by later device work. A native PASS
 alone does not establish which guest producer/invalidations route ran.
 
+`probes/mrt-batching.m` checks all primary and secondary BGRA pixels after
+multi-draw MRT rendering, replacing the secondary between encoders, clearing a
+secondary in a later encoder, and sampling the secondary into a third target.
+Every backed attachment uses Store. A correct primary or successful GPU sample
+does not prove secondary CPU publication: each secondary is also read with
+`getBytes` after command completion. Run the same authored source on native and
+guest macOS; record the selected guest rail separately.
+
+```sh
+mkdir -p .cache
+xcrun clang -fobjc-arc -O2 -mmacosx-version-min=15.0 \
+  -framework Foundation -framework Metal \
+  conformance/probes/mrt-batching.m -o .cache/mrt-batching
+.cache/mrt-batching
+```
+
+`probes/rog-framebuffer-copy.m` isolates a fragment that reads framebuffer
+attachment 0 and writes an explicitly raster-ordered texture at binding 3,
+without color outputs. It verifies the texture-3 destination, not just the
+attachments: nonuniform half-precision contents, overlapping indexed partial
+draws, coordinate offsets, an intervening source paint, and untouched pixels.
+Cases cover RGBA16Float with two attachments and BGRA8 with three attachments;
+unused secondary attachments are memoryless. Run unchanged on native and guest
+macOS. A Vulkan interlock refusal is a missing case, not a passing pixel oracle.
+
+```sh
+xcrun clang -fobjc-arc -O2 -mmacosx-version-min=15.0 \
+  -framework Foundation -framework Metal \
+  conformance/probes/rog-framebuffer-copy.m -o .cache/rog-framebuffer-copy
+.cache/rog-framebuffer-copy
+```
+
 `probes/current-planar-writes.m` exercises the native composite P010 formats
 `0x1f9` and `0x21f`. It alternates CPU-written luma 256 times and compares an
 existing texture with a newly constructed view of the same IOSurface, after
