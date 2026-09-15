@@ -168,13 +168,10 @@ fn immutable_reuse_requires_no_write_access_independently_of_reach() {
 }
 
 fn wrapped_air(source: &str) -> Vec<u8> {
-    let scratch = Scratch::write(source.as_bytes(), "ll").unwrap();
-    let (bitcode, _) = metal2vulkan::tools::run_with_timeout(
-        "llvm-as",
-        &[scratch.0.to_str().unwrap(), "-o", "-"],
-        20,
-    )
-    .unwrap();
+    wrap_bitcode(&metal2vulkan::tools::llvm_assemble(source).unwrap())
+}
+
+fn wrap_bitcode(bitcode: &[u8]) -> Vec<u8> {
     let mut blob = b"MTLB-owned-metadata-test".to_vec();
     blob.extend(crate::runtime::mtlb::AIR_WRAP_MAGIC);
     for word in [0, 20, u32::try_from(bitcode.len()).unwrap(), 0] {
@@ -182,6 +179,38 @@ fn wrapped_air(source: &str) -> Vec<u8> {
     }
     blob.extend(bitcode);
     blob
+}
+
+#[test]
+fn native_disassembly_preserves_air_buffer_declarations() {
+    let reflection = reflect_mtlb(&wrapped_air(FRAGMENT), Stage::Fragment).unwrap();
+    assert_eq!(reflection.stage, ShaderStage::Fragment);
+    assert_eq!(reflection.entry_point.as_deref(), Some("declared_reach"));
+    for (index, expected) in [
+        (0, BufferExtent::Object { bytes: 4 }),
+        (1, BufferExtent::Unbounded),
+        (2, BufferExtent::Unknown),
+    ] {
+        let binding = reflection
+            .bindings
+            .iter()
+            .find(|binding| binding.kind == ResourceKind::Buffer && binding.metal_index == index)
+            .unwrap();
+        assert_eq!(binding.extent, Some(expected));
+    }
+    let extents = BufferExtents {
+        stage: Stage::Fragment,
+        reflection: Ok(reflection),
+    };
+    for (index, expected) in [(0, Some(4)), (1, None), (2, None)] {
+        let (bytes, readonly) = extents
+            .bound(index)
+            .unwrap()
+            .capture_for(Class::Fragment, index)
+            .unwrap();
+        assert_eq!(bytes, expected);
+        assert_eq!(readonly.unwrap().bytes(), expected);
+    }
 }
 
 #[test]
@@ -250,4 +279,28 @@ fn reflection_failure_is_cached_and_never_supplies_a_cap() {
         panic!("failed optional reflection must not retry on every draw")
     });
     assert!(Arc::ptr_eq(&failed, &again));
+}
+
+#[test]
+fn native_disassembly_failure_is_reported_and_cached_without_a_cap() {
+    let capture = reims_vgpu_observe::FailCapture::start();
+    let cache = Mutex::new(ContentCache::new());
+    let mtlb = wrap_bitcode(b"invalid bitcode");
+    let key = BlobKey::new(&mtlb);
+    let failed = cached_with(&cache, key, Stage::Fragment, || {
+        reflect_mtlb(key.bytes, Stage::Fragment)
+    });
+    let detail = failed.reflection.as_ref().unwrap_err();
+    assert!(!detail.is_empty());
+    assert!(failed.bound(0).is_none());
+    let again = cached_with(&cache, key, Stage::Fragment, || {
+        panic!("a failed native disassembly must not retry on every draw")
+    });
+    assert!(Arc::ptr_eq(&failed, &again));
+    let line = capture.one("metal_buffer_extent");
+    assert!(line.contains("reason=metal_buffer_extent_reflection_failed"));
+    assert!(line.contains(&format!(
+        "detail={}",
+        detail.replace(char::is_whitespace, "_")
+    )));
 }

@@ -3,7 +3,9 @@
 //! Only `BufferExtent::Object` from the existing metadata parser may reduce
 //! capture. Pointee sizes, native argument sizes and buffer names decide nothing.
 //! Both successful reflection and failure are cached by exact MTLB bytes/stage;
-//! a missing tool cannot launch another process on every draw.
+//! a missing LLVM library cannot trigger another attempt on every draw.
+//! Cold builds are serialized and run in process, without a hard time or memory
+//! limit: native LLVM calls cannot be safely cancelled.
 
 use super::input::Class;
 use crate::backend::blob::{BlobIdentity, BlobKey};
@@ -12,10 +14,6 @@ use crate::model::content_cache::{CacheEntry, ContentCache};
 use crate::observe::{Decline, Emit};
 use metal2vulkan::reflect::{ShaderReflection, ShaderStage};
 use parking_lot::Mutex;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,71 +217,18 @@ pub(crate) fn cached(key: BlobKey<'_>, stage: Stage) -> Arc<BufferExtents> {
     })
 }
 
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn write(bytes: &[u8], extension: &str) -> Result<Self, String> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        std::fs::create_dir_all(".cache").map_err(|error| error.to_string())?;
-        let path = PathBuf::from(format!(
-            ".cache/reims-metal-metadata-{}-{}.{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed),
-            extension,
-        ));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|error| error.to_string())?;
-        let scratch = Self(path);
-        file.write_all(bytes).map_err(|error| error.to_string())?;
-        Ok(scratch)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.0) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                Emit::refusal(
-                    "metal_buffer_extent",
-                    &super::util::Status::execute("metal_buffer_extent_scratch_cleanup_failed"),
-                )
-                .unwrap()
-                .field("path", self.0.display())
-                .field("error", error)
-                .fail();
-            }
-        }
-    }
-}
-
 fn reflect_mtlb(mtlb: &[u8], stage: Stage) -> Result<ShaderReflection, String> {
     let air = crate::runtime::mtlb::extract_air(mtlb).map_err(|error| error.to_string())?;
-    let scratch = Scratch::write(air, "air")?;
-    // The existing bounded tool runner owns discovery, timeout and pipe drain.
-    // Only disassembly occurs, once on a miss; no SPIR-V or executable lowering.
-    let (ll, _) = metal2vulkan::tools::run_with_timeout(
-        "llvm-dis",
-        &[
-            scratch.0.to_str().ok_or("non-UTF8 scratch path")?,
-            "-o",
-            "-",
-        ],
-        20,
-    )?;
-    let ll = String::from_utf8(ll).map_err(|error| error.to_string())?;
+    let ll = metal2vulkan::tools::llvm_disassemble(air)?;
     reflect_text(&ll, stage)
 }
 
 fn reflect_text(ll: &str, stage: Stage) -> Result<ShaderReflection, String> {
-    let (sanitized, _) = metal2vulkan::tools::sanitize_ll_text_with_datalayout(ll);
     // This public metadata facade constructs no SPIR-V. Reach is the AIR
     // declaration, not its optional access classification or an emitted footprint.
+    // Pass raw IR so metadata and source layout survive without sanitization.
     let reflection = metal2vulkan::reflect_sanitized(
-        &sanitized,
+        ll,
         match stage {
             Stage::Vertex => metal2vulkan::passes::Stage::Vertex,
             Stage::Fragment => metal2vulkan::passes::Stage::Fragment,
@@ -298,7 +243,7 @@ fn reflect_text(ll: &str, stage: Stage) -> Result<ShaderReflection, String> {
         return Err("requested AIR stage entry is absent".into());
     }
     reflection.validate_descriptor_abi()?;
-    // The reflection owns metadata, not the executable IR or tool output.
+    // The reflection owns metadata, not the executable IR.
     Ok(reflection)
 }
 

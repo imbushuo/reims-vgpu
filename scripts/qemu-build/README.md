@@ -177,7 +177,23 @@ QEMU_BIN=$PWD/vendor/qemu/build/qemu-system-x86_64 vm/boot-x86.sh --device reims
 
 ### Requirements
 
-- **Both:** cargo (`crates/reims-vgpu`), ninja, meson, pkg-config, glib, pixman.
+- **Both:** cargo (`crates/reims-vgpu`), a C++ compiler/runtime for the statically
+  linked SPIRV-Tools dependency, ninja, meson, pkg-config, glib, pixman.
 - **aarch64 + metal:** macOS, Xcode CLT, HVF/Cocoa.
 - **aarch64 + vulkan:** macOS, Xcode CLT, HVF/Cocoa, Vulkan loader, and MoltenVK ICD.
 - **x86_64:** Linux QEMU build deps; KVM for boots.
+
+AIR disassembly runs in process through a lazily loaded LLVM shared library.
+Install a compatible `libLLVM`, or select it with
+`METAL2VULKAN_LLVM_LIBRARY=/path/to/libLLVM.dylib` (`libLLVM.so` on Linux).
+Neither LLVM nor SPIR-V processing launches tool executables. The final QEMU
+link includes libc++ on macOS or libstdc++ on Linux for SPIRV-Tools.
+On macOS, Meson passes QEMU's C compiler deployment target to Cargo as
+`MACOSX_DEPLOYMENT_TARGET`, keeping Rust's native dependencies compatible with
+QEMU even when their C++ compiler uses a newer SDK.
+
+Metal's optional buffer-extent reflection consumes raw AIR metadata and caches
+both success and failure by exact shader bytes and stage. Cold reflection is
+serialized, but native LLVM calls have no hard time or memory limit and cannot
+be safely cancelled. A reflection error is reported and leaves capture
+conservative; it does not trigger an external-tool fallback.

@@ -9,6 +9,10 @@ use reims_vgpu_wire::OP_HEADER_LEN;
 use super::*;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::protocol::endian::{st16, st32, st64};
+use crate::protocol::fifo::{
+    CHILD_EXEC_INDIRECT_CMDBUF_COUNT, CHILD_EXEC_INDIRECT_RESOURCE_COUNT,
+    CHILD_EXEC_INDIRECT_TASK_ID,
+};
 use crate::runtime::host::FakeHost;
 use crate::runtime::render_pass::{
     PASS_ATTACH_CLEAR_COLOR, PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,

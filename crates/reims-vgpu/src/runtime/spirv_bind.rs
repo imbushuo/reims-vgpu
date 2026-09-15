@@ -897,13 +897,27 @@ pub fn storage_image_access(words: &[u32], wanted_binding: u32) -> Option<Storag
 /// What a validator said about a module this device was about to hand a driver.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpirvValidation {
-    /// The module is valid as far as the validator can tell — including the
-    /// case where no validator is installed, which is not evidence of anything
-    /// and must not become a refusal.
+    /// The linked validator accepted the module.
     Accepted,
-    /// The validator rejected it. Carries its first line, which names the
-    /// instruction.
+    /// The validator rejected it. Carries its diagnostic on one line.
     Rejected(String),
+}
+
+impl From<Result<(), String>> for SpirvValidation {
+    fn from(verdict: Result<(), String>) -> Self {
+        match verdict {
+            Ok(()) => Self::Accepted,
+            Err(why) => {
+                // Keep the diagnosis after the wrapper's "spirv-val failed:" line.
+                let flattened: Vec<&str> = why
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                Self::Rejected(flattened.join(" | "))
+            }
+        }
+    }
 }
 
 /// Ask a validator whether `words` is a module a driver can be given.
@@ -924,69 +938,15 @@ pub enum SpirvValidation {
 /// finished with it, so validating the translator's output would leave this
 /// device's own contribution unchecked.
 ///
-/// # When there is no validator
-///
-/// The check is external (`spirv-val`, from SPIRV-Tools, which
-/// `vm/boot-x86.sh` already requires and which `metal2vulkan` spawns during
-/// translation). A host without it gets [`SpirvValidation::Accepted`] and one
-/// fail-log line: an absent instrument is not a verdict, and refusing every
-/// dispatch because a developer tool is missing would be the widening this
-/// device is not allowed to do in either direction.
+/// SPIRV-Tools is statically linked and validates in process. There is no
+/// missing-executable or temporary-directory path that can bypass validation.
 pub fn validate(words: &[u32]) -> SpirvValidation {
     let mut bytes = Vec::with_capacity(words.len() * 4);
     for word in words {
         bytes.extend_from_slice(&word.to_le_bytes());
     }
-    // A private directory per call, because `spirv_val_bytes` writes a **fixed**
-    // file name inside whatever directory it is given. Handed the shared
-    // `/tmp`, two concurrent validations — this device's, or one of
-    // `metal2vulkan`'s own async translations — write and delete the same path,
-    // and the loser validates bytes it did not produce or finds no file at all.
-    // Measured: three modules on a working macos-13 boot rejected that way,
-    // which would have cost the guest three shaders to fix a crash on a
-    // different rail.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("reims-vgpu-spirv-val-{}-{seq}", std::process::id()));
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        if crate::observe::first_sight("spirv_val_no_tmp", 0) {
-            crate::observe::fail(format!(
-                "spirv_validate reason=validator_unavailable detail={e}"
-            ));
-        }
-        return SpirvValidation::Accepted;
-    }
-    let verdict = metal2vulkan::tools::spirv_val_bytes(&bytes, &dir);
-    let _ = std::fs::remove_dir_all(&dir);
-    match verdict {
-        Ok(()) => SpirvValidation::Accepted,
-        Err(why) => {
-            // A missing or unrunnable tool reads as an error from the same call
-            // as a rejected module, and the two must not be confused: one is a
-            // module that would take the process down, the other is a laptop
-            // without SPIRV-Tools installed.
-            if why.contains("No such file") || why.contains("spawn") || why.contains("not found") {
-                if crate::observe::first_sight("spirv_val_absent", 0) {
-                    crate::observe::fail(format!(
-                        "spirv_validate reason=validator_unavailable detail={}",
-                        why.lines().next().unwrap_or("")
-                    ));
-                }
-                return SpirvValidation::Accepted;
-            }
-            // The whole message on one line. Its first line is the wrapper's
-            // own "spirv-val failed:" and the validator's diagnosis — the part
-            // that names the instruction — is on the ones after it, so keeping
-            // only the first is how a rejection reads as having no reason.
-            let flattened: Vec<&str> = why
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .collect();
-            SpirvValidation::Rejected(flattened.join(" | "))
-        }
-    }
+    // The library retains an unused path parameter for API compatibility.
+    metal2vulkan::tools::spirv_val_bytes(&bytes, std::path::Path::new("")).into()
 }
 
 /// Reflect the explicit texel format for one image descriptor binding.
@@ -2319,17 +2279,16 @@ pub fn reflected_storage_image_format(
         TextureFormat::R8 => ImageFormat::R8Unorm,
         TextureFormat::Rgba8 => ImageFormat::Rgba8Unorm,
         TextureFormat::R16f => ImageFormat::R16Float,
-        TextureFormat::R16ui => ImageFormat::Unsupported(16),
         TextureFormat::Rg16f => ImageFormat::Rg16Float,
-        // SPIR-V `Rg32f`. The device has no two-channel 32-bit float storage
-        // surface — neither `StorageImageSelector` nor `TexelLayout` names one
-        // — so the honest answer is the format's own SPIR-V ordinal carried as
-        // unsupported, which round-trips through `raw`/`from_raw` unchanged.
-        TextureFormat::Rg32f => ImageFormat::Unsupported(6),
+        // These formats have no engine storage surface. Preserve the translator's
+        // exact SPIR-V ordinal for the existing unsupported-format refusal.
+        TextureFormat::R16ui
+        | TextureFormat::Rg32f
+        | TextureFormat::R32i
+        | TextureFormat::Rgba32i
+        | TextureFormat::Rgba16i => ImageFormat::Unsupported(format.to_spirv_format() as u32),
         TextureFormat::R32f => ImageFormat::R32Float,
-        TextureFormat::R32i => ImageFormat::Unsupported(17),
         TextureFormat::R32ui => ImageFormat::R32ui,
-        TextureFormat::Rgba32i => ImageFormat::Unsupported(18),
         TextureFormat::Rgba32ui => ImageFormat::Rgba32Uint,
         TextureFormat::Rgba32f => ImageFormat::Rgba32Float,
         TextureFormat::Rgba16f => ImageFormat::Rgba16Float,
@@ -4768,6 +4727,35 @@ mod more_tests {
     }
 
     #[test]
+    fn reflected_storage_formats_match_spirv_ordinals() {
+        use metal2vulkan::meta::TextureFormat;
+
+        let binding = TEXTURE_BINDING_BASE + 1;
+        for format in TextureFormat::ALL {
+            let mut reflection = empty_reflection(ShaderStage::Kernel);
+            let mut storage_shape = shape(TextureDimension::D2, false, true);
+            storage_shape.storage_format = Some(format);
+            reflection
+                .bindings
+                .push(texture_binding(binding, storage_shape));
+            let mapped = reflected_storage_image_format(&reflection, binding).unwrap();
+            let raw = format.to_spirv_format() as u32;
+            assert_eq!(mapped.raw(), raw, "{format:?}");
+            assert_eq!(mapped, ImageFormat::from_raw(raw), "{format:?}");
+            if format == TextureFormat::Rgba16i {
+                assert_eq!(mapped, ImageFormat::Unsupported(22));
+                #[cfg(feature = "backend-vulkan")]
+                assert_eq!(
+                    crate::runtime::compute_exec::vulkan::spirv_image_format_to_engine_storage(
+                        mapped
+                    ),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reflection_derived_kind_and_access_cover_every_shape() {
         // Dimensionality mapping matches the SPIR-V-walk `SampledImageKind`.
         let cases = [
@@ -5690,15 +5678,10 @@ mod more_tests {
     /// contract — the device declines the dispatch rather than handing the
     /// driver something it is entitled to crash on, and one driver does.
     ///
-    /// Skips where SPIRV-Tools is not installed, because there the function is
-    /// specified to accept: an absent instrument is not a verdict.
     #[test]
     fn a_module_a_validator_rejects_never_reaches_a_driver() {
         let good = minimal_compute_module();
-        if validate(&good) != SpirvValidation::Accepted {
-            eprintln!("skip: no usable spirv-val, or it rejects the minimal module");
-            return;
-        }
+        assert_eq!(validate(&good), SpirvValidation::Accepted);
         // Point the function's return type at the function id instead of at
         // %void, which is a type error no driver has to survive.
         let mut bad = good.clone();
@@ -5713,24 +5696,31 @@ mod more_tests {
         }
     }
 
+    #[test]
+    fn validator_diagnostics_never_bypass_rejection() {
+        for detail in ["No such file", "spawn", "not found", ""] {
+            let why = format!("spirv-val failed:\n  {detail}\n");
+            let expected = if detail.is_empty() {
+                "spirv-val failed:".to_string()
+            } else {
+                format!("spirv-val failed: | {detail}")
+            };
+            assert_eq!(
+                SpirvValidation::from(Err(why)),
+                SpirvValidation::Rejected(expected)
+            );
+        }
+        assert_eq!(
+            SpirvValidation::from(Err(String::new())),
+            SpirvValidation::Rejected(String::new())
+        );
+    }
+
     /// Concurrent validations do not answer for each other.
-    ///
-    /// The validator wrapper writes a fixed file name inside the directory it
-    /// is handed, so a shared directory makes two callers race over one path
-    /// and the loser gets a verdict about bytes it did not submit. That is not
-    /// hypothetical: it rejected three good modules on a working macos-13 boot,
-    /// where the concurrency comes from this device's drain thread and
-    /// `metal2vulkan`'s own async translations sharing `/tmp`.
-    ///
-    /// Skips where SPIRV-Tools is absent, where every answer is `Accepted` and
-    /// the test could not fail.
     #[test]
     fn concurrent_validations_do_not_collide() {
         let good = minimal_compute_module();
-        if validate(&good) != SpirvValidation::Accepted {
-            eprintln!("skip: no usable spirv-val");
-            return;
-        }
+        assert_eq!(validate(&good), SpirvValidation::Accepted);
         let verdicts: Vec<_> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
                 .map(|_| {

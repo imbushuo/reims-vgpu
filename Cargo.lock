@@ -655,8 +655,10 @@ dependencies = [
 name = "metal2vulkan"
 version = "0.1.0"
 dependencies = [
+ "libloading",
  "spirv",
- "wait-timeout",
+ "spirv-tools",
+ "spirv-tools-sys",
 ]
 
 [[package]]
@@ -1436,6 +1438,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "spirv-tools"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43bbd243a64a3ac7f87f8f026977285fc578698627337bd65a309576e89ad00f"
+dependencies = [
+ "spirv-tools-sys",
+]
+
+[[package]]
+name = "spirv-tools-sys"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3dbb2c54a9c790946820dd59163c63155e00204e0cbdc4d18374bee4d868ae66"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "strict-num"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1597,15 +1617,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "wait-timeout"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "walkdir"

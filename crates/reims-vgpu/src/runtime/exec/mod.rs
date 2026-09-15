@@ -17,10 +17,9 @@ use crate::protocol::draw::DrawArgs;
 use crate::protocol::endian::{ld32, ld64};
 use crate::protocol::fifo::{decode_exec_resource_table, ExecResourceDesc};
 use crate::protocol::fifo::{
-    CHILD_EXEC_INDIRECT_CMDBUF_COUNT, CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN,
-    CHILD_EXEC_INDIRECT_CMDBUF_GVA, CHILD_EXEC_INDIRECT_CMDBUF_LENGTH,
-    CHILD_EXEC_INDIRECT_HEADER_LEN, CHILD_EXEC_INDIRECT_RESOURCE_COUNT,
-    CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN, CHILD_EXEC_INDIRECT_TASK_ID,
+    CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN, CHILD_EXEC_INDIRECT_CMDBUF_GVA,
+    CHILD_EXEC_INDIRECT_CMDBUF_LENGTH, CHILD_EXEC_INDIRECT_HEADER_LEN,
+    CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN,
 };
 use crate::protocol::pixel_format::{self, ClearImageEncoding};
 use crate::runtime::blit_exec::{self, BlitStatus};
