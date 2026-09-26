@@ -55,6 +55,10 @@ impl ExternalImageBirth {
     }
 }
 
+pub(crate) fn guest_contents_require_copy() -> bool {
+    ExternalImageBirth::for_contents(InitialContents::GuestHostBytes).is_err()
+}
+
 // The linear DRM modifier is the API value zero. Unlike vendor modifiers, it
 // describes ordinary row-major storage and therefore lets the guest's declared
 // byte offset and row pitch be stated directly in the image-create contract.

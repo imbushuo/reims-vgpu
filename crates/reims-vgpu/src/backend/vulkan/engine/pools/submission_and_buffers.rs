@@ -3184,13 +3184,10 @@ impl ResourcePools {
         ctx: &DeviceContext,
         counters: &EngineCounters,
     ) -> Result<(), DrawError> {
-        // Taken before the wait, for the reason `quiesce_guest_reads` states:
-        // a failed wait still leaves the slot pending and the next claimant
-        // re-waits, so the ordering holds without carrying the debt forward.
-        if !self.take_guest_write_debt() {
+        if !self.guest_writes_in_flight {
             return Ok(());
         }
-        unsafe { self.retire_all(ctx, counters) }
+        self.quiesce_guest_access_with(|pools| unsafe { pools.retire_all(ctx, counters) })
     }
 
     /// Wait until nothing this device has recorded will read guest RAM again.
@@ -3219,14 +3216,35 @@ impl ResourcePools {
         ctx: &DeviceContext,
         counters: &EngineCounters,
     ) -> Result<(), DrawError> {
-        // Taken before the wait, not after: a failed wait leaves the slot
-        // pending and whichever entry claims it next re-waits, so the read is
-        // still ordered — but leaving the debt standing would re-run a failing
-        // quiesce at every stamp for the rest of the boot.
-        if !self.take_guest_read_debt() {
+        if !self.guest_reads_in_flight {
             return Ok(());
         }
-        unsafe { self.retire_all(ctx, counters) }
+        self.quiesce_guest_access_with(|pools| unsafe { pools.retire_all(ctx, counters) })
+    }
+
+    fn quiesce_guest_access_with(
+        &mut self,
+        mut retire: impl FnMut(&mut Self) -> Result<(), DrawError>,
+    ) -> Result<(), DrawError> {
+        let mut deadlines = 0u64;
+        loop {
+            match retire(self) {
+                Err(DrawError::FenceTimeout) => {
+                    deadlines = deadlines.saturating_add(1);
+                    crate::observe::Emit::decline("vk_guest_access_wait", &DrawError::FenceTimeout)
+                        .field("deadlines", deadlines)
+                        .fail();
+                }
+                result => {
+                    result?;
+                    // The whole ring has retired. A deadline alone cannot release
+                    // guest pages: the next user may be the CPU, not another slot.
+                    self.take_guest_read_debt();
+                    self.take_guest_write_debt();
+                    return Ok(());
+                }
+            }
+        }
     }
 
     /// Wait + retire every in-flight slot and drain the graveyard. Callers
@@ -6835,6 +6853,44 @@ mod recycle_tests {
         pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert!(pools.take_guest_write_debt());
         assert!(!pools.take_guest_write_debt());
+    }
+
+    #[test]
+    fn guest_access_deadlines_keep_debt_until_actual_retirement() {
+        let mut pools = ResourcePools::new();
+        pools.note_guest_read_recorded();
+        pools.note_guest_write_recorded(GuestWriteSource::RingEntry);
+        let mut attempts = 0;
+        pools
+            .quiesce_guest_access_with(|pools| {
+                attempts += 1;
+                assert!(pools.guest_reads_in_flight);
+                assert!(pools.guest_writes_in_flight);
+                if attempts < 3 {
+                    Err(DrawError::FenceTimeout)
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert_eq!(attempts, 3);
+        assert!(!pools.guest_reads_in_flight);
+        assert!(!pools.guest_writes_in_flight);
+    }
+
+    #[test]
+    fn guest_access_failed_retirement_preserves_both_debts() {
+        let mut pools = ResourcePools::new();
+        pools.note_guest_read_recorded();
+        pools.note_guest_write_recorded(GuestWriteSource::RingEntry);
+        let error = DrawError::DeviceLost(DeviceLostDecline::ForcedDraw);
+        assert_eq!(
+            pools.quiesce_guest_access_with(|_| Err(error.clone())),
+            Err(error),
+        );
+        assert!(pools.guest_reads_in_flight);
+        assert!(pools.guest_writes_in_flight);
+        pools.take_guest_read_debt();
     }
 
     /// A submitted-but-unsettled copy reads its resident's image, so the ledger

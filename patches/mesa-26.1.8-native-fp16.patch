@@ -1,0 +1,182 @@
+Gallivm: retain native FP16 conversions with unspecified rounding
+
+Avoid expanding generic f2f16 into branch-heavy integer arithmetic on CPUs
+where Gallivm already supports native FP16 conversion. Explicit rounding
+modes and targets without native support retain the existing lowering.
+The new NIR option is opt-in; other drivers keep their current behavior.
+
+Apply to the Mesa 26.1.8 source tree with patch -p1.
+
+--- a/src/compiler/nir/nir.h
++++ b/src/compiler/nir/nir.h
+@@ -6586,6 +6586,8 @@
+    nir_lower_fp16_rd = (1 << 3),
+    nir_lower_fp16_all = 0xf,
+    nir_lower_fp16_split_fp64 = (1 << 4),
++   /* Leave conversions with no requested rounding mode to the backend. */
++   nir_lower_fp16_keep_undef = (1 << 5),
+ } nir_lower_fp16_cast_options;
+ bool nir_lower_fp16_casts(nir_shader *shader, nir_lower_fp16_cast_options options);
+ bool nir_normalize_cubemap_coords(nir_shader *shader);
+--- a/src/compiler/nir/nir_lower_fp16_conv.c
++++ b/src/compiler/nir/nir_lower_fp16_conv.c
+@@ -308,7 +308,8 @@
+       req_option = nir_lower_fp16_rd;
+       break;
+    case nir_rounding_mode_undef:
+-      if ((options & nir_lower_fp16_all) == nir_lower_fp16_all) {
++      if ((options & nir_lower_fp16_all) == nir_lower_fp16_all &&
++          !(options & nir_lower_fp16_keep_undef)) {
+          /* Pick one arbitrarily for lowering */
+          mode = nir_rounding_mode_rtne;
+          req_option = nir_lower_fp16_rtne;
+--- a/src/gallium/auxiliary/gallivm/lp_bld_nir.c
++++ b/src/gallium/auxiliary/gallivm/lp_bld_nir.c
+@@ -24,6 +24,7 @@
+  **************************************************************************/
+ 
+ #include "lp_bld_nir.h"
++#include "lp_bld_limits.h"
+ #include "nir.h"
+ 
+ /* do some basic opts to remove some things we don't want to see. */
+@@ -56,7 +57,11 @@
+    }
+ 
+    NIR_PASS(_, nir, nir_lower_flrp, 16|32|64, true);
+-   NIR_PASS(_, nir, nir_lower_fp16_casts, nir_lower_fp16_all | nir_lower_fp16_split_fp64);
++   nir_lower_fp16_cast_options fp16_options =
++      nir_lower_fp16_all | nir_lower_fp16_split_fp64;
++   if (lp_has_fp16())
++      fp16_options |= nir_lower_fp16_keep_undef;
++   NIR_PASS(_, nir, nir_lower_fp16_casts, fp16_options);
+ 
+    NIR_PASS(_, nir, nir_lower_alu);
+ 
+--- a/src/compiler/nir/meson.build
++++ b/src/compiler/nir/meson.build
+@@ -444,6 +444,7 @@
+           'tests/loop_unroll_tests.cpp',
+           'tests/lower_alu_width_tests.cpp',
+           'tests/lower_discard_if_tests.cpp',
++          'tests/lower_fp16_cast_tests.cpp',
+           'tests/minimize_call_live_states_test.cpp',
+           'tests/mod_analysis_tests.cpp',
+           'tests/negative_equal_tests.cpp',
+--- /dev/null
++++ b/src/compiler/nir/tests/lower_fp16_cast_tests.cpp
+@@ -0,0 +1,114 @@
++/* SPDX-License-Identifier: MIT */
++
++#include "nir_test.h"
++
++namespace {
++
++class nir_lower_fp16_cast_test : public nir_test {
++protected:
++   nir_lower_fp16_cast_test() : nir_test("nir_lower_fp16_cast_test") {}
++
++   bool lower(bool keep_undef)
++   {
++      unsigned flags = nir_lower_fp16_all | nir_lower_fp16_split_fp64;
++      if (keep_undef)
++         flags |= nir_lower_fp16_keep_undef;
++      return nir_lower_fp16_casts(
++         b->shader, static_cast<nir_lower_fp16_cast_options>(flags));
++   }
++
++   nir_alu_instr *consumer(nir_def *value)
++   {
++      return nir_def_as_alu(nir_u2u32(b, value));
++   }
++
++   void check_explicit(nir_op op, unsigned execution_mode)
++   {
++      b->shader->info.float_controls_execution_mode = execution_mode;
++      nir_def *value = nir_build_alu(b, op, nir_undef(b, 1, 32), NULL, NULL, NULL);
++      nir_alu_instr *use = consumer(value);
++      EXPECT_TRUE(lower(true));
++      EXPECT_NE(use->src[0].src.ssa, value);
++      nir_validate_shader(b->shader, "explicit fp16 rounding");
++   }
++};
++
++TEST_F(nir_lower_fp16_cast_test, default_all_lowers_unspecified)
++{
++   nir_def *value = nir_f2f16(b, nir_undef(b, 1, 32));
++   nir_alu_instr *use = consumer(value);
++   EXPECT_TRUE(lower(false));
++   EXPECT_NE(use->src[0].src.ssa, value);
++}
++
++TEST_F(nir_lower_fp16_cast_test, keep_unspecified)
++{
++   nir_def *value = nir_f2f16(b, nir_undef(b, 1, 32));
++   nir_alu_instr *use = consumer(value);
++   EXPECT_FALSE(lower(true));
++   EXPECT_EQ(use->src[0].src.ssa, value);
++}
++
++TEST_F(nir_lower_fp16_cast_test, keep_unspecified_intrinsic)
++{
++   nir_def *value = nir_convert_alu_types(
++      b, 16, nir_undef(b, 1, 32), nir_type_float32,
++      nir_type_float16, nir_rounding_mode_undef);
++   nir_alu_instr *use = consumer(value);
++   EXPECT_FALSE(lower(true));
++   EXPECT_EQ(use->src[0].src.ssa, value);
++}
++
++TEST_F(nir_lower_fp16_cast_test, explicit_rtne_opcode)
++{
++   check_explicit(nir_op_f2f16_rtne, 0);
++}
++
++TEST_F(nir_lower_fp16_cast_test, explicit_rtz_opcode)
++{
++   check_explicit(nir_op_f2f16_rtz, 0);
++}
++
++TEST_F(nir_lower_fp16_cast_test, shader_rtne)
++{
++   check_explicit(nir_op_f2f16, FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP16);
++}
++
++TEST_F(nir_lower_fp16_cast_test, shader_rtz)
++{
++   check_explicit(nir_op_f2f16, FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP16);
++}
++
++TEST_F(nir_lower_fp16_cast_test, explicit_intrinsic_rounding)
++{
++   for (nir_rounding_mode mode : {nir_rounding_mode_rtne, nir_rounding_mode_rtz,
++                                 nir_rounding_mode_ru, nir_rounding_mode_rd}) {
++      nir_def *value = nir_convert_alu_types(
++         b, 16, nir_undef(b, 1, 32), nir_type_float32,
++         nir_type_float16, mode);
++      nir_alu_instr *use = consumer(value);
++      EXPECT_TRUE(lower(true));
++      EXPECT_NE(use->src[0].src.ssa, value);
++   }
++   nir_validate_shader(b->shader, "intrinsic fp16 rounding");
++}
++
++TEST_F(nir_lower_fp16_cast_test, still_splits_fp64_source)
++{
++   nir_def *value = nir_f2f16(b, nir_undef(b, 1, 64));
++   nir_alu_instr *use = consumer(value);
++   EXPECT_TRUE(lower(true));
++   EXPECT_EQ(use->src[0].src.ssa, value);
++   EXPECT_EQ(nir_def_as_alu(value)->src[0].src.ssa->bit_size, 32);
++   nir_validate_shader(b->shader, "split fp64 source");
++}
++
++TEST_F(nir_lower_fp16_cast_test, still_splits_fp64_destination)
++{
++   nir_def *value = nir_f2f64(b, nir_undef(b, 1, 16));
++   EXPECT_TRUE(lower(true));
++   EXPECT_EQ(nir_def_as_alu(value)->src[0].src.ssa->bit_size, 32);
++   nir_validate_shader(b->shader, "split fp64 destination");
++}
++
++}

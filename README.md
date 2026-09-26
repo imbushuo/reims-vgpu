@@ -195,6 +195,46 @@ How much can be captured depends on the host, and the log names which mechanism 
 A host that cannot capture at all still runs; it emits a `window_capture_*` reason on
 `/tmp/reims-vgpu-fail.log` rather than silently dropping the keys.
 
+On Linux the window identifies as `qemu`, matching the host's `qemu.desktop` application entry.
+With that entry installed, GNOME can remember the shortcut-inhibition permission across VM
+launches. An operator can explicitly allow it for QEMU (without allowing other applications):
+
+```bash
+gdbus call --session --dest org.freedesktop.impl.portal.PermissionStore \
+  --object-path /org/freedesktop/impl/portal/PermissionStore \
+  --method org.freedesktop.impl.portal.PermissionStore.SetPermission \
+  gnome true shortcuts-inhibitor qemu.desktop "['GRANTED']"
+```
+
+### Cold-cache software Vulkan boots
+
+Lavapipe/llvmpipe can JIT shader variants when a draw **executes**, after Vulkan pipeline
+precreation has finished. Cold-cache LLVM optimization can therefore exceed the guest watchdog
+even when pipeline creation runs off the device lock. For a boot explicitly using Mesa's software
+Vulkan driver, `GALLIVM_PERF=nopt` trades shader execution performance for lower first-use compile
+latency. Set it on the QEMU process before startup; it is a Mesa option, not a reims override, and
+is not enabled automatically for hardware Vulkan drivers.
+
+For normal LLVM optimization, the optional
+[Mesa 26.1.8 patch](patches/mesa-26.1.8-native-fp16.patch) avoids expanding generic
+FP16 conversions into branch-heavy integer code when Gallivm reports native FP16 support.
+Explicit rounding modes and CPUs without native support retain their existing lowering.
+Apply it with `patch -p1` in the Mesa source tree and rebuild lavapipe separately; the reims/QEMU
+build does not apply this driver patch. Select the separate driver's ICD manifest through
+`VK_ICD_FILENAMES` on the QEMU process, with `GALLIVM_PERF` unset. This reduces cold compilation
+cost without disabling optimization, but does not eliminate execution-time JIT or guarantee
+that every workload stays below the guest watchdog deadline.
+
+To compare cold and warm Mesa caches without deleting the host's existing cache, set
+`MESA_SHADER_CACHE_DIR` to an empty run-specific directory, then reuse that directory for the warm
+run. This does not clear reims's translation or native-pipeline caches.
+
+A fence deadline is not GPU completion. Mandatory guest-memory quiescence keeps waiting across
+timeouts and retains its access debt until retirement; freeing pages on a timeout could let a
+still-running submission access guest memory after reuse. A genuinely wedged queue can consequently
+keep the caller blocked. Terminal driver-error paths still use the existing logging and recovery
+behavior; this timeout fix does not establish completion on those paths.
+
 ### Environment overrides
 
 Set on the boot command; every one is optional and every default is "let the device decide". The

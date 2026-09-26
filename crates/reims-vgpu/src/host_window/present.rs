@@ -878,6 +878,12 @@ impl ApplicationHandler<FramePublished> for App {
                 self.config.width,
                 self.config.height,
             ));
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            // Match qemu.desktop so compositors can retain per-application permissions.
+            attrs = attrs.with_name("qemu", "reims-vgpu");
+        }
         if self.config.mode == WindowMode::Borderless {
             // `None` means "the monitor this window opens on", which is the only
             // answer available before the window exists — winit has no monitor

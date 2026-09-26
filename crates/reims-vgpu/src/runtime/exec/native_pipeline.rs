@@ -334,7 +334,9 @@ fn draw_metadata_resolved<M: HostMemory + HostOps>(
     resolved: &pipeline_resolve::ResolvedRenderPipeline,
     inputs: &PipelineInputs,
 ) -> Result<Metadata, &'static str> {
-    if host.map_pages_stable() {
+    // Stable buffer aliases do not imply an imported image: its initial-contents
+    // contract can still require the same native target used by this preflight.
+    if host.map_pages_stable() && !engine::guest_contents_require_copy() {
         return Err("native_preflight_shared_target_placement");
     }
     if viewport_count != 1 {

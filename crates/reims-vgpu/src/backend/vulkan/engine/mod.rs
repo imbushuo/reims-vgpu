@@ -72,6 +72,7 @@ pub(crate) use draw_preparation::DrawPreparationDecline;
 #[cfg_attr(not(feature = "host-window"), expect(unused_imports))]
 pub(crate) use facade_decline::EngineFacadeDecline;
 pub(crate) use host_ram::GuestWriteDecline;
+pub(crate) use linear_target_import::guest_contents_require_copy;
 pub use types::viewport_slot_count;
 pub use types::{
     BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue, ColorWriteMask,
@@ -1763,11 +1764,10 @@ pub fn quiesce_guest_writes() {
             device_lost::note_device_lost_seen();
         }
         crate::observe::Emit::decline("vk_guest_write_quiesce", &e).fail_once(0);
+        return;
     }
-    // Cleared whether the wait succeeded or failed, for the reason
-    // `ResourcePools::quiesce_guest_writes` takes its own debt before waiting:
-    // the slot stays pending either way and the next claimant re-waits, so the
-    // ordering survives without every later settle re-running a failing wait.
+    // A timeout is not completion. The pool retries deadlines and retains both
+    // debts on terminal errors; mirror only a successful retirement here.
     GUEST_WRITE_DEBT.store(false, Ordering::Release);
     // Under the same lock as the flag it accompanies, so no reader can see the
     // flag set beside a footprint that has already been forgotten.

@@ -484,6 +484,24 @@ fn native_collector_admits_inactive_attributes_unused_sampled_and_serializer_sam
 }
 
 #[test]
+fn native_collector_admits_stable_aliases_when_guest_images_require_copy() {
+    let mut fixture = Fixture::new();
+    let copied = fixture.metadata().unwrap();
+    fixture.host.stable_map_pages = true;
+    assert!(fixture.host.map_pages_stable());
+    assert!(engine::guest_contents_require_copy());
+
+    let stable = fixture.metadata().unwrap();
+    assert_b20_shape(&stable);
+    assert_eq!(stable.pass, copied.pass);
+    assert_eq!(stable.bindings, copied.bindings);
+    assert_eq!(stable.vertex, copied.vertex);
+    assert_eq!(stable.fragment, copied.fragment);
+    assert!(fixture.host.actions.is_empty());
+    assert_eq!(fixture.host.map_pages_calls, 0);
+}
+
+#[test]
 fn native_collector_preserves_active_attributes_stride_and_format_variants() {
     let mut fixture = Fixture::new();
     Arc::make_mut(&mut fixture.pipeline.desc).vertex_attributes[0] = VertexAttribute {
