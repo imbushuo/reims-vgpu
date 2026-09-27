@@ -24,6 +24,7 @@ OpDecorate %position BuiltIn Position
 OpDecorate %uv Location 1
 OpDecorate %params DescriptorSet 0
 OpDecorate %params Binding 0
+OpDecorate %params NonWritable
 OpDecorate %Params BufferBlock
 OpMemberDecorate %Params 0 Offset 0
 %void = OpTypeVoid
@@ -416,6 +417,11 @@ fn texture3_copy_oracle(sticky: bool) {
             bytes: Arc::new(source.clone()),
         });
         engine::execute_draw_request(&state, &initial).unwrap();
+        assert_eq!(
+            engine::pass_local::read_native_for_test(targets[0].identity()).unwrap(),
+            source,
+            "seeded source before the storage copy"
+        );
         let mut expected = pixels(DW, DH, bgra, 2, false);
         let mut destination = expected.clone();
         let bpp = if bgra { 4 } else { 8 };

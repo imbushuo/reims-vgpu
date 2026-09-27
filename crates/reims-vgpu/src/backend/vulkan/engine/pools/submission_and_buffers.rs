@@ -2273,29 +2273,34 @@ impl ResourcePools {
     /// caller must have parked its cleanup with [`Self::finish_entry_async`]
     /// first; the slot stays pending and the ring retires it later (its fence
     /// is already signaled, so that retire is a no-wait drain).
+    ///
+    /// Deadlines do not release a synchronous reader's resources. In particular,
+    /// a readback lease must not return to the free pool while its copy is live.
     pub(crate) unsafe fn wait_entry_fence(
         &self,
         ctx: &DeviceContext,
         counters: &EngineCounters,
         fence: vk::Fence,
     ) -> Result<(), DrawError> {
-        if let Some(error) = ctx.queue_failure() {
-            return Err(Self::wait_error(
-                counters,
-                error,
-                DeviceLostOp::PoolsWaitFencesEntry,
-            ));
-        }
-        let timeout = self
-            .slots
-            .iter()
-            .find(|slot| slot.fence == fence)
-            .map(|slot| slot.host_submission.wait(FENCE_TIMEOUT_NS))
-            .unwrap_or(Ok(FENCE_TIMEOUT_NS))
-            .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))?;
-        ctx.device
-            .wait_for_fences(&[fence], true, timeout)
-            .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))
+        Self::wait_until_complete("vk_entry_fence_wait", || {
+            if let Some(error) = ctx.queue_failure() {
+                return Err(Self::wait_error(
+                    counters,
+                    error,
+                    DeviceLostOp::PoolsWaitFencesEntry,
+                ));
+            }
+            let timeout = self
+                .slots
+                .iter()
+                .find(|slot| slot.fence == fence)
+                .map(|slot| slot.host_submission.wait(FENCE_TIMEOUT_NS))
+                .unwrap_or(Ok(FENCE_TIMEOUT_NS))
+                .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))?;
+            ctx.device
+                .wait_for_fences(&[fence], true, timeout)
+                .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))
+        })
     }
 
     /// Record that the command buffer being built reads guest RAM when it
@@ -3226,23 +3231,26 @@ impl ResourcePools {
         &mut self,
         mut retire: impl FnMut(&mut Self) -> Result<(), DrawError>,
     ) -> Result<(), DrawError> {
+        Self::wait_until_complete("vk_guest_access_wait", || retire(self))?;
+        self.take_guest_read_debt();
+        self.take_guest_write_debt();
+        Ok(())
+    }
+
+    fn wait_until_complete(
+        operation: &'static str,
+        mut wait: impl FnMut() -> Result<(), DrawError>,
+    ) -> Result<(), DrawError> {
         let mut deadlines = 0u64;
         loop {
-            match retire(self) {
+            match wait() {
                 Err(DrawError::FenceTimeout) => {
                     deadlines = deadlines.saturating_add(1);
-                    crate::observe::Emit::decline("vk_guest_access_wait", &DrawError::FenceTimeout)
+                    crate::observe::Emit::decline(operation, &DrawError::FenceTimeout)
                         .field("deadlines", deadlines)
                         .fail();
                 }
-                result => {
-                    result?;
-                    // The whole ring has retired. A deadline alone cannot release
-                    // guest pages: the next user may be the CPU, not another slot.
-                    self.take_guest_read_debt();
-                    self.take_guest_write_debt();
-                    return Ok(());
-                }
+                result => return result,
             }
         }
     }
@@ -6853,6 +6861,54 @@ mod recycle_tests {
         pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert!(pools.take_guest_write_debt());
         assert!(!pools.take_guest_write_debt());
+    }
+
+    #[test]
+    fn completion_wait_deadlines_keep_readback_lease_unreclaimed() {
+        let mut pools = ResourcePools::new();
+        pools.readback_live = Some(BufferSlot {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            size: 4096,
+            mapped: 1,
+            backing: BufferBacking::Dedicated,
+            coherent: true,
+            cached: true,
+        });
+        let lease = pools.lease_readback().unwrap();
+        let guard = crate::backend::vulkan::engine::ReadbackLeaseGuard::new(Some(lease));
+        let mut attempts = 0;
+        ResourcePools::wait_until_complete("vk_entry_fence_wait", || {
+            attempts += 1;
+            pools.reclaim_returned_readback_leases();
+            assert!(pools.readback_free.is_empty());
+            assert_eq!(pools.readback_leased.len(), 1);
+            if attempts < 3 {
+                Err(DrawError::FenceTimeout)
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+        drop(guard);
+        pools.reclaim_returned_readback_leases();
+        assert!(pools.readback_leased.is_empty());
+        assert_eq!(pools.readback_free[&4096].len(), 1);
+    }
+
+    #[test]
+    fn completion_wait_propagates_terminal_errors_without_retry() {
+        let error = DrawError::DeviceLost(DeviceLostDecline::ForcedDraw);
+        let mut attempts = 0;
+        assert_eq!(
+            ResourcePools::wait_until_complete("vk_entry_fence_wait", || {
+                attempts += 1;
+                Err(error.clone())
+            }),
+            Err(error),
+        );
+        assert_eq!(attempts, 1);
     }
 
     #[test]

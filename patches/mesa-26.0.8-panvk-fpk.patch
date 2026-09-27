@@ -1,0 +1,74 @@
+--- a/src/panfrost/vulkan/panvk_blend.h
++++ b/src/panfrost/vulkan/panvk_blend.h
+@@ -25,6 +25,7 @@
+ #ifdef PAN_ARCH
+ 
+ struct panvk_blend_info {
++   uint8_t enabled_mask;
+    bool any_dest_read;
+    bool needs_shader;
+    bool shader_loads_blend_const;
+--- a/src/panfrost/vulkan/panvk_vX_blend.c
++++ b/src/panfrost/vulkan/panvk_vX_blend.c
+@@ -335,6 +335,7 @@
+           !(is_float || util_format_is_srgb(rt->format)))
+          continue;
+ 
++      blend_info->enabled_mask |= BITFIELD_BIT(i);
+       rt->nr_samples = color_attachment_samples[i];
+       rt->equation.blend_enable = cb->attachments[i].blend_enable;
+       rt->equation.is_float = is_float;
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -1983,9 +1983,14 @@
+       dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_OP) ||
+       dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_WRITE_MASK) ||
+       /* fpk enablement depends on vk_color_blend_attachment_state */
++      dyn_gfx_state_dirty(cmdbuf, CB_LOGIC_OP_ENABLE) ||
++      dyn_gfx_state_dirty(cmdbuf, CB_LOGIC_OP) ||
++      dyn_gfx_state_dirty(cmdbuf, CB_ATTACHMENT_COUNT) ||
++      dyn_gfx_state_dirty(cmdbuf, CB_COLOR_WRITE_ENABLES) ||
+       dyn_gfx_state_dirty(cmdbuf, CB_BLEND_ENABLES) ||
+       dyn_gfx_state_dirty(cmdbuf, CB_BLEND_EQUATIONS) ||
+       dyn_gfx_state_dirty(cmdbuf, CB_WRITE_MASKS) ||
++      dyn_gfx_state_dirty(cmdbuf, CB_BLEND_CONSTANTS) ||
+       /* line mode needs primitive topology */
+       dyn_gfx_state_dirty(cmdbuf, IA_PRIMITIVE_TOPOLOGY) ||
+       dyn_gfx_state_dirty(cmdbuf, INPUT_ATTACHMENT_MAP) ||
+@@ -2018,6 +2023,8 @@
+       rt_written = color_attachment_written_mask(fs, &dyns->cal);
+       rt_read = color_attachment_read_mask(fs, &dyns->ial, rt_mask);
+    }
++   /* Masked outputs cannot replace earlier pixels, including framebuffer loads. */
++   uint8_t fpk_written = rt_written & cmdbuf->state.gfx.cb.info.enabled_mask;
+ 
+    bool msaa = dyns->ms.rasterization_samples > 1;
+    if ((ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
+@@ -2049,7 +2056,7 @@
+             }
+ 
+             cfg.allow_forward_pixel_to_kill =
+-               fs->info.fs.can_fpk && !(rt_mask & ~rt_written) &&
++               fs->info.fs.can_fpk && !(rt_mask & ~fpk_written) &&
+                !(rt_read & rt_written) && !alpha_to_coverage &&
+                !cmdbuf->state.gfx.cb.info.any_dest_read;
+ 
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -293,6 +293,7 @@
+                            MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
+          uint8_t rt_written = color_attachment_written_mask(
+             fs, &cmdbuf->vk.dynamic_graphics_state.cal);
++         uint8_t fpk_written = rt_written & binfo->enabled_mask;
+          uint8_t rt_read = color_attachment_read_mask(fs, &dyns->ial, rt_mask);
+          enum pan_earlyzs_zs_tilebuf_read zs_read =
+             (z_attachment_read(fs, &dyns->ial) ||
+@@ -301,7 +302,7 @@
+                : PAN_EARLYZS_ZS_TILEBUF_NOT_READ;
+ 
+          cfg.properties.allow_forward_pixel_to_kill =
+-            fs_info->fs.can_fpk && !(rt_mask & ~rt_written) &&
++            fs_info->fs.can_fpk && !(rt_mask & ~fpk_written) &&
+             !(rt_read & rt_written) && !alpha_to_coverage &&
+             !binfo->any_dest_read;
+ 

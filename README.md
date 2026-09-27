@@ -234,6 +234,116 @@ timeouts and retains its access debt until retirement; freeing pages on a timeou
 still-running submission access guest memory after reuse. A genuinely wedged queue can consequently
 keep the caller blocked. Terminal driver-error paths still use the existing logging and recovery
 behavior; this timeout fix does not establish completion on those paths.
+Synchronous readbacks also keep waiting across transient deadlines: returning early
+would recycle their leased destination buffer while the GPU can still write it,
+and skip publication of the image's newly recorded layout.
+
+### AArch64 Lavapipe in large QEMU processes
+
+Mesa 26.0.8's MCJIT path leaves AArch64 in LLVM's small code model, but
+`SectionMemoryManager` allocates code and constants independently. With multi-gigabyte
+guest mappings, the sections can be more than 4 GiB apart. An out-of-range `ADRP`
+relocation can then read the wrong address (wrapping by 8 GiB), causing shader
+corruption or a host SIGSEGV. This is separate from guest timer emulation.
+
+Apply [the AArch64 JIT patch](patches/mesa-26.0.8-aarch64-jit.patch) with `patch -p1`
+in Mesa 26.0.8 and rebuild Lavapipe separately. It reserves one contiguous mapping
+per JIT object, with separate code, read-only and writable regions, keeping section
+distances below 2 GiB. Code becomes executable and constants read-only at finalization;
+the existing Gallivm owner retains the mapping until the shaders are destroyed.
+LLVM's optimization level and instruction selector are unchanged.
+The patch also corrects a debug-build bounds assertion that casts a valid 2 GiB
+buffer width to a negative signed integer; it does not remove the bounds checks.
+Keep the resulting driver and ICD outside the system installation, and point
+`VK_ICD_FILENAMES` at that ICD when starting QEMU. `GALLIVM_PERF=nopt` remains
+compatible and need not be removed. This patch does not change hardware drivers.
+
+For a Wayland-only standalone driver, with Mesa's build dependencies available,
+run these commands from the patched Mesa source directory:
+
+```bash
+meson setup build-aarch64-jit -Dbuildtype=debugoptimized -Db_ndebug=false \
+  -Dgallium-drivers=llvmpipe -Dvulkan-drivers=swrast -Dplatforms=wayland \
+  -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dgles1=disabled \
+  -Dgles2=disabled -Dopengl=false -Dllvm=enabled -Dshared-llvm=enabled \
+  -Dvideo-codecs= -Dgallium-va=disabled -Dgallium-rusticl=false \
+  -Dbuild-tests=false
+ninja -C build-aarch64-jit -j4 \
+  src/gallium/targets/lavapipe/libvulkan_lvp.so \
+  src/gallium/targets/lavapipe/lvp_devenv_icd.aarch64.json
+```
+
+The generated `lvp_devenv_icd.aarch64.json` selects that build without `ninja install`.
+Use an absolute path to it in `VK_ICD_FILENAMES`.
+
+The authored regression forces JIT code and constants 6 GiB apart in its negative
+controls, then exercises the actual contiguous allocator with global loads, vector
+constants and masked scatter stores. The reservation uses virtual address space,
+not 6 GiB of physical RAM. The large-code-model control demonstrates why changing
+only that option is insufficient: LLVM 21 GlobalISel still emits `ADRP` for vector
+constant pools. On an AArch64 host with LLVM 21, run this from the reims repository
+root with `MESA_SOURCE` set to the absolute path of the patched Mesa source tree:
+
+```bash
+c++ $(llvm-config-21 --cxxflags) -std=c++17 \
+  -I "$MESA_SOURCE/src/gallium/auxiliary/gallivm" \
+  scripts/qemu-build/tests/aarch64-jit-address.cpp \
+  $(llvm-config-21 --ldflags --libs core executionengine mcjit native --system-libs) \
+  -o build/aarch64-jit-address
+build/aarch64-jit-address reserved
+# Negative controls: intentionally fault, or assert with assertions-enabled LLVM.
+(ulimit -c 0; build/aarch64-jit-address small)
+(ulimit -c 0; build/aarch64-jit-address large-globalisel)
+```
+
+### PanVK masked color outputs
+
+[The Mesa 26.0.8 PanVK patch](patches/mesa-26.0.8-panvk-fpk.patch) fixes a separate
+framebuffer-preservation defect reproduced on Mali-G720. PanVK allowed forward
+pixel kill based on shader outputs without accounting for disabled color writes.
+A draw could consequently discard the earlier framebuffer preload even though
+its masked attachment had to retain those pixels. This produced missing text and
+black fragments; disabling AFBC or forcing synchronous execution did not fix it.
+
+The patch derives the enabled attachment mask from the existing blend-state
+owner, uses it in the CSF and JM forward-pixel-kill decisions, and refreshes the
+CSF decision when the relevant dynamic blend state changes. It does not disable
+the optimization for draws that really overwrite all attachments.
+
+Apply it with `patch -p1` in Mesa 26.0.8. Configure a new `build-panvk` directory
+using the standalone options above, with `-Dgallium-drivers=` and
+`-Dvulkan-drivers=panfrost`; PanVK also needs Mesa's
+CLC/LLVM-to-SPIR-V build dependencies. Build these targets instead:
+
+```bash
+ninja -C build-panvk -j4 src/panfrost/vulkan/libvulkan_panfrost.so \
+  src/panfrost/vulkan/panfrost_devenv_icd.aarch64.json
+```
+
+Select the generated ICD through `VK_ICD_FILENAMES`, without
+`LIBGL_ALWAYS_SOFTWARE` or `GALLIUM_DRIVER`. `GALLIVM_PERF` need not be removed.
+With that ICD selected, the pixel-exact regression runs from this repository:
+
+```bash
+cargo test -p reims-vgpu --lib --no-default-features \
+  --features backend-vulkan,host-window serial_interlock_gpu_ \
+  -- --ignored --test-threads=1
+```
+
+The regression checks the seeded, write-masked attachment before copying it,
+then verifies RGBA16F/BGRA copies, offsets, overlapping updates and untouched MRT
+attachments. An otherwise-identical unpatched driver fails the seeded-source
+check; the patched driver passes.
+
+These fixes do not establish overall macOS guest-data integrity on the CIX KVM
+configuration. Repeated extraction checks also found intermittent guest-file
+corruption, including on hardware Vulkan without host-pointer imports. Its writer
+has not been identified; different validation/debugger configurations changed
+reproducibility but did not establish a cause. A clean Lavapipe build also
+reproduced it without validation or a debugger: an initially checksum-correct
+file changed during later extractions. Disabling validation is not a sufficient
+workaround. Use disposable images for further investigation rather than trusting
+this configuration with valuable guest data.
 
 ### Environment overrides
 
